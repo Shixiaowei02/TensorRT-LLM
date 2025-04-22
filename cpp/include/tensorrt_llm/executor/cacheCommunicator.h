@@ -75,4 +75,75 @@ public:
     [[nodiscard]] virtual CommState const& getCommState() const = 0;
 };
 
+// -----
+
+class MemoryDesc
+{
+public:
+    MemoryDesc(uintptr_t addr, size_t len);
+
+private:
+    uintptr_t mAddr;
+    size_t mLen;
+    int deviceId;
+};
+
+using TransferDescs = std::vector<MemoryDesc>;
+using RegisterDescs = std::vector<MemoryDesc>;
+using SyncMessage = std::string;
+
+class AgentDesc
+{
+private:
+    std::string mUnderlyingDesc;
+};
+
+enum class TransferOp : uint8_t
+{
+    kREAD,
+    kWRITE,
+};
+
+class TransferRequest
+{
+public:
+    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, AgentDesc const* remoteAgentDesc);
+
+private:
+    TransferOp mOp;
+    TransferDescs mSrcDescs;
+    TransferDescs mDstDescs;
+    AgentDesc const* mRemoteAgentDesc;
+    std::string mNotifMsg;
+};
+
+class TransferStatus
+{
+public:
+    virtual ~TransferStatus() = default;
+    virtual bool isCompleted() const = 0;
+    virtual void wait() const = 0;
+};
+
+class TransferAgentInterface
+{
+public:
+    virtual ~TransferAgentInterface() = default;
+
+    virtual void registerMemory(RegisterDescs const& descs) = 0;
+
+    virtual void deregisterMemory(RegisterDescs const& descs) = 0;
+
+    // bool isMemoryRegistered();
+
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
+
+    // for MLA , some rank didn't need to be read.
+    virtual void notifySyncInfo(SyncMessage const& syncMessage) = 0;
+
+    // check the sync info is matched.
+    // return the entire matched sync info.
+    [[nodiscard]] virtual std::optional<SyncMessage> getMatchedSyncInfo(SyncMessage const& matchedSyncInfo) = 0;
+};
+
 } // namespace tensorrt_llm::executor::kv_cache
