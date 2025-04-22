@@ -143,7 +143,9 @@ public:
 
     // check the sync info is matched.
     // return the entire matched sync info.
-    [[nodiscard]] virtual std::optional<SyncMessage> getMatchedSyncInfo(SyncMessage const& matchedSyncInfo) = 0;
+    [[nodiscard]] virtual std::vector<std::pair<AgentDesc const*, SyncMessage>> getMatchedSyncInfo(
+        SyncMessage const& matchedSyncInfo)
+        = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache
