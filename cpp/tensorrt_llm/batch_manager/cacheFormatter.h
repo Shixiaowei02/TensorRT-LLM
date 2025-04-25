@@ -82,14 +82,15 @@ public:
             {
                 if (common::getEnvKVCacheTransferUseAsyncBuffer())
                 {
-                    mConcurrenceSendResource.mSendbuffers[i] = mCacheManager->getBlockManager().getBufferManager().gpu(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    // mConcurrenceSendResource.mSendbuffers[i] =
+                    // mCacheManager->getBlockManager().getBufferManager().gpu(
+                    //    runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
                 }
                 else
                 {
-                    mConcurrenceSendResource.mSendbuffers[i]
-                        = mCacheManager->getBlockManager().getBufferManager().gpuSync(
-                            runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
+                    // mConcurrenceSendResource.mSendbuffers[i]
+                    //    = mCacheManager->getBlockManager().getBufferManager().gpuSync(
+                    //         runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType);
                 }
             }
 
@@ -98,13 +99,13 @@ public:
             {
                 if (common::getEnvKVCacheTransferUseAsyncBuffer())
                 {
-                    mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpu(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
+                    //   mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpu(
+                    //       runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
                 }
                 else
                 {
-                    mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpuSync(
-                        runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
+                    //   mPreAllocatedRecvBuffers.push_back(mCacheManager->getBlockManager().getBufferManager().gpuSync(
+                    //       runtime::ITensor::makeShape({static_cast<int64_t>(sendBufferEleSize)}), dataType));
                 }
             }
         }
