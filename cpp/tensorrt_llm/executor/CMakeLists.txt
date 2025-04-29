@@ -64,6 +64,7 @@ message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/nixl_utils/nixl_example.cpp
+    cache_transmission/transferAgent.cpp
     cache_transmission/cacheConcatenate.cu
     contextPhaseParams.cpp
     debugConfig.cpp
@@ -130,6 +131,7 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 add_subdirectory(cache_transmission/ucx_utils)
+add_subdirectory(cache_transmission/nixl_utils)
 
 # Add include directories
 target_include_directories(${EXECUTOR_STATIC_TARGET}
