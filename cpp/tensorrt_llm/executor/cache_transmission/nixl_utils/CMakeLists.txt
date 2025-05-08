@@ -11,7 +11,7 @@
 
 if(ENABLE_NIXL)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    message(STATUS "NIXL currently only supports aarch64.")
+    message(STATUS "NIXL currently only supports x86_64.")
     return()
   endif()
 
