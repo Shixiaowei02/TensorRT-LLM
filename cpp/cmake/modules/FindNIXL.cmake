@@ -31,14 +31,17 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
   set(NIXL_TARGET_ARCH "aarch64-linux-gnu")
 endif()
 
-find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
+find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}
+                                     ${NIXL_ROOT}/lib64)
 find_library(NIXL_BUILD_LIBRARY nixl_build
-             HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
-find_library(SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
-find_library(UCX_BACKEND_LIBRARY plugin_UCX
-             HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}/plugins)
+             HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH} ${NIXL_ROOT}/lib64)
+find_library(SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}
+                                         ${NIXL_ROOT}/lib64)
+find_library(
+  UCX_BACKEND_LIBRARY plugin_UCX
+  HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}/plugins ${NIXL_ROOT}/lib64/plugins)
 find_library(UCX_UTILS_LIBRARY ucx_utils
-             HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
+             HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH} ${NIXL_ROOT}/lib64)
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
