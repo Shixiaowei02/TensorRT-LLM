@@ -22,59 +22,14 @@ if(NIXL_FOUND)
 endif()
 
 find_package(ucx REQUIRED)
-file(REAL_PATH ${ucx_DIR}/../../../ UCX_PATH)
-
-# Check if the UCX path exists
-if(NOT EXISTS "${UCX_PATH}")
-  message(FATAL_ERROR "UCX path does not exist: ${UCX_PATH}")
-endif()
-message(STATUS "UCX path exists: ${UCX_PATH}")
-
-# calculate TARGET_ARCH
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-  set(NIXL_TARGET_ARCH "x86_64-linux-gnu")
-else()
-  message(FATAL_ERROR "Unsupported system with NIXL: ${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-# NIXL not found, attempt to build and install
-message(STATUS "NIXL not found. Attempting to build and install NIXL.")
-
-# Define the build directory for NIXL
-set(NIXL_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/nixl_build)
-
-# Create the build directory
-file(MAKE_DIRECTORY ${NIXL_BUILD_DIR})
-set(NIXL_SOURCE_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/nixl/)
-
-find_program(MESON_EXECUTABLE meson)
-find_program(NINJA_EXECUTABLE ninja)
-
-set(NIXL_ROOT ${CMAKE_CURRENT_BINARY_DIR}/nixl_install)
-
-# Run the Meson setup and build commands
-execute_process(
-  COMMAND ${MESON_EXECUTABLE} setup ${NIXL_BUILD_DIR} -Ducx_path=${UCX_PATH}
-          --prefix=${NIXL_ROOT}
-  WORKING_DIRECTORY ${NIXL_SOURCE_DIR}
-  RESULT_VARIABLE MESON_SETUP_RESULT
-  OUTPUT_VARIABLE MESON_SETUP_OUTPUT
-  ERROR_VARIABLE MESON_SETUP_ERROR
-  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
-message(STATUS "Meson setup output: ${MESON_SETUP_OUTPUT}")
-message(STATUS "Meson setup error: ${MESON_SETUP_ERROR}")
-if(NOT MESON_SETUP_RESULT EQUAL 0)
-  message(
-    FATAL_ERROR "Meson setup failed with error code: ${MESON_SETUP_RESULT}")
-endif()
-
-# Build and install NIXL
-execute_process(COMMAND ${NINJA_EXECUTABLE} WORKING_DIRECTORY ${NIXL_BUILD_DIR})
-
-execute_process(COMMAND ${NINJA_EXECUTABLE} install
-                WORKING_DIRECTORY ${NIXL_BUILD_DIR})
 
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+  set(NIXL_TARGET_ARCH "x86_64-linux-gnu")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(NIXL_TARGET_ARCH "aarch64-linux-gnu")
+endif()
 
 find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
 find_library(NIXL_BUILD_LIBRARY nixl_build
@@ -86,13 +41,6 @@ find_library(UCX_UTILS_LIBRARY ucx_utils
              HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH})
 find_library(GDS_BACKEND_LIBRARY plugin_GDS
              HINTS ${NIXL_ROOT}/lib/${NIXL_TARGET_ARCH}/plugins)
-
-message(STATUS "NIXL_LIBRARY: ${NIXL_LIBRARY}")
-message(STATUS "NIXL_BUILD_LIBRARY: ${NIXL_BUILD_LIBRARY}")
-message(STATUS "SERDES_LIBRARY: ${SERDES_LIBRARY}")
-message(STATUS "UCX_BACKEND_LIBRARY: ${UCX_BACKEND_LIBRARY}")
-message(STATUS "UCX_UTILS_LIBRARY: ${UCX_UTILS_LIBRARY}")
-message(STATUS "GDS_BACKEND_LIBRARY: ${GDS_BACKEND_LIBRARY}")
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(
@@ -131,5 +79,11 @@ if(NIXL_FOUND)
                                                    ${SERDES_LIBRARY})
   endif()
 else()
+  message(STATUS "NIXL_LIBRARY: ${NIXL_LIBRARY}")
+  message(STATUS "NIXL_BUILD_LIBRARY: ${NIXL_BUILD_LIBRARY}")
+  message(STATUS "SERDES_LIBRARY: ${SERDES_LIBRARY}")
+  message(STATUS "UCX_BACKEND_LIBRARY: ${UCX_BACKEND_LIBRARY}")
+  message(STATUS "UCX_UTILS_LIBRARY: ${UCX_UTILS_LIBRARY}")
+  message(STATUS "GDS_BACKEND_LIBRARY: ${GDS_BACKEND_LIBRARY}")
   message(FATAL_ERROR "NIXL not found after installation attempt.")
 endif()

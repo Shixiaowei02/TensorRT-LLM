@@ -9,12 +9,7 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-if(ENABLE_NIXL)
-  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    message(STATUS "NIXL currently only supports x86_64.")
-    return()
-  endif()
-
+if(NIXL_ROOT)
   find_package(NIXL REQUIRED)
   # Check if all required packages were found
   if(NOT NIXL_FOUND)
@@ -27,6 +22,8 @@ if(ENABLE_NIXL)
 
   # Add the NIXL wrapper target
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
+  target_compile_options(${NIXL_WRAPPER_TARGET}
+                         PRIVATE "-U_GLIBCXX_USE_CXX11_ABI")
 
   # Add include directories
   target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
