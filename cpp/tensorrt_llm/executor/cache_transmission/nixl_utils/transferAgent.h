@@ -55,9 +55,9 @@ public:
 
     void deregisterMemory(RegisterDescs const& descs) override;
 
-    void loadRemoteAgent(std::string const& name) override;
+    void loadRemoteAgent(char const* name) override;
 
-    void invalidateRemoteAgent(std::string const& name) override;
+    void invalidateRemoteAgent(char const* name) override;
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 

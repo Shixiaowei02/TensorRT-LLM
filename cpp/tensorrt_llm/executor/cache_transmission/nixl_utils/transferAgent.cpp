@@ -118,7 +118,7 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    mRegistrar->addAgentDesc(mName, std::move(localMD));
+    mRegistrar->addAgentDesc(mName.c_str(), localMD.c_str());
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -128,7 +128,7 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     TLLM_CHECK(status == NIXL_SUCCESS);
 }
 
-void NixlTransferAgent::loadRemoteAgent(std::string const& name)
+void NixlTransferAgent::loadRemoteAgent(char const* name)
 {
     nixl_status_t status;
     auto const* desc = mRegistrar->getAgentDesc(name);
@@ -137,10 +137,10 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name)
     status = mRawAgent->loadRemoteMD(desc->getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
-        name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+        name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name, remoteName.c_str());
 }
 
-void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
+void NixlTransferAgent::invalidateRemoteAgent(char const* name)
 {
     mRawAgent->invalidateRemoteMD(name);
 }

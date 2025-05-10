@@ -106,19 +106,18 @@ private:
 
 using TransferDescs = MemoryDescs;
 using RegisterDescs = MemoryDescs;
-using SyncMessage = std::string;
 
 class AgentDesc final
 {
 public:
-    AgentDesc(std::string backendAgentDesc)
-        : mBackendAgentDesc{std::move(backendAgentDesc)}
+    AgentDesc(char const* backendAgentDesc)
+        : mBackendAgentDesc{backendAgentDesc}
     {
     }
 
-    [[nodiscard]] std::string const& getBackendAgentDesc() const noexcept
+    [[nodiscard]] char const* getBackendAgentDesc() const noexcept
     {
-        return mBackendAgentDesc;
+        return mBackendAgentDesc.c_str();
     }
 
 private:
@@ -134,7 +133,7 @@ enum class TransferOp : uint8_t
 class TransferRequest
 {
 public:
-    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, std::string const& remoteName)
+    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, char const* remoteName)
         : mOp{op}
         , mSrcDescs{std::move(srcDescs)}
         , mDstDescs{std::move(dstDescs)}
@@ -157,9 +156,9 @@ public:
         return mDstDescs;
     }
 
-    [[nodiscard]] std::string const& getRemoteName() const noexcept
+    [[nodiscard]] char const* getRemoteName() const noexcept
     {
-        return mRemoteName;
+        return mRemoteName.c_str();
     }
 
 private:
@@ -182,16 +181,16 @@ class AgentRegistrar
 public:
     ~AgentRegistrar() = default;
 
-    [[nodiscard]] virtual AgentDesc const* getAgentDesc(std::string const& agentName) const = 0;
+    [[nodiscard]] virtual AgentDesc const* getAgentDesc(char const* agentName) const = 0;
 
-    virtual void addAgentDesc(std::string agentName, AgentDesc desc) = 0;
+    virtual void addAgentDesc(char const* agentName, AgentDesc desc) = 0;
 
-    virtual void removeAgentDesc(std::string const& agentName) = 0;
+    virtual void removeAgentDesc(char const* agentName) = 0;
 };
 
 struct BaseAgentConfig
 {
-    std::string mName;
+    char const* mName;
     bool useProgThread;
 };
 
@@ -204,9 +203,9 @@ public:
 
     virtual void deregisterMemory(RegisterDescs const& descs) = 0;
 
-    virtual void loadRemoteAgent(std::string const& name) = 0;
+    virtual void loadRemoteAgent(char const* name) = 0;
 
-    virtual void invalidateRemoteAgent(std::string const& name) = 0;
+    virtual void invalidateRemoteAgent(char const* name) = 0;
 
     [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
 
@@ -218,14 +217,15 @@ class DynLibLoader final
 public:
     [[nodiscard]] static DynLibLoader& getInstance();
 
-    [[nodiscard]] void* getHandle(std::string const& name);
+    [[nodiscard]] void* getHandle(char const* name);
 
     template <typename FunctionT>
-    [[nodiscard]] FunctionT getFunctionPointer(std::string const& libName, std::string const& funcName)
+    [[nodiscard]] FunctionT getFunctionPointer(char const* libName, char const* funcName)
     {
         void* handle = getHandle(libName);
-        void* funcPtr = dlSym(handle, funcName.c_str());
-        TLLM_CHECK_WITH_INFO(funcPtr, funcName + " function is not open correctly.");
+        void* funcPtr = dlSym(handle, funcName);
+        const std::string err = funcName + std::string{" function is not open correctly."};
+        TLLM_CHECK_WITH_INFO(funcPtr, err.c_str());
         return reinterpret_cast<FunctionT>(funcPtr);
     }
 
@@ -243,9 +243,9 @@ private:
 };
 
 template <typename... Args>
-[[nodiscard]] std::unique_ptr<BaseTransferAgent> makeTransferAgent(std::string const& backend, Args&&... args)
+[[nodiscard]] std::unique_ptr<BaseTransferAgent> makeTransferAgent(char const* const& backend, Args&&... args)
 {
-    if (backend == "nixl")
+    if (backend == std::string{"nixl"})
     {
         auto& loader = DynLibLoader::getInstance();
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*, AgentRegistrar*);
