@@ -110,18 +110,18 @@ using RegisterDescs = MemoryDescs;
 class AgentDesc final
 {
 public:
-    AgentDesc(char const* backendAgentDesc)
+    AgentDesc(std::vector<char> backendAgentDesc)
         : mBackendAgentDesc{backendAgentDesc}
     {
     }
 
-    [[nodiscard]] char const* getBackendAgentDesc() const noexcept
+    [[nodiscard]] std::vector<char> const& getBackendAgentDesc() const noexcept
     {
-        return mBackendAgentDesc.c_str();
+        return mBackendAgentDesc;
     }
 
 private:
-    std::string mBackendAgentDesc;
+    std::vector<char> mBackendAgentDesc;
 };
 
 enum class TransferOp : uint8_t
@@ -225,7 +225,7 @@ public:
         void* handle = getHandle(libName);
         void* funcPtr = dlSym(handle, funcName);
         const std::string err = funcName + std::string{" function is not open correctly."};
-        TLLM_CHECK_WITH_INFO(funcPtr, err.c_str());
+        TLLM_CHECK_WITH_INFO(funcPtr, "%s", err.c_str());
         return reinterpret_cast<FunctionT>(funcPtr);
     }
 

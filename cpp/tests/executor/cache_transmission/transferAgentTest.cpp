@@ -19,19 +19,19 @@ using namespace tensorrt_llm::executor::kv_cache;
 class LocalAgentRegistrar final : public tensorrt_llm::executor::kv_cache::AgentRegistrar
 {
 public:
-    [[nodiscard]] AgentDesc const* getAgentDesc(std::string const& agentName) const
+    [[nodiscard]] AgentDesc const* getAgentDesc(char const* agentName) const
     {
         auto it = mAgentDescs.find(agentName);
         TLLM_CHECK(it != mAgentDescs.end());
         return &it->second;
     }
 
-    void addAgentDesc(std::string agentName, AgentDesc desc)
+    void addAgentDesc(char const* agentName, AgentDesc desc)
     {
-        mAgentDescs.insert(std::make_pair(std::move(agentName), std::move(desc)));
+        mAgentDescs.insert(std::make_pair(agentName, std::move(desc)));
     }
 
-    void removeAgentDesc(std::string const& agentName)
+    void removeAgentDesc(char const* agentName)
     {
         mAgentDescs.erase(agentName);
     }
@@ -85,7 +85,7 @@ TEST_F(TransferAgentTest, Basic)
 {
     LocalAgentRegistrar registrar;
 
-    const std::string agent0{"agent0"}, agent1{"agent1"};
+    char const *agent0{"agent0"}, *agent1{"agent1"};
     BaseAgentConfig config0{agent0, true}, config1{agent1, true};
     auto nixlAgent0 = makeTransferAgent(config0, &registrar);
     auto nixlAgent1 = makeTransferAgent(config1, &registrar);

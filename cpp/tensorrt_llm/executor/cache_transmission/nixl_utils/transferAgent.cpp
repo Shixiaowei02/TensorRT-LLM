@@ -118,7 +118,7 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    mRegistrar->addAgentDesc(mName.c_str(), localMD.c_str());
+    mRegistrar->addAgentDesc(mName.c_str(), std::vector<char>(localMD.begin(), localMD.end()));
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -134,7 +134,8 @@ void NixlTransferAgent::loadRemoteAgent(char const* name)
     auto const* desc = mRegistrar->getAgentDesc(name);
     TLLM_CHECK(desc);
     std::string remoteName;
-    status = mRawAgent->loadRemoteMD(desc->getBackendAgentDesc(), remoteName);
+    auto backendDesc = desc->getBackendAgentDesc();
+    status = mRawAgent->loadRemoteMD(std::string(backendDesc.begin(), backendDesc.end()), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name, remoteName.c_str());
