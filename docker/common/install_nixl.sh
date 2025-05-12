@@ -5,12 +5,24 @@ GITHUB_URL="https://github.com"
 
 UCX_VERSION="v1.18.1"
 UCX_INSTALL_PATH="/usr/local/ucx/"
+CUDA_PATH="/usr/local/cuda"
 
 if [ ! -d ${UCX_INSTALL_PATH} ]; then
   git clone --depth 1 -b ${UCX_VERSION} https://github.com/openucx/ucx.git
   cd ucx
   ./autogen.sh
-  ./contrib/configure-release --prefix=${UCX_INSTALL_PATH}
+  ./contrib/configure-release       \
+    --prefix=${UCX_INSTALL_PATH}    \
+    --enable-shared                 \
+    --disable-static                \
+    --disable-doxygen-doc           \
+    --enable-optimizations          \
+    --enable-cma                    \
+    --enable-devel-headers          \
+    --with-cuda=${CUDA_PATH}        \
+    --with-verbs                    \
+    --with-dm                       \
+    --enable-mt
   make install -j
   cd ..
   echo "export LD_LIBRARY_PATH=${UCX_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
