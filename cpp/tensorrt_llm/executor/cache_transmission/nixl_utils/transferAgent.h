@@ -18,6 +18,7 @@
 #pragma once
 
 #include "nixl.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/interfaces.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 namespace tensorrt_llm::executor::kv_cache
@@ -78,20 +79,5 @@ private:
     nixl_opt_args_t mExtraParams;
     std::string mName;
 };
-
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-
-extern "C"
-{
-    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(
-        BaseAgentConfig const* config, AgentRegistrar* registrar);
-}
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
 
 } // namespace tensorrt_llm::executor::kv_cache

@@ -11,30 +11,11 @@
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/interfaces.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 using namespace tensorrt_llm::executor::kv_cache;
-
-namespace tensorrt_llm::executor::kv_cache
-{
-
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
-#endif
-
-extern "C"
-{
-    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(
-        BaseAgentConfig const* config, AgentRegistrar* registrar);
-}
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
-
-} // namespace tensorrt_llm::executor::kv_cache
 
 class LocalAgentRegistrar final : public tensorrt_llm::executor::kv_cache::AgentRegistrar
 {
@@ -103,6 +84,9 @@ public:
 
 TEST_F(TransferAgentTest, Basic)
 {
+    // Remove the hardcoding of this environment variable.
+    setenv("NIXL_PLUGIN_DIR", "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/plugins/", 0);
+
     LocalAgentRegistrar registrar;
 
     char const *agent0{"agent0"}, *agent1{"agent1"};
