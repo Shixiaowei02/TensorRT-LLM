@@ -16,6 +16,26 @@
 
 using namespace tensorrt_llm::executor::kv_cache;
 
+namespace tensorrt_llm::executor::kv_cache
+{
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+#endif
+
+extern "C"
+{
+    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(
+        BaseAgentConfig const* config, AgentRegistrar* registrar);
+}
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+} // namespace tensorrt_llm::executor::kv_cache
+
 class LocalAgentRegistrar final : public tensorrt_llm::executor::kv_cache::AgentRegistrar
 {
 public:
@@ -77,7 +97,7 @@ public:
     [[nodiscard]] std::unique_ptr<BaseTransferAgent> makeTransferAgent(
         BaseAgentConfig const& config, AgentRegistrar* registrar)
     {
-        return tensorrt_llm::executor::kv_cache::makeTransferAgent("nixl", &config, registrar);
+        return tensorrt_llm::executor::kv_cache::createNixlTransferAgent(&config, registrar);
     }
 };
 
