@@ -1114,6 +1114,13 @@ class PyExecutor:
     def _fetch_new_requests(self) -> List[RequestQueueItem]:
         new_requests = self.executor_request_queue.fetch_new_requests(
             len(self.active_requests))
+        if self.kv_cache_transceiver is None:
+            assert all(
+                req.request is None
+                or req.request.request_type != "REQUEST_TYPE_CONTEXT_ONLY"
+                for req in new_requests
+            ), "Context-only requests are not allowed when disaggregation is disabled."
+
         self.active_requests.extend(new_requests)
 
         self.is_shutdown = self.executor_request_queue.is_shutdown
