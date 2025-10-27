@@ -4,17 +4,26 @@ import sys
 import threading
 import uuid
 from abc import ABC, abstractmethod
+from builtins import dict
 from dataclasses import dataclass
 from typing import Optional
 
 import zmq
 
+import tensorrt_llm.bindings
+import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import SamplingParams
+
+AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
+LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
+DataType = tensorrt_llm.bindings.DataType
 
 nixl_path = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
 if nixl_path not in sys.path:
@@ -137,8 +146,8 @@ class NixlTransferAgent(BaseTransferAgent):
     def deregister_memory(self, descs: RegMemoryDescs):
         self.agent.deregister_memory(descs.descs, descs.type)
 
-    def load_remote_agent(self, name: str, agent_desc: str):
-        self.agent.add_remote_agent(bytes(agent_desc))
+    def load_remote_agent(self, name: str, agent_desc: bytes):
+        self.agent.add_remote_agent(agent_desc)
 
     def get_local_agent_desc(self):
         return self.agent.get_agent_metadata()
@@ -306,6 +315,8 @@ class DataSender(BaseDataSender):
             transfer_meta_data.src_kv_ptrs, transfer_meta_data.kv_sizes)]
         dst_kv_list = [(dst_ptr, size, self.device_id) for dst_ptr, size in zip(
             transfer_meta_data.dst_kv_ptrs, transfer_meta_data.kv_sizes)]
+        print(f"src_kv_list: {src_kv_list}")
+        print(f"dst_kv_list: {dst_kv_list}")
         src_memory_descs = MemoryDescs("VRAM", src_kv_list)
         dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
         request = TransferRequest(TransferOp.WRITE, src_memory_descs,
@@ -339,6 +350,7 @@ class DataSender(BaseDataSender):
         if peer_endpoint not in self.socket_cache:
             self.socket_cache[peer_endpoint] = self.zmq_context.socket(
                 zmq.DEALER)
+            print(f"DataSender get_socket connect to: {peer_endpoint}")
             self.socket_cache[peer_endpoint].connect(peer_endpoint)
         return self.socket_cache[peer_endpoint]
 
@@ -353,6 +365,7 @@ class DataReceiver(BaseDataReceiver):
         self.server_socket.bind(f"tcp://{get_local_ip()}:*")
         self.server_endpoint = self.server_socket.getsockopt(
             zmq.LAST_ENDPOINT).decode()
+        print(f"DataReceiver server_endpoint: {self.server_endpoint}")
         self.session_id_to_count = {}
         self.session_id_to_future = {}
         self._background_thread = threading.Thread(
@@ -382,7 +395,7 @@ class DataReceiver(BaseDataReceiver):
             recv_message = message[1:]
             if self._message_is_termination(recv_message):
                 break
-            if self._message_is_task_state(recv_message):
+            elif self._message_is_task_state(recv_message):
                 self._handle_task_state(send_id, recv_message)
             else:
                 raise ValueError(
@@ -415,6 +428,7 @@ class DataReceiver(BaseDataReceiver):
             )
 
 
+@dataclass
 class InstanceRankInfo:
     instance_name: str
     instance_rank: int
@@ -477,13 +491,13 @@ class InstanceInfo:
 @dataclass
 class TransferReqInfo:
     req_id: int
-    start_token_idx: int
-    end_token_idx: int
-    start_layer_idx: int
-    end_layer_idx: int
-    block_ids: list[int]
-    instance_name: str
-    instance_rank: int
+    start_token_idx: Optional[int] = None
+    end_token_idx: Optional[int] = None
+    start_layer_idx: Optional[int] = None
+    end_layer_idx: Optional[int] = None
+    block_ids: Optional[list[int]] = None
+    instance_name: Optional[str] = None
+    instance_rank: Optional[int] = None
 
 
 @dataclass
@@ -510,11 +524,11 @@ class peerDomainRanks:
 class TransferSession:
     _peer_domain_ranks_cache: dict[str, peerDomainRanks] = {}
 
-    def __init__(self, transferReqInfo: TransferReqInfo,
-                 transfer_manager: CacheTransferManager):
+    def __init__(self, transferReqInfo: TransferReqInfo, transfer_manager,
+                 instance_rank_info: InstanceRankInfo):
         self.first_extracted = False
         self.future = concurrent.futures.Future()
-        self.instance_rank_info = InstanceRankInfo()
+        self.instance_rank_info = instance_rank_info
         self.transfer_req_info = transferReqInfo
         self.session_id = str(uuid.uuid4())
         self.transfer_manager = transfer_manager
@@ -531,10 +545,11 @@ class TransferSession:
                            dst_info: TransferGenSideReqInfo) -> TransReqMeta:
         # TODO: compute the ptrs and size
 
+        # TODO: get peer instance rank info and peer instance info
         peer_instance_rank_info: InstanceRankInfo = self.transfer_manager.get_peer_instance_rank_info(
             dst_info.instance_name, dst_info.instance_rank)
         peer_domain_ranks = self._get_peer_peer_target_ranks(
-            peer_instance_rank_info)
+            peer_instance_rank_info, peer_instance_rank_info.dp_rank)
         expect_count = len(peer_domain_ranks.ranks)
         if not self.first_extracted:
             self.first_extracted = True
@@ -585,7 +600,8 @@ class TransferSession:
                             future_for_session=self.future,
                             src_kv_ptrs=src_kv_blocks_transfer_ptrs,
                             dst_kv_ptrs=dst_kv_blocks_transfer_ptrs,
-                            kv_sizes=src_kv_blocks_size,
+                            kv_sizes=[src_kv_blocks_size] *
+                            len(src_kv_blocks_transfer_ptrs),
                             expect_count=expect_count,
                             remote_name=peer_instance_rank_info.instance_name +
                             str(peer_instance_rank_info.instance_rank),
@@ -605,18 +621,17 @@ class TransferSession:
             self.first_extracted = True
             self.remain_count = len(peer_domain_ranks.ranks)
         self.remain_count = 0
-        return TransReqRecvMeta(
-            session_id=self.session_id,
-            future_for_session=self.future,
-            expect_count=expect_count,
-            remote_name=None,
-            peer_session_id=self.session_id), peer_domain_ranks.ranks
+        return TransReqRecvMeta(session_id=self.session_id,
+                                future_for_session=self.future,
+                                expect_count=expect_count,
+                                remote_name=None), peer_domain_ranks.ranks
 
     def create_gen_side_transfer_req_info(
-            self, transfer_req_info: TransferReqInfo) -> TransferGenSideReqInfo:
+            self, transfer_req_info: TransferReqInfo,
+            disagg_params: DisaggregatedParams) -> TransferGenSideReqInfo:
 
         return TransferGenSideReqInfo(
-            ctx_req_id=transfer_req_info.req_id,
+            ctx_req_id=disagg_params.ctx_request_id,
             instance_name=transfer_req_info.instance_name,
             instance_rank=transfer_req_info.instance_rank,
             block_ids=transfer_req_info.block_ids,
@@ -761,7 +776,7 @@ class TransferSession:
             peer_instance_info, peer_dp_rank)
 
     def is_active(self) -> bool:
-        return self.remain_count == 0
+        return self.remain_count != 0
 
 
 class CacheTransferManager:
@@ -797,7 +812,9 @@ class CacheTransferManager:
         self,
         src: TransferReqInfo,
     ) -> TransferSession:
-        session = TransferSession(transferReqInfo=src)
+        session = TransferSession(transferReqInfo=src,
+                                  transfer_manager=self,
+                                  instance_rank_info=self.instance_rank_info)
         self.active_transfer_sessions.append(session)
         return session
 
@@ -914,19 +931,23 @@ class CacheTransferManager:
         for session in self.active_transfer_sessions:
             if not session.is_active():
                 # remove session
-                self._clean_resource_for_request(session.request_id)
-                self.remove_transfer_session(session)
+                # self.remove_transfer_session(session)
+                self.active_transfer_sessions.remove(session)
 
 
 class Transceiver:
 
-    def __init__(self, kv_cache_manager: KVCacheManager, device_id: int):
+    def __init__(self, kv_cache_manager: KVCacheManager, device_id: int,
+                 instance_info: InstanceInfo,
+                 instance_rank_info: InstanceRankInfo):
 
-        self.instance_rank_info = InstanceRankInfo()
+        self.kv_cache_manager = kv_cache_manager
+
+        self.instance_rank_info = instance_rank_info
 
         self.cache_transfer_manager = CacheTransferManager(
             self.instance_rank_info, self.kv_cache_manager)
-        self.instance_info = InstanceInfo()
+        self.instance_info = instance_info
 
         self._zmq_context = zmq.Context()
 
@@ -934,18 +955,30 @@ class Transceiver:
             self.instance_rank_info.instance_name +
             str(self.instance_rank_info.instance_rank), True)
 
+        kv_cache_memory = self.kv_cache_manager.get_unique_primary_pool()
+        memory_desc = (kv_cache_memory.data_ptr(),
+                       kv_cache_memory.numel() * kv_cache_memory.element_size(),
+                       device_id, "kv_cache_memory")
+        reg_memory_desc = RegMemoryDescs("VRAM", [memory_desc])
+        # print(f"reg_memory_desc: {reg_memory_desc}")
+        self.transfer_agent.register_memory(reg_memory_desc)
         self.data_sender = DataSender(self.transfer_agent, device_id)
         self.data_receiver = DataReceiver(self.transfer_agent, device_id)
-        self.kv_cache_manager = kv_cache_manager
         self.server_socket = self._zmq_context.socket(zmq.ROUTER)
         self.server_socket.bind(f"tcp://{get_local_ip()}:*")
         self.server_endpoint = self.server_socket.getsockopt(
             zmq.LAST_ENDPOINT).decode()
+        print(f"Transceiver server_endpoint: {self.server_endpoint}")
         self.instance_rank_info.server_endpoint = self.server_endpoint
         self.instance_rank_info.recv_endpoint = self.data_receiver.get_endpoint(
         )
         self.instance_rank_info.transfer_engine_info = bytes(
             self.transfer_agent.get_local_agent_desc())
+
+        # should get from all transceiver
+
+        self.instance_info.ctx_server_endpoints = [self.server_endpoint]
+
         self.context_endpoint_to_instance_info_cache = {}
         self.socket_cache = {}
         self.request_id_to_send_transfer_session_cache = {}
@@ -999,16 +1032,16 @@ class Transceiver:
             recv_message = message[1:]
             if self._message_is_termination(recv_message):
                 break
-            if self._message_is_request_data(recv_message):
+            elif self._message_is_request_data(recv_message):
                 self._handle_request_data(send_id, recv_message)
-            if self._message_is_request_instance_info(recv_message):
+            elif self._message_is_request_instance_info(recv_message):
                 self._handle_request_instance_info(send_id, recv_message)
 
-            if self._message_is_register_rank_info(recv_message):
+            elif self._message_is_register_rank_info(recv_message):
                 self._handle_register_rank_info(send_id, recv_message)
             else:
                 raise ValueError(
-                    f" data receiver received unknown message type: {recv_message[0]}"
+                    f"transceiver sender loop received unknown message type: {recv_message[0]}"
                 )
 
     def _message_is_termination(self, message: list[bytes]):
@@ -1072,7 +1105,7 @@ class Transceiver:
 
         context_peer_infos: InstanceInfo = self._get_context_info(disagg_params)
 
-        transfer_req_info = self.cache_transfer_manager.create_recv_transfer_req_info(
+        transfer_req_info = self.cache_transfer_manager.create_trans_req_info(
             request)
         transfer_session = self.cache_transfer_manager.create_transfer_session(
             transfer_req_info)
@@ -1081,7 +1114,7 @@ class Transceiver:
 
         # map_info = self.gen_map_info(request, disagg_params)
         transfer_recv_req_info = transfer_session.create_gen_side_transfer_req_info(
-            transfer_req_info)
+            transfer_req_info, disagg_params)
         for rank in target_ranks:
             self._send_data_request(
                 context_peer_infos.ctx_server_endpoints[rank],
@@ -1099,16 +1132,22 @@ class Transceiver:
     def _get_context_info(self,
                           disagg_params: DisaggregatedParams) -> InstanceInfo:
         if self._need_register_peer_in_first_request(disagg_params):
-            socket = zmq.socket(self._zmq_context, zmq.DEALER)
+            socket = self._zmq_context.socket(zmq.DEALER)
             socket.connect(disagg_params.ctx_leader_endpoint)
+            print(
+                f"get_context_info connect to ctx_leader_endpoint: {disagg_params.ctx_leader_endpoint}"
+            )
             message = [str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")]
+            print(f"get_context_info send message: {message}")
             socket.send_multipart(message)
             message = socket.recv_multipart()
-            context_info = InstanceInfo.from_zmq(message)
+            # context_info = InstanceInfo.from_zmq(message)
+            context_info = pickle.loads(message[0])
             socket.close()
             for endpoint in context_info.ctx_server_endpoints:
-                socket = zmq.socket(self._zmq_context, zmq.DEALER)
+                socket = self._zmq_context.socket(zmq.DEALER)
                 socket.connect(endpoint)
+                print(f"get_context_info connect to: {endpoint}")
                 send_message = []
                 send_message.append(
                     str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
@@ -1134,8 +1173,7 @@ class Transceiver:
 
     def _get_socket(self, endpoint: str):
         if endpoint not in self.socket_cache:
-            self.socket_cache[endpoint] = zmq.socket(self._zmq_context,
-                                                     zmq.DEALER)
+            self.socket_cache[endpoint] = self._zmq_context.socket(zmq.DEALER)
             self.socket_cache[endpoint].connect(endpoint)
         return self.socket_cache[endpoint]
 
@@ -1384,5 +1422,210 @@ def test_data_sender_and_receiver():
     assert src_tensor2.equal(dst_tensor2)
 
 
+def test_cache_transceiver():
+    mapping = Mapping(world_size=1, rank=0)
+
+    num_layers = 2
+    head_dim = 128
+    num_kv_heads = 4
+    tokens_per_block = 8
+    max_seq_len = 256
+    max_batch_size = 1
+    dtype = DataType.FLOAT
+    element_size = 4
+    ctx_kv_cache_manager = KVCacheManager(
+        trtllm.KvCacheConfig(
+            max_tokens=2048,
+            enable_block_reuse=False,
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        dtype=dtype)
+
+    ctx_instance_info = InstanceInfo(instance_name="ctx_instance",
+                                     tp_size=1,
+                                     pp_size=1,
+                                     dp_size=1,
+                                     cp_size=1,
+                                     kv_head_num_per_rank=num_kv_heads,
+                                     tokens_per_block=tokens_per_block,
+                                     dims_per_head=head_dim,
+                                     element_size=element_size,
+                                     enable_attention_dp=False,
+                                     is_mla=False,
+                                     layer_num_per_pp=[num_layers],
+                                     ctx_server_endpoints=None)
+
+    ctx_instance_rank_info = InstanceRankInfo(
+        instance_name="ctx_instance",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        kv_head_num_per_rank=num_kv_heads,
+        tokens_per_block=tokens_per_block,
+        dims_per_head=head_dim,
+        element_size=element_size,
+        enable_attention_dp=False,
+        is_mla=False,
+        layer_num_per_pp=[num_layers],
+        kvcache_ptrs=[
+            ctx_kv_cache_manager.get_unique_primary_pool().data_ptr()
+        ],
+        aux_ptrs=[],
+        server_endpoint="",
+        recv_endpoint="",
+        transfer_engine_info=bytes())
+
+    gen_kv_cache_manager = KVCacheManager(
+        trtllm.KvCacheConfig(
+            max_tokens=2048,
+            enable_block_reuse=False,
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        dtype=dtype)
+
+    gen_instance_info = InstanceInfo(instance_name="gen_instance",
+                                     tp_size=1,
+                                     pp_size=1,
+                                     dp_size=1,
+                                     cp_size=1,
+                                     kv_head_num_per_rank=num_kv_heads,
+                                     tokens_per_block=tokens_per_block,
+                                     dims_per_head=head_dim,
+                                     element_size=element_size,
+                                     enable_attention_dp=False,
+                                     is_mla=False,
+                                     layer_num_per_pp=[num_layers],
+                                     ctx_server_endpoints=None)
+
+    gen_instance_rank_info = InstanceRankInfo(
+        instance_name="gen_instance",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        kv_head_num_per_rank=num_kv_heads,
+        tokens_per_block=tokens_per_block,
+        dims_per_head=head_dim,
+        element_size=element_size,
+        enable_attention_dp=False,
+        is_mla=False,
+        layer_num_per_pp=[num_layers],
+        kvcache_ptrs=[
+            gen_kv_cache_manager.get_unique_primary_pool().data_ptr()
+        ],
+        aux_ptrs=[],
+        server_endpoint="",
+        recv_endpoint="",
+        transfer_engine_info=bytes())
+
+    print(
+        f" ctx instance info kv cache ptrs :{ ctx_instance_rank_info.kvcache_ptrs}"
+    )
+    print(
+        f" gen instance info kv cache ptrs :{ gen_instance_rank_info.kvcache_ptrs}"
+    )
+
+    device_id = 0
+
+    ctx_transceiver = Transceiver(ctx_kv_cache_manager, device_id,
+                                  ctx_instance_info, ctx_instance_rank_info)
+    gen_transceiver = Transceiver(gen_kv_cache_manager, device_id,
+                                  gen_instance_info, gen_instance_rank_info)
+
+    sampling_params = SamplingParams()
+
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+    ctx_kv_cache_manager.impl.add_sequence(ctx_request.py_request_id,
+                                           ctx_request.prompt_len, 1,
+                                           ctx_request)
+
+    ctx_block_ids = ctx_kv_cache_manager.get_batch_cache_indices(
+        [ctx_request.py_request_id])[0]
+
+    ctx_block_data_pools = ctx_kv_cache_manager.get_unique_primary_pool()
+
+    random_values = torch.rand(ctx_block_data_pools.shape,
+                               dtype=torch.float32,
+                               device=ctx_block_data_pools.device)
+    ctx_block_data_pools.copy_(random_values)
+
+    send_session = ctx_transceiver.async_send(ctx_request)
+
+    gen_request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx_request.py_request_id,
+        ctx_dp_rank=0,
+        ctx_leader_endpoint=ctx_instance_info.ctx_server_endpoints[0])
+    gen_kv_cache_manager.impl.add_sequence(gen_request.py_request_id,
+                                           gen_request.prompt_len, 1,
+                                           gen_request)
+    recv_session = gen_transceiver.async_receive(gen_request)
+
+    print(
+        f"send_session.get_future_for_session().result(): {send_session.get_future_for_session().result()}"
+    )
+    print(
+        f"recv_session.get_future_for_session().result(): {recv_session.get_future_for_session().result()}"
+    )
+    gen_block_ids = gen_kv_cache_manager.get_batch_cache_indices(
+        [gen_request.py_request_id])[0]
+    print(f"gen_block_ids: {gen_block_ids}")
+    gen_block_datas = gen_kv_cache_manager.get_unique_primary_pool(
+    )[gen_block_ids]
+
+    ctx_block_datas = ctx_kv_cache_manager.get_unique_primary_pool(
+    )[ctx_block_ids]
+
+    print(
+        f"ctx_block_datas: {ctx_block_datas}, ctx_block_datas.shape: {ctx_block_datas.shape}, ctx_block_datas.data_ptr: {ctx_block_datas.data_ptr()}"
+    )
+    print(
+        f"gen_block_datas: {gen_block_datas}, gen_block_datas.shape: {gen_block_datas.shape}, gen_block_datas.data_ptr: {gen_block_datas.data_ptr()}"
+    )
+    assert ctx_block_datas.equal(gen_block_datas)
+
+
 if __name__ == "__main__":
-    test_data_sender_and_receiver()
+    # test_data_sender_and_receiver()
+    test_cache_transceiver()
