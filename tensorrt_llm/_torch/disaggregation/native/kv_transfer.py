@@ -12,7 +12,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
-from ..base import BaseTransferAgent
+from ..base import BaseTransferAgent, SessionState
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
@@ -274,15 +274,6 @@ class TransRecvMeta:
     future_for_session: concurrent.futures.Future
     expect_count: int
     remote_name: str
-
-
-class SessionState:
-    INIT = "INIT"
-    WAITING_FOR_SEND = "WAITING_FOR_SEND"
-    TRANSFERRING = "TRANSFERRING"
-    COMPLETED = "COMPLETED"
-    CANCELLED = "CANCELLED"
-    FAILED = "FAILED"
 
 
 class MessageType:
