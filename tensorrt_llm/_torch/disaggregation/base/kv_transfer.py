@@ -78,25 +78,3 @@ class RxSessionBase(ABC):
 
     @abstractmethod
     def get_exception(self) -> Optional[Exception]: ...
-
-
-class SenderBase(ABC):
-    """Handles cache control signals within a single rank."""
-
-    """
-    Creates a sending session for a given LLM request ID.
-    """
-
-    @abstractmethod
-    def create_session(self, llm_rid: int) -> TxSessionBase: ...
-
-
-class ReceiverBase(ABC):
-    """Handles cache control signals within a single rank."""
-
-    """
-    Creates a receiving session for a given LLM request ID.
-    """
-
-    @abstractmethod
-    def create_session(self, llm_rid: int) -> RxSessionBase: ...
