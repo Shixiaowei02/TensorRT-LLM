@@ -32,6 +32,9 @@ class DisaggregatedParams:
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
+    ctx_dp_rank: Optional[int] = None
+    ctx_leader_endpoint: Optional[str] = None
+    disagg_id: Optional[str] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (

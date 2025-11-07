@@ -1,12 +1,12 @@
 import sys
 
-from nixl._api import nixl_agent, nixl_agent_config, nixl_xfer_handle
-
-from ..base import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
 
 nixl_path = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
 if nixl_path not in sys.path:
     sys.path.insert(0, nixl_path)
+
+from nixl._api import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
 
 
 class NixlTransferStatus(TransferStatus):
@@ -49,6 +49,12 @@ class NixlTransferAgent(BaseTransferAgent):
 
     def invalidate_remote_agent(self, name: str):
         self.agent.remove_remote_agent(name)
+
+    def check_remote_descs(self, name: str, memory_descs: list[int]) -> bool:
+        raise NotImplementedError
+
+    def notify_sync_message(self, name: str, sync_message: str):
+        raise NotImplementedError
 
     def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus:
         src_xfer_descs = self.agent.get_xfer_descs(request.src_descs.descs, request.src_descs.type)
