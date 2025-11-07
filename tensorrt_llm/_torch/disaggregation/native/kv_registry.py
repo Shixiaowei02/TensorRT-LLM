@@ -4,11 +4,18 @@ from typing import List
 
 @dataclass
 class WorkerDesc:
+    instance_name: str
     instance_rank: int
     tp_rank: int
+    tp_size: int
     pp_rank: int
+    pp_size: int
     dp_rank: int
+    dp_size: int
     cp_rank: int
+    cp_size: int
+    kv_head_num_per_rank: int
+    tokens_per_block: int
     #  [numLayers,kv_factor,heads,tokens,dimsPerHead]
     dims_per_head: int
     enable_attention_dp: bool
