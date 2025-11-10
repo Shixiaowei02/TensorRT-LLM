@@ -1,5 +1,3 @@
-from abc import ABC
-
 """
 Convenient interface for the following functions.
 
@@ -18,6 +16,3 @@ BlockManager:
 - getStreamDevice()
 
 """
-
-
-class KVAdapter(ABC): ...
