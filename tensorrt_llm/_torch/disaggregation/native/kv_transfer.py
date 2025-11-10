@@ -20,12 +20,6 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
-    AgentRecvArgs,
-    AgentSendArgs,
-    SliceTaskState,
-    TransferGenSideReqInfo,
-)
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -35,6 +29,50 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
+
+
+@dataclass
+class GenReqInfo:
+    ctx_req_id: int
+    instance_name: str
+    instance_rank: int
+    block_ids: list[int]
+    disagg_id: str
+    start_token_id: Optional[int] = None
+
+
+@dataclass
+class AgentRecvArgs:
+    disagg_id: str
+    futrure_for_task: concurrent.futures.Future
+    expect_count: int
+    remote_name: str
+    slice_id: int
+
+
+@dataclass
+class AgentSendArgs:
+    future_for_task: concurrent.futures.Future
+    src_kv_ptrs: List[int]
+    dst_kv_ptrs: List[int]
+    kv_sizes: List[int]
+    expect_count: int
+    remote_name: str
+    src_aux_ptrs: List[int] = None
+    dst_aux_ptrs: List[int] = None
+    aux_sizes: List[int] = None
+    peer_endpoint: Optional[str] = None  # used for send state
+    disagg_id: Optional[str] = None
+    slice_id: Optional[int] = None
+    expect_slice_num: Optional[int] = None
+
+
+class SliceTaskState(Enum):
+    INIT = "Init"
+    READY = "Ready"
+    TRANSFERRING = "Transferring"
+    FINISHED = "Finished"
+    ERR = "Err"
 
 
 def get_local_ip():
@@ -646,7 +684,7 @@ class SliceSenderTask:
     def get_future_for_task(self) -> concurrent.futures.Future:
         return self.future
 
-    def extract_trans_meta(self, dst_info: TransferGenSideReqInfo) -> AgentSendArgs:
+    def extract_trans_meta(self, dst_info: GenReqInfo) -> AgentSendArgs:
         peer_instance_rank_info = self.resource_register.get_peer_instance_rank_info(
             dst_info.instance_name, dst_info.instance_rank
         )
@@ -977,7 +1015,7 @@ class Sender:
         )
 
     def _handle_request_data(self, send_id: bytes, message: list[bytes]):
-        transfer_gen_side_req_info: TransferGenSideReqInfo = pickle.loads(message[1])
+        transfer_gen_side_req_info: GenReqInfo = pickle.loads(message[1])
 
         send_slice_tasks: list[SliceSenderTask] = self._get_send_slice_tasks(
             transfer_gen_side_req_info.disagg_id
@@ -1001,7 +1039,7 @@ class Sender:
             self.socket_cache[endpoint].connect(endpoint)
         return self.socket_cache[endpoint]
 
-    def _save_peer_transfer_req_info(self, peer_transfer_req_info: TransferGenSideReqInfo):
+    def _save_peer_transfer_req_info(self, peer_transfer_req_info: GenReqInfo):
         with self._peer_transfer_recv_req_info_lock:
             if peer_transfer_req_info.ctx_req_id not in self._peer_transfer_recv_req_info_cache:
                 self._peer_transfer_recv_req_info_cache[peer_transfer_req_info.ctx_req_id] = {}
@@ -1019,7 +1057,7 @@ class Sender:
                 self.disagg_id_session_state[peer_transfer_req_info.disagg_id] = SessionState.READY
 
 
-class SenderSession:
+class TxSession:
     def __init__(self, request_id: int, disagg_params: DisaggregatedParams, sender: Sender):
         self.request_id = request_id
         self.disagg_params = disagg_params
@@ -1073,8 +1111,8 @@ class SliceReceiverTask:
     def get_future_for_task(self) -> concurrent.futures.Future:
         return self.future
 
-    def create_gen_side_transfer_req_info(self) -> TransferGenSideReqInfo:
-        return TransferGenSideReqInfo(
+    def create_gen_side_transfer_req_info(self) -> GenReqInfo:
+        return GenReqInfo(
             ctx_req_id=self.disagg_params.ctx_request_id,
             instance_name=self.resource_register.get_instance_rank_info().instance_name,
             instance_rank=self.resource_register.get_instance_rank_info().instance_rank,
@@ -1269,7 +1307,7 @@ class Receiver:
         else:
             raise ValueError(f" session {disagg_id} received unknown task state: {task_state}")
 
-    def _send_data_request(self, endpoint: str, transfer_gen_side_req_info: TransferGenSideReqInfo):
+    def _send_data_request(self, endpoint: str, transfer_gen_side_req_info: GenReqInfo):
         print(
             f" call _send_data_request endpoint: {endpoint} transfer_gen_side_req_info: {transfer_gen_side_req_info}"
         )
@@ -1280,7 +1318,7 @@ class Receiver:
         socket.send_multipart(send_message)
 
 
-class ReceiverSession:
+class RxSession:
     def __init__(self, request_id: int, disagg_params: DisaggregatedParams, receiver: Receiver):
         self.request_id = request_id
 
@@ -1352,15 +1390,15 @@ class TransferWorker:
         self.instance_info.layer_num_per_pp = update_layer_num_per_pp
         self.instance_rank_info.layer_num_per_pp = update_layer_num_per_pp
 
-    def create_sender_session(self, request: LlmRequest) -> SenderSession:
-        return SenderSession(
+    def create_sender_session(self, request: LlmRequest) -> TxSession:
+        return TxSession(
             request_id=request.py_request_id,
             disagg_params=request.py_disaggregated_params,
             sender=self.sender,
         )
 
-    def create_receiver_session(self, request: LlmRequest) -> ReceiverSession:
-        return ReceiverSession(
+    def create_receiver_session(self, request: LlmRequest) -> RxSession:
+        return RxSession(
             request_id=request.py_request_id,
             disagg_params=request.py_disaggregated_params,
             receiver=self.receiver,
