@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Union
 
@@ -176,12 +177,31 @@ class PeerRegistrar:
         return self.ri
 
 
-class PeerMapper:
+class PeerMapperBase(ABC):
+    PtrMapper = Callable[[List[int], int, List[int], int], CopyArgs]
+
+    def __init__(
+        self,
+        registrar: PeerRegistrar,
+        kv_cache_manager: KVCacheManager,
+    ): ...
+
+    @abstractmethod
+    def get_peer_overlap_targets(
+        self, peer_ii: InstanceInfo, peer_dp_rank: int
+    ) -> PeerOverlapTargets: ...
+
+    @abstractmethod
+    def get_kv_ptrs_mapper(self, peer_ri: RankInfo) -> PtrMapper: ...
+
+
+class PeerMapper(PeerMapperBase):
     def __init__(
         self,
         registrar: PeerRegistrar,
         kv_cache_manager: KVCacheManager,
     ):
+        super().__init__(registrar, kv_cache_manager)
         self._registrar = registrar
         self._overlap_cache: Dict[str, PeerOverlapTargets] = {}
         self._kv_mapper_cache: Dict[str, callable] = {}
@@ -292,9 +312,7 @@ class PeerMapper:
         return pd
 
     # ---------------- kv block ptrs mapper ----------------
-    PtrMapper = Callable[[List[int], int, List[int], int], CopyArgs]
-
-    def get_kv_ptrs_mapper(self, peer_ri: RankInfo) -> PtrMapper:
+    def get_kv_ptrs_mapper(self, peer_ri: RankInfo) -> PeerMapperBase.PtrMapper:
         k = self._key(peer_ri.instance_name, peer_ri.instance_rank)
         if k in self._kv_mapper_cache:
             return self._kv_mapper_cache[k]
@@ -315,7 +333,6 @@ class PeerMapper:
         if write_all and self.ri.pp_size == peer_ri.pp_size:
             mapper = self._identity_kv_mapper()
             self._kv_mapper_cache[k] = mapper
-            print(" call get_kv_ptrs_mapper end with mapper 0")
             return mapper
 
         # compute overlapping layers
@@ -383,7 +400,7 @@ class PeerMapper:
     dst_ptrs: [ D0 ] [ D1 ] [ D2 ] ...
     """
 
-    def _identity_kv_mapper(self) -> PtrMapper:
+    def _identity_kv_mapper(self) -> PeerMapperBase.PtrMapper:
         def kv_mapper(
             src_ptrs: List[int], src_size: int, dst_ptrs: List[int], dst_size: int
         ) -> CopyArgs:
@@ -415,7 +432,7 @@ class PeerMapper:
         src_layer_off: int,
         dst_layer_off: int,
         peer_ri: RankInfo,
-    ) -> PtrMapper:
+    ) -> PeerMapperBase.PtrMapper:
         frag_sz = (
             transfer_layers
             * kv_factor
@@ -488,7 +505,7 @@ class PeerMapper:
         src_layer_off: int,
         peer_layer_off: int,
         peer_ri: RankInfo,
-    ) -> PtrMapper:
+    ) -> PeerMapperBase.PtrMapper:
         head_frag = self.ri.tokens_per_block * self.ri.dims_per_head * self.ri.element_size
         cont_head_frag = min(self.ri.kv_head_num_per_rank, peer_ri.kv_head_num_per_rank) * head_frag
 
@@ -515,8 +532,6 @@ class PeerMapper:
         )
         src_layer_num = src_layer_kv_num * kv_factor
         dst_layer_num = dst_layer_kv_num * kv_factor
-
-        print(f"src_layer_num: {src_layer_num}, dst_layer_num: {dst_layer_num}")
 
         def kv_mapper(
             src_ptrs: List[int],
