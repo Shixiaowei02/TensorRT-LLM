@@ -299,7 +299,7 @@ def launch_disaggregated_llm(
         except Exception as e:
             print(f"Error while waiting for futures: {e}")
 
-        perf_paths = ["/v1/perf_metrics", "/perf_metrics"]
+        perf_paths = ["/perf_metrics"]
         perf_fetched = False
         for path in perf_paths:
             perf_url = f"http://localhost:8000{path}"
@@ -407,6 +407,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                         gen_enable_block_reuse):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "perf_metrics_max_requests": 10000,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse
             }
@@ -414,6 +415,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler,
+            "perf_metrics_max_requests": 10000,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
             },
@@ -426,6 +428,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "hostname": "localhost",
             "port": 8000,
             "backend": "pytorch",
+            "perf_metrics_max_requests": 10000,
             "context_servers": {
                 "num_instances": 1,
                 "urls": ["localhost:8001"]
