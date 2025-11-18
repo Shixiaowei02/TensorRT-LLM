@@ -407,6 +407,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                         gen_enable_block_reuse):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse
@@ -415,6 +416,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler,
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
@@ -428,6 +430,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "hostname": "localhost",
             "port": 8000,
             "backend": "pytorch",
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "context_servers": {
                 "num_instances": 1,
@@ -980,6 +983,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "cache_transceiver_config": {
                 "backend": "NIXL"
@@ -987,6 +991,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "cache_transceiver_config": {
                 "backend": "NIXL"
@@ -996,6 +1001,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "hostname": "localhost",
             "port": 8000,
             "backend": "pytorch",
+            "return_perf_metrics": True,
             "perf_metrics_max_requests": 10000,
             "context_servers": {
                 "num_instances": 1,
