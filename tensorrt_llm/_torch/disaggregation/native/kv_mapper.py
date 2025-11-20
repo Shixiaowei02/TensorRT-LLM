@@ -130,10 +130,11 @@ class KVPtrExtractor:
             ptrs.append(ptr)
 
             # numel -> block size
+            # use p[0] , p is a tensor shape (num_blocks,block_size)
             if hasattr(p, "numel") and callable(getattr(p, "numel")):
-                n = p.numel()
+                n = p[0].numel()
             elif hasattr(p, "num_elements"):
-                n = getattr(p, "num_elements")
+                n = getattr(p[0], "num_elements")
             else:
                 raise ValueError("Pool object does not expose numel()/num_elements: " + repr(p))
 
@@ -176,6 +177,9 @@ class PeerRegistrar:
     def get_self_rank_info(self) -> RankInfo:
         return self.ri
 
+    def _key(self, name: str, rank: int) -> str:
+        return name + str(rank)
+
 
 class PeerMapperBase(ABC):
     PtrMapper = Callable[[List[int], int, List[int], int], CopyArgs]
@@ -208,6 +212,9 @@ class PeerMapper(PeerMapperBase):
         self._kv_pool_cache: Dict[str, KVPtrExtractor] = {}
 
         self.kv_block_ptr_extractor = KVPtrExtractor(kv_cache_manager)
+
+        self.ri = self._registrar.get_self_rank_info()
+        self.ii = self._registrar.get_self_instance_info()
 
     # ---------------- kv pool extractor ----------------
     def get_kv_extractor(self, peer_name: str, peer_rank: int) -> KVPtrExtractor:
@@ -311,6 +318,9 @@ class PeerMapper(PeerMapperBase):
         self._overlap_cache[k] = pd
         return pd
 
+    def get_peer_registrar(self) -> PeerRegistrar:
+        return self._registrar
+
     # ---------------- kv block ptrs mapper ----------------
     def get_kv_ptrs_mapper(self, peer_ri: RankInfo) -> PeerMapperBase.PtrMapper:
         k = self._key(peer_ri.instance_name, peer_ri.instance_rank)
@@ -327,10 +337,10 @@ class PeerMapper(PeerMapperBase):
             self.ri.kv_head_num_per_rank * self_tp_per_dp
             != peer_ri.kv_head_num_per_rank * peer_tp_per_dp
         )
-        write_all = is_dup_head or self.ri.is_mla or self_tp_per_dp == peer_tp_per_dp
+        head_match = is_dup_head or self.ri.is_mla or self_tp_per_dp == peer_tp_per_dp
 
         # fast identity when write_all and same pp_size
-        if write_all and self.ri.pp_size == peer_ri.pp_size:
+        if head_match and self.ri.pp_size == peer_ri.pp_size:
             mapper = self._identity_kv_mapper()
             self._kv_mapper_cache[k] = mapper
             return mapper
@@ -346,8 +356,8 @@ class PeerMapper(PeerMapperBase):
         src_offset_layers = start - self_start_layer
         peer_offset_layers = start - peer_start_layer
 
-        if write_all:
-            mapper = self._build_write_all_kv_mapper(
+        if head_match:
+            mapper = self._build_head_match_kv_mapper(
                 transfer_layers, kv_factor, src_offset_layers, peer_offset_layers, peer_ri
             )
             self._kv_mapper_cache[k] = mapper
@@ -409,7 +419,7 @@ class PeerMapper(PeerMapperBase):
         return kv_mapper
 
     """
-    ---- write_all_kv_mapper ----
+    ---- write_head_match_kv_mapper ----
 
     Move/copy entire contiguous block(s) (multi-layer fragment) as a single chunk.
     Align by whole fragment size (frag_sz) and apply a constant source/destination block offset.
@@ -425,7 +435,7 @@ class PeerMapper(PeerMapperBase):
           [ D0 + dst_off ] [ D1 + dst_off ]   ->  (destination frags)
     """
 
-    def _build_write_all_kv_mapper(
+    def _build_head_match_kv_mapper(
         self,
         transfer_layers: int,
         kv_factor: int,
