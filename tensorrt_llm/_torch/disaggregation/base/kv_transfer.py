@@ -40,6 +40,7 @@ class State(Enum):
     READY = "Ready"  # Resources are ready for processing.
     TRANSFERRING = "Transferring"  # Data is being transffered.
     FINISHED = "Finished"  # Processing is finished.
+    META_DATA_SENT = "MetaDataSent"  # Meta data has been sent.
     ERR = "Err"  # An error has occurred.
 
 
@@ -96,3 +97,14 @@ class RxSessionBase(ABC):
 
     @abstractmethod
     def get_exception(self) -> Optional[Exception]: ...
+
+
+class MetaBufferBase(ABC):
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def alloc_slot(self) -> int: ...
+
+    @abstractmethod
+    def free_slot(self, slot_id: int) -> None: ...
