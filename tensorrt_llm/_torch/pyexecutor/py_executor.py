@@ -1811,6 +1811,8 @@ class PyExecutor:
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
             return
+        if not hasattr(self.kv_cache_transceiver, "kv_transfer_timeout_ms"):
+            return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
             return
@@ -1933,7 +1935,9 @@ class PyExecutor:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+        if hasattr(
+                self.kv_cache_transceiver, "kv_transfer_timeout_ms"
+        ) and self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
@@ -1970,7 +1974,9 @@ class PyExecutor:
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
 
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+        if hasattr(
+                self.kv_cache_transceiver, "kv_transfer_timeout_ms"
+        ) and self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in ctx_transmission_reqs:
                 req.py_kv_transfer_start_time = time.time()
 

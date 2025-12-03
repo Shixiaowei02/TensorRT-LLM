@@ -59,7 +59,13 @@ def create_kv_cache_transceiver(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
-
+    if cache_transceiver_config.backend == "PY_NIXL":
+        from tensorrt_llm._torch.disaggregation.native.py_cache_transceiver import \
+            PyNativeCacheTransceiver
+        logger.info("Using PyNativeCacheTransceiver")
+        return PyNativeCacheTransceiver(mapping, dist, kv_cache_manager,
+                                        attention_type,
+                                        cache_transceiver_config)
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config)
 
@@ -120,7 +126,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                                         cache_transceiver_config._to_pybind())
 
     def respond_and_send_async(self, req: LlmRequest):
-        return self.impl.respond_and_send_async(req)
+
+        self.impl.respond_and_send_async(req)
+        req.context_phase_params.disagg_id = req.py_disaggregated_params.disagg_id
+        req.context_phase_params.disagg_info_endpoint = "context_phase_info_endpoint_xx0"
+        return
 
     def request_and_receive_sync(self, req: LlmRequest):
         return self.impl.request_and_receive_sync(req)

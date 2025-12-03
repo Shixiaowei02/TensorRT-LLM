@@ -586,9 +586,13 @@ class Sender:
         send_slice_tasks: list[SliceSenderTask] = self._get_send_slice_tasks(
             transfer_gen_side_req_info.disagg_id
         )
+        self._save_peer_transfer_req_info(transfer_gen_side_req_info)
+        # if send_slice_tasks is None:
+        #     print(" _handle_request_data, send_slice_tasks is None")
+        #     # TODO: awalys save the peer transfer req info
+        #     self._save_peer_transfer_req_info(transfer_gen_side_req_info)
         if send_slice_tasks is None:
-            print(" _handle_request_data, send_slice_tasks is None")
-            self._save_peer_transfer_req_info(transfer_gen_side_req_info)
+            pass
         else:
             for send_slice_task in send_slice_tasks:
                 trans_meta = send_slice_task.extract_trans_meta(transfer_gen_side_req_info)
@@ -623,7 +627,11 @@ class Sender:
             if expect_count == len(
                 self._peer_transfer_req_info_cache[peer_transfer_req_info.disagg_id]
             ):
-                self.tx_sessions[peer_transfer_req_info.disagg_id]().get_state().state = State.READY
+                # TODO: effect in case that pre-allocated flow
+                if peer_transfer_req_info.disagg_id in self.tx_sessions:
+                    self.tx_sessions[
+                        peer_transfer_req_info.disagg_id
+                    ]().get_state().state = State.READY
 
 
 class TxSession(TxSessionBase):
@@ -638,8 +646,8 @@ class TxSession(TxSessionBase):
         self.slice_tasks = []  # slice_id -> SliceTxSession
         self.sender.init_session_resource(self)
 
-        if meta_slot_id is None:
-            raise ValueError("meta_slot_id is None")
+        # if meta_slot_id is None:
+        #     raise ValueError("meta_slot_id is None")
         self.meta_slot_id = meta_slot_id
 
     def send(self, slice: KVSlice) -> TaskIdType:
@@ -796,8 +804,9 @@ class Receiver:
         print(f" _async_request_data_transfer context_peer_infos: {context_peer_infos}")
         transfer_gen_side_req_info = slice_receiver_task.create_gen_side_transfer_req_info()
 
+        ctx_dp_rank = 0 if disagg_params.ctx_dp_rank is None else disagg_params.ctx_dp_rank
         agent_recv_args, target_ranks = slice_receiver_task.extract_trans_meta(
-            context_peer_infos, disagg_params.ctx_dp_rank
+            context_peer_infos, ctx_dp_rank
         )
 
         for rank in target_ranks:
@@ -1029,7 +1038,7 @@ class TransferWorker:
         device_id: int,
         instance_name: str,
         transfer_agent_config: TransferAgentConfig,
-        meta_buffer: MetaBuffer,
+        meta_buffer: Optional[MetaBuffer] = None,
     ):
         self.mapping = mapping
 
@@ -1049,7 +1058,8 @@ class TransferWorker:
         )
 
         self._register_kv_cache()
-        self._register_meta_buffer()
+        if self.meta_buffer is not None:
+            self._register_meta_buffer()
 
         self.sender = Sender(self.peer_mapper, device_id, self.transfer_agent)
         self.receiver = Receiver(self.peer_mapper, device_id, self.transfer_agent)
@@ -1067,7 +1077,10 @@ class TransferWorker:
         self.instance_rank_info.layer_num_per_pp = update_layer_num_per_pp
 
     def create_sender_session(self, request: LlmRequest) -> TxSession:
-        meta_slot_id = self.meta_buffer.alloc_slot()
+        if self.meta_buffer is not None:
+            meta_slot_id = self.meta_buffer.alloc_slot()
+        else:
+            meta_slot_id = None
         return TxSession(
             request_id=request.py_request_id,
             disagg_params=request.py_disaggregated_params,
@@ -1076,7 +1089,10 @@ class TransferWorker:
         )
 
     def create_receiver_session(self, request: LlmRequest) -> RxSession:
-        meta_slot_id = self.meta_buffer.alloc_slot()
+        if self.meta_buffer is not None:
+            meta_slot_id = self.meta_buffer.alloc_slot()
+        else:
+            meta_slot_id = None
         return RxSession(
             request_id=request.py_request_id,
             disagg_params=request.py_disaggregated_params,
@@ -1086,7 +1102,8 @@ class TransferWorker:
 
     def clear_session(self, session: TxSession | RxSession):
         meta_slot_id = session.meta_slot_id
-        self.meta_buffer.free_slot(meta_slot_id)
+        if self.meta_buffer is not None:
+            self.meta_buffer.free_slot(meta_slot_id)
 
     def init_instance_info(self, instance_name):
         rank = self.mapping.rank
@@ -1149,7 +1166,9 @@ class TransferWorker:
             server_endpoint="",
             recv_endpoint="",
             transfer_engine_info=bytes(),
-            meta_buffer_info=self.meta_buffer.get_buffer_info(),
+            meta_buffer_info=self.meta_buffer.get_buffer_info()
+            if self.meta_buffer is not None
+            else None,
         )
 
     def _register_kv_cache(self):
@@ -1318,14 +1337,16 @@ def test_transfer_worker():
     gen_kv_cache_manager.impl.add_sequence(
         gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
     )
+
+    print("ctx async_send before")
+    send_session = ctx_transfer_worker.create_sender_session(ctx_request)
+    print("ctx async_send after")
+
     print("gen async_receive before")
     recv_session = gen_transfer_worker.create_receiver_session(gen_request)
 
     time.sleep(0.1)
     print("gen async_receive after")
-    print("ctx async_send before")
-    send_session = ctx_transfer_worker.create_sender_session(ctx_request)
-    print("ctx async_send after")
 
     context_block_ids = ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
     print(f"context_block_ids: {context_block_ids}")

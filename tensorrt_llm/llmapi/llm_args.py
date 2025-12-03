@@ -1644,10 +1644,11 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
-        default=None,
-        description=
-        "The communication backend type to use for the cache transceiver.")
+    backend: Optional[Literal[
+        "DEFAULT", "UCX", "NIXL", "MPI", "PY_NIXL"]] = Field(
+            default=None,
+            description=
+            "The communication backend type to use for the cache transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -2887,6 +2888,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
+        print(f"moe_config.load_balancer: {self.moe_config.load_balancer}")
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
                 raise FileNotFoundError(
@@ -2905,6 +2907,9 @@ class TorchLlmArgs(BaseLlmArgs):
             try:
                 self.moe_config.load_balancer = MoeLoadBalancerConfig(
                     **self.moe_config.load_balancer)
+                print(
+                    f"moe_config.load_balancer: {self.moe_config.load_balancer}"
+                )
             except Exception as e:
                 raise ValueError(
                     f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"

@@ -16,6 +16,7 @@ import asyncio
 import copy
 import os
 from typing import Any, Callable, Dict, Optional
+import uuid
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -47,6 +48,7 @@ from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 
 class OpenAIDisaggregatedService(OpenAIService):
+
     def __init__(
         self,
         config: DisaggServerConfig,
@@ -78,7 +80,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._disagg_cluster_manager = None
 
     async def openai_completion(
-        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
@@ -87,8 +91,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             if type(request.prompt) is list and len(request.prompt) == 1:
                 request.prompt = request.prompt[0]
             elif not isinstance(request.prompt, list) or not all(
-                isinstance(x, int) for x in request.prompt
-            ):
+                    isinstance(x, int) for x in request.prompt):
                 raise ValueError(
                     "Disaggregated server currently only supports single string prompt or list of integers in request"
                 )
@@ -96,14 +99,18 @@ class OpenAIDisaggregatedService(OpenAIService):
         return await self._send_disagg_request(request, hooks)
 
     async def openai_chat_completion(
-        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
     async def _send_disagg_request(
-        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
         if hooks:
             hooks.on_req_begin(request)
@@ -111,7 +118,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         reserved_gen_server = None
         reserved_ctx_server = None
         # reserve a gen_server if conditional disagg is needed
-        reserved_gen_server, need_ctx = await self._check_conditional_disagg(request)
+        reserved_gen_server, need_ctx = await self._check_conditional_disagg(
+            request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
@@ -119,14 +127,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_req = self._get_ctx_request(request)
             # ctx generator is empty
             ctx_response = await self._ctx_client.send_request(
-                ctx_req, server=reserved_ctx_server, hooks=hooks
-            )
+                ctx_req, server=reserved_ctx_server, hooks=hooks)
             await self._verify_ctx_response(ctx_response)
             gen_req = self._get_gen_request(request, ctx_response)
         if ctx_response is None or self._need_gen(ctx_response):
             return await self._gen_client.send_request(
-                gen_req, server=reserved_gen_server, hooks=hooks
-            )
+                gen_req, server=reserved_gen_server, hooks=hooks)
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
@@ -135,14 +141,21 @@ class OpenAIDisaggregatedService(OpenAIService):
             return ctx_response
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
-        if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
+        if response and response.choices[0].finish_reason not in [
+                "length", "not_finished"
+        ]:
             del response.choices[0].disaggregated_params
             return False
         return True
 
-    def _get_ctx_request(self, request: UCompletionRequest) -> UCompletionRequest:
+    def _get_ctx_request(self,
+                         request: UCompletionRequest) -> UCompletionRequest:
         ctx_request = copy.deepcopy(request)
-        ctx_request.disaggregated_params = DisaggregatedParams(request_type="context_only")
+        unique_disagg_id = str(uuid.uuid4())
+        ctx_request.disaggregated_params = DisaggregatedParams(
+            request_type="context_only",
+            disagg_id=unique_disagg_id,
+        )
         ctx_request.stream = False
         ctx_request.stream_options = None
         return ctx_request
@@ -152,7 +165,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         request: UCompletionRequest,
         ctx_response: UCompletionResponse,
     ) -> UCompletionRequest:
-        request.disaggregated_params = ctx_response.choices[0].disaggregated_params
+        request.disaggregated_params = ctx_response.choices[
+            0].disaggregated_params
         request.disaggregated_params.request_type = "generation_only"
         # Replace the string prompt with prompt_tokens_ids
         if isinstance(request, CompletionRequest):
@@ -161,19 +175,18 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.prompt_token_ids = ctx_response.prompt_token_ids
         return request
 
-    async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
+    async def _check_conditional_disagg(self,
+                                        request: UCompletionRequest) -> bool:
         if self.conditional_disagg_config:
             assert isinstance(self._gen_router, KvCacheAwareRouter)
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
             gen_server, info = await self._gen_router.get_next_server(request)
             match_length = sum(info["matches"])
-            total_length = sum(len(token_list) for token_list in info["token_lists"])
-            if (
-                match_length == 0
-                or total_length - match_length
-                > self.conditional_disagg_config.max_local_prefill_length
-            ):
+            total_length = sum(
+                len(token_list) for token_list in info["token_lists"])
+            if (match_length == 0 or total_length - match_length
+                    > self.conditional_disagg_config.max_local_prefill_length):
                 return gen_server, True
             return gen_server, False
         return None, True
@@ -195,7 +208,8 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def cluster_info(self) -> Dict[str, Any]:
         cluster_info = {"is_ready": await self.is_ready()}
         if self._disagg_cluster_manager:
-            cluster_info.update(await self._disagg_cluster_manager.cluster_info())
+            cluster_info.update(await
+                                self._disagg_cluster_manager.cluster_info())
         return cluster_info
 
     async def is_ready(self) -> bool:
@@ -212,30 +226,28 @@ class OpenAIDisaggregatedService(OpenAIService):
         return self._config.conditional_disagg_config
 
     async def setup(self) -> None:
-        self._ctx_client = self._client_factory(
-            self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
-        )
-        self._gen_client = self._client_factory(
-            self._gen_router, ServerRole.GENERATION, self._config.max_retries
-        )
+        self._ctx_client = self._client_factory(self._ctx_router,
+                                                ServerRole.CONTEXT,
+                                                self._config.max_retries)
+        self._gen_client = self._client_factory(self._gen_router,
+                                                ServerRole.GENERATION,
+                                                self._config.max_retries)
 
         if self.disagg_cluster_config and self._cluster_storage:
             logger.info("Starting disagg cluster manager")
             self._disagg_cluster_manager = DisaggClusterManager(
-                self.disagg_cluster_config, self._cluster_storage
-            )
+                self.disagg_cluster_config, self._cluster_storage)
             await self._disagg_cluster_manager.start()
-            await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
+            await self._disagg_cluster_manager.watch_workers(
+                on_event=self._on_worker_event)
             logger.info("Disagg cluster manager started")
         else:
             if self._metadata_server and self._metadata_config:
                 logger.info("Starting server monitoring via metadata service")
                 await self._ctx_router.start_server_monitoring(
-                    self._metadata_config.refresh_interval
-                )
+                    self._metadata_config.refresh_interval)
                 await self._gen_router.start_server_monitoring(
-                    self._metadata_config.refresh_interval
-                )
+                    self._metadata_config.refresh_interval)
             await self._wait_for_all_servers_ready()
 
     async def teardown(self) -> None:
@@ -250,13 +262,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             await self._gen_router.stop_server_monitoring()
 
     async def _wait_for_all_servers_ready(self) -> None:
+
         async def check_servers_ready():
             elapsed_time = 0
             interval = self._health_check_interval_secs
             while elapsed_time < self._server_start_timeout_secs:
                 _, unready_ctx_servers = await self._ctx_client.check_ready()
                 _, unready_gen_servers = await self._gen_client.check_ready()
-                if len(unready_ctx_servers) == 0 and len(unready_gen_servers) == 0:
+                if len(unready_ctx_servers) == 0 and len(
+                        unready_gen_servers) == 0:
                     logger.info("All servers are ready")
                     return
                 logger.info(
@@ -266,12 +280,19 @@ class OpenAIDisaggregatedService(OpenAIService):
                 elapsed_time += interval
 
         try:
-            await asyncio.wait_for(check_servers_ready(), timeout=self._server_start_timeout_secs)
+            await asyncio.wait_for(check_servers_ready(),
+                                   timeout=self._server_start_timeout_secs)
         except asyncio.TimeoutError:
-            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+            raise TimeoutError(
+                "Timeout waiting for context and generation servers to be ready"
+            )
 
-    async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
-        router_map = {ServerRole.CONTEXT: self._ctx_router, ServerRole.GENERATION: self._gen_router}
+    async def _on_worker_event(self, worker_info: WorkerInfo,
+                               event_type: WatchEventType):
+        router_map = {
+            ServerRole.CONTEXT: self._ctx_router,
+            ServerRole.GENERATION: self._gen_router
+        }
         worker_addr = f"{worker_info.host}:{worker_info.port}"
         try:
             router = router_map[worker_info.role]
@@ -279,20 +300,28 @@ class OpenAIDisaggregatedService(OpenAIService):
                 await router.add_server(worker_addr)
             elif event_type == WatchEventType.DELETE:
                 await router.remove_server(worker_addr)
-            logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
+            logger.info(
+                f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}"
+            )
         except KeyError:
             logger.error(
                 f"Unknown worker role: {worker_info.role}, Worker {worker_info.worker_id} event: {event_type.name}"
             )
 
-    async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
+    async def _verify_ctx_response(self,
+                                   ctx_response: UCompletionResponse) -> None:
         if ctx_response:
             if len(ctx_response.choices) != 1:
                 raise ValueError(
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
             if ctx_response.choices[0].disaggregated_params is None:
-                raise ValueError("Context server did not return disaggregated params")
-            if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
-                raise ValueError("Invalid disaggregated params in context phase response.")
+                raise ValueError(
+                    "Context server did not return disaggregated params")
+            if ctx_response.choices[
+                    0].disaggregated_params.ctx_request_id is None:
+                raise ValueError(
+                    "Invalid disaggregated params in context phase response.")
+            if ctx_response.choices[0].disaggregated_params.disagg_id is None:
+                raise ValueError("Invalid disaggregated params in context phase response. disagg_id is None")
             return ctx_response

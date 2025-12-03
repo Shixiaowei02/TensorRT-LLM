@@ -1,0 +1,364 @@
+import concurrent
+import uuid
+from itertools import chain
+
+import tensorrt_llm
+from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
+from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
+    TransferAgentConfig,
+    TransferWorker,
+)
+from tensorrt_llm._torch.distributed.communicator import Distributed
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ContextPhaseParams
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.mapping import Mapping
+
+CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
+AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
+CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
+BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
+
+
+class PyNativeCacheTransceiver(KvCacheTransceiver):
+    def __init__(
+        self,
+        mapping: Mapping,
+        dist: Distributed,
+        kv_cache_manager: KVCacheManager,
+        attention_type: AttentionTypeCpp,
+        cache_transceiver_config: CacheTransceiverConfig,
+    ):
+        self.dist: Distributed = dist
+        self.kv_cache_manager = kv_cache_manager
+        self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.sender_future_timeout_ms = (
+            cache_transceiver_config.kv_transfer_sender_future_timeout_ms
+        )
+        instance_name = None
+        if dist.rank == 0:
+            instance_name = str(uuid.uuid4())
+            dist.broadcast(instance_name, 0)
+        else:
+            instance_name = dist.broadcast(instance_name, 0)
+
+        self.instance_name = instance_name
+
+        device_id = mapping.local_rank
+
+        transfer_angent_config = TransferAgentConfig()
+
+        self.transfer_worker = TransferWorker(
+            kv_cache_manager=kv_cache_manager,
+            mapping=mapping,
+            device_id=device_id,
+            instance_name=instance_name,
+            transfer_agent_config=transfer_angent_config,
+        )
+
+        self.context_info_endpoint = None
+        if self.dist.rank == 0:
+            self.context_info_endpoint = self.transfer_worker.instance_info_server.get_endpoint()
+            self.dist.broadcast(self.context_info_endpoint, 0)
+        else:
+            self.context_info_endpoint = self.dist.broadcast(self.context_info_endpoint, 0)
+
+        self.mapping = mapping
+
+        self.need_tp_sync = mapping.tp_size > 1 and (not mapping.enable_attention_dp)
+
+        ctx_server_endpoint = self.transfer_worker.sender.server_endpoint
+        layer_num = len(self.kv_cache_manager.pp_layers)
+
+        ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
+        layer_num_per_pp = self.dist.pp_allgather(layer_num)
+        self.transfer_worker.update_instance_info_with_collective_info(
+            update_endpoints=ctx_server_endpoints, update_layer_num_per_pp=layer_num_per_pp
+        )
+
+        logger.info(f" transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
+        logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
+        logger.info(f"self.context_info_endpoint: {self.context_info_endpoint}")
+        self.send_sessions = {}  # request_id to send_session
+        self.send_task_ids = {}  # request_id to send_task_id
+        self.recv_sessions = {}  # request_id to recv_session
+        self.recv_task_ids = {}  # request_id to recv_task_id
+
+        self.sender_future_to_request_id = {}  # future to request_id
+
+        self.receiver_future_to_request_id = {}  # future to request_id
+        self.id_to_request = {}  # request_id to request
+
+    def _create_kv_slice(self, req: LlmRequest):
+        block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
+        return KVSlice(is_last_slice=True, block_ids=block_ids)
+
+    def respond_and_send_async(self, req: LlmRequest):
+        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        send_session = self.transfer_worker.create_sender_session(req)
+        self.send_sessions[req.request_id] = send_session
+        kv_slice = self._create_kv_slice(req)
+        send_task_id = send_session.send(kv_slice)
+        self.send_task_ids[req.request_id] = send_task_id
+        self.sender_future_to_request_id[
+            send_session.slice_tasks[send_task_id].get_future_for_task()
+        ] = req.request_id
+
+        req.context_phase_params = ContextPhaseParams(
+            first_gen_tokens=[],
+            req_id=req.request_id,
+            opaque_state=None,
+            draft_tokens=None,
+            disagg_id=req.py_disaggregated_params.disagg_id,
+            disagg_info_endpoint=self.context_info_endpoint,
+        )
+        self.id_to_request[req.request_id] = req
+
+        return
+
+        # executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt}
+
+    def request_and_receive_sync(self, req: LlmRequest):
+        raise NotImplementedError("request_and_receive_sync is not implemented")
+
+    def request_and_receive_async(self, req: LlmRequest):
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        recv_session = self.transfer_worker.create_receiver_session(req)
+        self.recv_sessions[req.request_id] = recv_session
+        kv_slice = self._create_kv_slice(req)
+        recv_task_id = recv_session.receive(kv_slice)
+        self.recv_task_ids[req.request_id] = recv_task_id
+        self.receiver_future_to_request_id[
+            recv_session.slice_tasks[recv_task_id].get_future_for_task()
+        ] = req.request_id
+        self.id_to_request[req.request_id] = req
+        return
+
+    def check_context_transfer_status(self, at_least_request_num: int):
+        block_all = at_least_request_num is None
+
+        wait_num = at_least_request_num if not block_all else 0
+
+        local_completed_request_ids = []
+        local_failed_request_ids = []
+        for request_id, session in self.send_sessions.items():
+            if session.get_state().state == State.FINISHED:
+                local_completed_request_ids.append(request_id)
+            elif session.get_state().state == State.ERR:
+                local_failed_request_ids.append(request_id)
+        local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+        if self.need_tp_sync:
+            sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
+        else:
+            sync_request_ids = [local_sync_request_ids]
+
+        frequency_map = {}
+        for request_id in list(chain.from_iterable(sync_request_ids)):
+            frequency_map[request_id] = frequency_map.get(request_id, 0) + 1
+        sorted_frequency_map = sorted(frequency_map.items(), key=lambda x: x[1], reverse=True)
+        sync_size = self.dist.tp_size if self.need_tp_sync else 1
+        to_complete_request_ids = []
+        for request_id, frequency in sorted_frequency_map:
+            if frequency == sync_size:
+                to_complete_request_ids.append(request_id)
+            else:
+                break
+        for request_id in self.id_to_request.keys():
+            if len(to_complete_request_ids) >= wait_num:
+                break
+            if request_id not in to_complete_request_ids:
+                to_complete_request_ids.append(request_id)
+        if block_all:
+            to_complete_request_ids = self.id_to_request.keys()
+        completed_request_ids = []
+        timeout_request_ids = []
+        failed_request_ids = []
+        for request_id in to_complete_request_ids:
+            future = (
+                self.send_sessions[request_id]
+                .slice_tasks[self.send_task_ids[request_id]]
+                .get_future_for_task()
+            )
+            try:
+                sync_status = future.result(timeout=self.sender_future_timeout_ms)
+                if sync_status == "SUCCESS":
+                    completed_request_ids.append(request_id)
+                else:
+                    failed_request_ids.append(request_id)
+            except concurrent.futures.TimeoutError:
+                timeout_request_ids.append(request_id)
+            except Exception:
+                failed_request_ids.append(request_id)
+        for request_id in completed_request_ids + timeout_request_ids + failed_request_ids:
+            if request_id in completed_request_ids:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            elif request_id in timeout_request_ids:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
+            elif request_id in failed_request_ids:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
+            del self.id_to_request[request_id]
+            del self.sender_future_to_request_id[future]
+            del self.send_sessions[request_id]
+            del self.send_task_ids[request_id]
+
+        return
+
+    def check_context_transfer_status_v1(self, at_least_request_num: int):
+        # TODO: add logic to handle multiple tp
+        # block_all = at_least_request_num is None
+
+        wait_num = (
+            at_least_request_num
+            if at_least_request_num is not None
+            else len(self.id_to_request.keys())
+        )
+
+        remaining_futures = self.sender_future_to_request_id.keys()
+        completed_futures_appended = []
+        while len(completed_futures_appended) < wait_num:
+            completed_futures, remaining_futures = concurrent.futures.wait(
+                remaining_futures, timeout=None, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in completed_futures:
+                completed_futures_appended.append(future)
+
+        completed_request_ids = []
+        failed_request_ids = []
+        for request_id, session in self.send_sessions.items():
+            if session.get_state().state == State.FINISHED:
+                completed_request_ids.append(request_id)
+            elif session.get_state().state == State.ERR:
+                failed_request_ids.append(request_id)
+        for request_id in completed_request_ids + failed_request_ids:
+            if request_id in completed_request_ids:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            else:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
+            del self.id_to_request[request_id]
+
+            del self.sender_future_to_request_id[
+                session.slice_tasks[self.send_task_ids[request_id]].get_future_for_task()
+            ]
+            del self.send_sessions[request_id]
+            del self.send_task_ids[request_id]
+
+        return
+
+    def check_gen_transfer_status(self, at_least_request_num: int):
+        block_all = at_least_request_num is None
+
+        wait_num = at_least_request_num if not block_all else 0
+
+        local_completed_request_ids = []
+        local_failed_request_ids = []
+        for request_id, session in self.recv_sessions.items():
+            if session.get_state().state == State.FINISHED:
+                local_completed_request_ids.append(request_id)
+            elif session.get_state().state == State.ERR:
+                local_failed_request_ids.append(request_id)
+        local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+        if self.need_tp_sync:
+            sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
+        else:
+            sync_request_ids = [local_sync_request_ids]
+
+        frequency_map = {}
+        for request_id in list(chain.from_iterable(sync_request_ids)):
+            frequency_map[request_id] = frequency_map.get(request_id, 0) + 1
+        sorted_frequency_map = sorted(frequency_map.items(), key=lambda x: x[1], reverse=True)
+        sync_size = self.dist.tp_size if self.need_tp_sync else 1
+        to_complete_request_ids = []
+        for request_id, frequency in sorted_frequency_map:
+            if frequency == sync_size:
+                to_complete_request_ids.append(request_id)
+            else:
+                break
+        for request_id in self.recv_sessions.keys():
+            if len(to_complete_request_ids) >= wait_num:
+                break
+            if request_id not in to_complete_request_ids:
+                to_complete_request_ids.append(request_id)
+        if block_all:
+            to_complete_request_ids = list(self.recv_sessions.keys())
+        completed_request_ids = []
+        failed_request_ids = []
+        for request_id in to_complete_request_ids:
+            future = (
+                self.recv_sessions[request_id]
+                .slice_tasks[self.recv_task_ids[request_id]]
+                .get_future_for_task()
+            )
+            try:
+                sync_status = future.result(timeout=self.sender_future_timeout_ms)
+                if sync_status == "SUCCESS":
+                    completed_request_ids.append(request_id)
+                else:
+                    failed_request_ids.append(request_id)
+            except Exception:
+                failed_request_ids.append(request_id)
+        for request_id in completed_request_ids + failed_request_ids:
+            future = (
+                self.recv_sessions[request_id]
+                .slice_tasks[self.recv_task_ids[request_id]]
+                .get_future_for_task()
+            )
+            if request_id in completed_request_ids:
+                self.id_to_request[
+                    request_id
+                ].state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            elif request_id in failed_request_ids:
+                self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
+            del self.id_to_request[request_id]
+            del self.receiver_future_to_request_id[future]
+            del self.recv_sessions[request_id]
+            del self.recv_task_ids[request_id]
+
+        return
+
+    def check_gen_transfer_status_v1(self, at_least_request_num: int):
+        # TODO: add logic to handle multiple tp
+        # block_all = at_least_request_num is None
+
+        wait_num = (
+            at_least_request_num
+            if at_least_request_num is not None
+            else len(self.receiver_future_to_request_id)
+        )
+
+        remaining_futures = self.receiver_future_to_request_id.keys()
+        completed_futures_appended = []
+        while len(completed_futures_appended) < wait_num:
+            completed_futures, remaining_futures = concurrent.futures.wait(
+                remaining_futures, timeout=None, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in completed_futures:
+                completed_futures_appended.append(future)
+
+        completed_request_ids = []
+        for request_id, session in self.recv_sessions.items():
+            if session.get_state().state == State.FINISHED:
+                completed_request_ids.append(request_id)
+
+        for request_id in completed_request_ids:
+            self.id_to_request[request_id].state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            del self.id_to_request[request_id]
+            del self.receiver_future_to_request_id[
+                session.slice_tasks[self.recv_task_ids[request_id]].get_future_for_task()
+            ]
+            del self.recv_sessions[request_id]
+            del self.recv_task_ids[request_id]
+
+        return
+
+    def check_gen_transfer_complete(self):
+        #     return mRequesterFutures.empty();
+
+        return len(self.receiver_future_to_request_id) == 0
+
+    def cancel_request(self, req: LlmRequest):
+        raise NotImplementedError("cancel_request is not implemented")
+        # self.transfer_worker.cancel_request(req)

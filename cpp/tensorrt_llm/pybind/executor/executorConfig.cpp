@@ -431,6 +431,7 @@ void initConfigBindings(pybind11::module_& m)
         .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
         .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
         .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
+        .value("PY_NIXL", tle::CacheTransceiverConfig::BackendType::PY_NIXL)
         .def("from_string",
             [](std::string const& str)
             {
@@ -442,6 +443,8 @@ void initConfigBindings(pybind11::module_& m)
                     return tle::CacheTransceiverConfig::BackendType::UCX;
                 if (str == "NIXL" || str == "nixl")
                     return tle::CacheTransceiverConfig::BackendType::NIXL;
+                if (str == "PY_NIXL" || str == "py_nixl")
+                    return tle::CacheTransceiverConfig::BackendType::PY_NIXL;
                 throw std::runtime_error("Invalid backend type: " + str);
             });
 

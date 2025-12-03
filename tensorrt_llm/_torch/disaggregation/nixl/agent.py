@@ -1,12 +1,8 @@
-import sys
+import time
+
+from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
 
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
-
-nixl_path = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
-if nixl_path not in sys.path:
-    sys.path.insert(0, nixl_path)
-
-from nixl._api import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
 
 
 class NixlTransferStatus(TransferStatus):
@@ -20,18 +16,24 @@ class NixlTransferStatus(TransferStatus):
 
     def wait(self):
         status = "PROC"
+        sleep_time = 0.0001  # 0.1ms
+        max_sleep_time = 0.01  # 10ms
         while status == "PROC":
             status = self.agent.check_xfer_state(self.handle)
             if status == "ERR":
                 return False  # transfer failed
-            # sleep(0.1)
+            # sleep to release GIL
+            time.sleep(sleep_time)
+            sleep_time = min(sleep_time * 2, max_sleep_time)
         return True
 
 
 class NixlTransferAgent(BaseTransferAgent):
     def __init__(self, name: str, use_prog_thread: bool):
         self.name = name
-        agent_config = nixl_agent_config(enable_prog_thread=use_prog_thread, backends=["UCX"])
+        agent_config = nixl_agent_config(
+            enable_prog_thread=use_prog_thread, backends=["UCX"], num_threads=8
+        )
         self.agent = nixl_agent(name, agent_config)
 
     def register_memory(self, descs: RegMemoryDescs):
