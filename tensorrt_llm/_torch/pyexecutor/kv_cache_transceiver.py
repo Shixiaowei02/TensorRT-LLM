@@ -126,11 +126,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                                         cache_transceiver_config._to_pybind())
 
     def respond_and_send_async(self, req: LlmRequest):
-
-        self.impl.respond_and_send_async(req)
-        req.context_phase_params.disagg_id = req.py_disaggregated_params.disagg_id
-        req.context_phase_params.disagg_info_endpoint = "context_phase_info_endpoint_xx0"
-        return
+        return self.impl.respond_and_send_async(req)
 
     def request_and_receive_sync(self, req: LlmRequest):
         return self.impl.request_and_receive_sync(req)

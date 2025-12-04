@@ -2888,7 +2888,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
-        print(f"moe_config.load_balancer: {self.moe_config.load_balancer}")
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
                 raise FileNotFoundError(
@@ -2907,9 +2906,6 @@ class TorchLlmArgs(BaseLlmArgs):
             try:
                 self.moe_config.load_balancer = MoeLoadBalancerConfig(
                     **self.moe_config.load_balancer)
-                print(
-                    f"moe_config.load_balancer: {self.moe_config.load_balancer}"
-                )
             except Exception as e:
                 raise ValueError(
                     f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"

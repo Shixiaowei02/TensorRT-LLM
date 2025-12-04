@@ -101,7 +101,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         {
             result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
                 mContextPhaseParams.value().releaseState(), std::nullopt, mContextPhaseParams.value().getDisaggId(),
-                mContextPhaseParams.value().getDisaggInfoEndpoint()};
+                mContextPhaseParams.value().getCtxDpRank(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
         else
         {
@@ -109,7 +109,8 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
             // TODO: llm request set context phase params with mContextPhaseParams.disaggId
             result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
                 mContextPhaseParams.value().releaseState(), *getDraftTokens(),
-                mContextPhaseParams.value().getDisaggId(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
+                mContextPhaseParams.value().getDisaggId(), mContextPhaseParams.value().getCtxDpRank(),
+                mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
     }
 

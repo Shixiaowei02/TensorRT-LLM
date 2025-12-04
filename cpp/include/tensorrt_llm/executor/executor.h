@@ -437,13 +437,14 @@ public:
     using RequestIdType = std::uint64_t;
 
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens,
-        std::optional<std::string> disaggId = std::nullopt,
+        std::optional<std::string> disaggId = std::nullopt, std::optional<SizeType32> ctxDpRank = std::nullopt,
         std::optional<std::string> disaggInfoEndpoint = std::nullopt);
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens,
-        std::optional<std::string> disaggId = std::nullopt,
+        std::optional<std::string> disaggId = std::nullopt, std::optional<SizeType32> ctxDpRank = std::nullopt,
         std::optional<std::string> disaggInfoEndpoint = std::nullopt);
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState,
         std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId = std::nullopt,
+        std::optional<SizeType32> ctxDpRank = std::nullopt,
         std::optional<std::string> disaggInfoEndpoint = std::nullopt);
 
     ContextPhaseParams(ContextPhaseParams const&);
@@ -468,6 +469,8 @@ public:
 
     [[nodiscard]] std::optional<std::string> const& getDisaggId() const noexcept;
     void setDisaggId(std::optional<std::string> disaggId) noexcept;
+    [[nodiscard]] std::optional<SizeType32> getCtxDpRank() const noexcept;
+    void setCtxDpRank(std::optional<SizeType32> ctxDpRank) noexcept;
     [[nodiscard]] std::optional<std::string> const& getDisaggInfoEndpoint() const noexcept;
     void setDisaggInfoEndpoint(std::optional<std::string> disaggInfoEndpoint) noexcept;
 
@@ -490,6 +493,9 @@ private:
 
     /// @brief The disaggregated id
     std::optional<std::string> mDisaggId;
+
+    /// @brief The context phase data parallel rank
+    std::optional<SizeType32> mCtxDpRank;
 
     /// @brief The disaggregated info endpoint
     std::optional<std::string> mDisaggInfoEndpoint;

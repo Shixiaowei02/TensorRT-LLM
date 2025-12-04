@@ -165,6 +165,7 @@ class PeerRegistrar:
 
     # ---------------- public simple APIs ----------------
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
+        # TODO: check  if peer is valid for registration
         self._peer_ri_cache[self._key(peer_name, peer_rank)] = peer_ri
 
     def unregister(self, peer_name: str, peer_rank: int):
@@ -336,12 +337,16 @@ class PeerMapper(PeerMapperBase):
         self_tp_rank = self.ri.tp_rank % self_tp_per_dp
         peer_tp_rank = peer_ri.tp_rank % peer_tp_per_dp
 
+        # head_num_per_rank =1 when is_dup_head
         is_dup_head = (
             self.ri.kv_head_num_per_rank * self_tp_per_dp
             != peer_ri.kv_head_num_per_rank * peer_tp_per_dp
         )
         head_match = is_dup_head or self.ri.is_mla or self_tp_per_dp == peer_tp_per_dp
-
+        print(
+            f"head_match: {head_match}, is_dup_head: {is_dup_head}, self.ri.is_mla: {self.ri.is_mla}, "
+            f"self_tp_per_dp: {self_tp_per_dp}, peer_tp_per_dp: {peer_tp_per_dp}"
+        )
         # fast identity when write_all and same pp_size
         if head_match and self.ri.pp_size == peer_ri.pp_size:
             mapper = self._identity_kv_mapper()
@@ -482,7 +487,7 @@ class PeerMapper(PeerMapperBase):
         ) -> CopyArgs:
             s_trans = [p + s_off for p in src_ptrs]
             d_trans = [p + d_off for p in dst_ptrs]
-            return s_trans, s_frag, d_trans
+            return s_trans, d_trans, s_frag
 
         return kv_mapper
 
@@ -556,14 +561,8 @@ class PeerMapper(PeerMapperBase):
             src_layer_num: int = src_layer_num,
             src_layer_kv_num: int = src_layer_kv_num,
             dst_head_off: int = dst_head_off,
-            start_layer: int = max(
-                sum(self.ri.layer_num_per_pp[: self.ri.pp_rank]),
-                sum(peer_ri.layer_num_per_pp[: peer_ri.pp_rank]),
-            ),
             dst_layer_num: int = dst_layer_num,
             dst_layer_kv_num: int = dst_layer_kv_num,
-            self_start_off: int = src_layer_off,
-            dst_start_off: int = peer_layer_off,
             cont_frag: int = cont_head_frag,
         ) -> CopyArgs:
             src_out: List[int] = []
@@ -572,8 +571,8 @@ class PeerMapper(PeerMapperBase):
                 src_base = src_ptrs[i]
                 dst_base = dst_ptrs[i]
                 for idx in range(transfer_layers):
-                    src_layer_idx = start_layer + idx - self_start_off
-                    dst_layer_idx = start_layer + idx - dst_start_off
+                    src_layer_idx = src_layer_off + idx
+                    dst_layer_idx = peer_layer_off + idx
                     for kv in range(kv_factor):
                         src_ptr = (
                             src_base

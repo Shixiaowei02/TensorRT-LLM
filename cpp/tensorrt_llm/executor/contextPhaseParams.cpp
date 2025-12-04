@@ -28,35 +28,38 @@ namespace tensorrt_llm::executor
 {
 
 ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state,
-    std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId,
+    std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId, std::optional<SizeType32> ctxDpRank,
     std::optional<std::string> disaggInfoEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mState{StatePtr{state, deleter}}
     , mDraftTokens{std::move(draftTokens)}
     , mDisaggId{std::move(disaggId)}
+    , mCtxDpRank{ctxDpRank}
     , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
 {
 }
 
 ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
-    std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId,
+    std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId, std::optional<SizeType32> ctxDpRank,
     std::optional<std::string> disaggInfoEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mDraftTokens{std::move(draftTokens)}
     , mDisaggId{std::move(disaggId)}
+    , mCtxDpRank{ctxDpRank}
     , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
 {
 }
 
 ContextPhaseParams::ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId,
     std::vector<char> const& serializedState, std::optional<VecTokens> draftTokens, std::optional<std::string> disaggId,
-    std::optional<std::string> disaggInfoEndpoint)
+    std::optional<SizeType32> ctxDpRank, std::optional<std::string> disaggInfoEndpoint)
     : mReqId{reqId}
     , mFirstGenTokens{std::move(firstGenTokens)}
     , mDraftTokens{std::move(draftTokens)}
     , mDisaggId{std::move(disaggId)}
+    , mCtxDpRank{ctxDpRank}
     , mDisaggInfoEndpoint{std::move(disaggInfoEndpoint)}
 {
 
@@ -73,6 +76,7 @@ ContextPhaseParams::ContextPhaseParams(ContextPhaseParams const& other)
     , mFirstGenTokens{other.mFirstGenTokens}
     , mDraftTokens{other.mDraftTokens}
     , mDisaggId{other.mDisaggId}
+    , mCtxDpRank{other.mCtxDpRank}
     , mDisaggInfoEndpoint{other.mDisaggInfoEndpoint}
 {
     // Since the internal header files implement the destructor while using the declaration of this
@@ -161,6 +165,16 @@ void ContextPhaseParams::setDisaggId(std::optional<std::string> disaggId) noexce
     mDisaggId = std::move(disaggId);
 }
 
+std::optional<SizeType32> ContextPhaseParams::getCtxDpRank() const noexcept
+{
+    return mCtxDpRank;
+}
+
+void ContextPhaseParams::setCtxDpRank(std::optional<SizeType32> ctxDpRank) noexcept
+{
+    mCtxDpRank = ctxDpRank;
+}
+
 std::optional<std::string> const& ContextPhaseParams::getDisaggInfoEndpoint() const noexcept
 {
     return mDisaggInfoEndpoint;
@@ -181,7 +195,7 @@ bool ContextPhaseParams::operator==(ContextPhaseParams const& other) const noexc
 {
     if (mFirstGenTokens != other.mFirstGenTokens || mReqId != other.mReqId || mDraftTokens != other.mDraftTokens
         || mDisaggId != other.mDisaggId || mDisaggInfoEndpoint != other.mDisaggInfoEndpoint
-        || static_cast<bool>(mState) != static_cast<bool>(other.mState))
+        || mCtxDpRank != other.mCtxDpRank || static_cast<bool>(mState) != static_cast<bool>(other.mState))
     {
         return false;
     }

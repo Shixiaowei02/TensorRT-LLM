@@ -36,6 +36,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.dist: Distributed = dist
         self.kv_cache_manager = kv_cache_manager
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.mapping = mapping
         self.sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
@@ -61,6 +62,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         )
 
         self.context_info_endpoint = None
+        self.dp_rank = self.mapping.tp_rank if self.mapping.enable_attention_dp else 0
         if self.dist.rank == 0:
             self.context_info_endpoint = self.transfer_worker.instance_info_server.get_endpoint()
             self.dist.broadcast(self.context_info_endpoint, 0)
@@ -114,6 +116,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             opaque_state=None,
             draft_tokens=None,
             disagg_id=req.py_disaggregated_params.disagg_id,
+            ctx_dp_rank=self.dp_rank,
             disagg_info_endpoint=self.context_info_endpoint,
         )
         self.id_to_request[req.request_id] = req

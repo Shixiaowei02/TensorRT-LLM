@@ -1199,7 +1199,7 @@ def test_result_pickle():
     result.is_sequence_final = True
     result.decoding_iter = 1
     result.context_phase_params = trtllm.ContextPhaseParams(
-        [1, 2], 123, bytes([0, 1]), [10, 20, 30], "disagg_id_13579",
+        [1, 2], 123, bytes([0, 1]), [10, 20, 30], "disagg_id_13579", 1,
         "disagg_info_endpoint_24680")
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
@@ -1221,6 +1221,7 @@ def test_result_pickle():
     assert result.context_phase_params.draft_tokens == result_copy.context_phase_params.draft_tokens
     assert result.context_phase_params.opaque_state == result_copy.context_phase_params.opaque_state
     assert result.context_phase_params.disagg_id == result_copy.context_phase_params.disagg_id
+    assert result.context_phase_params.ctx_dp_rank == result_copy.context_phase_params.ctx_dp_rank
     assert result.context_phase_params.disagg_info_endpoint == result_copy.context_phase_params.disagg_info_endpoint
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
 

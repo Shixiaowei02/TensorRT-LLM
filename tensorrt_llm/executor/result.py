@@ -412,6 +412,7 @@ class GenerationResultBase:
                     opaque_state=context_phase_params.opaque_state,
                     draft_tokens=context_phase_params.draft_tokens,
                     disagg_id=context_phase_params.disagg_id,
+                    ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint)
 
             finish_reasons = response_result.finish_reasons

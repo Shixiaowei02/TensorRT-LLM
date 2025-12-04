@@ -653,6 +653,7 @@ ContextPhaseParams Serialization::deserializeContextPhaseParams(std::istream& is
     auto firstGenTokens = su::deserialize<decltype(ContextPhaseParams::mFirstGenTokens)>(is);
     auto draftTokens = su::deserialize<decltype(ContextPhaseParams::mDraftTokens)>(is);
     auto disaggId = su::deserialize<decltype(ContextPhaseParams::mDisaggId)>(is);
+    auto ctxDpRank = su::deserialize<decltype(ContextPhaseParams::mCtxDpRank)>(is);
     auto disaggInfoEndpoint = su::deserialize<decltype(ContextPhaseParams::mDisaggInfoEndpoint)>(is);
     auto hasState = su::deserialize<bool>(is);
     if (hasState)
@@ -660,10 +661,10 @@ ContextPhaseParams Serialization::deserializeContextPhaseParams(std::istream& is
         auto state = std::make_unique<DataTransceiverState>();
         *state = deserializeDataTransceiverState(is);
         return ContextPhaseParams{std::move(firstGenTokens), reqId, state.release(), std::move(draftTokens),
-            std::move(disaggId), std::move(disaggInfoEndpoint)};
+            std::move(disaggId), ctxDpRank, std::move(disaggInfoEndpoint)};
     }
-    return ContextPhaseParams{
-        std::move(firstGenTokens), reqId, std::move(draftTokens), std::move(disaggId), std::move(disaggInfoEndpoint)};
+    return ContextPhaseParams{std::move(firstGenTokens), reqId, std::move(draftTokens), std::move(disaggId), ctxDpRank,
+        std::move(disaggInfoEndpoint)};
 }
 
 void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std::ostream& os)
@@ -672,6 +673,7 @@ void Serialization::serialize(ContextPhaseParams const& contextPhaseParams, std:
     su::serialize(contextPhaseParams.mFirstGenTokens, os);
     su::serialize(contextPhaseParams.mDraftTokens, os);
     su::serialize(contextPhaseParams.mDisaggId, os);
+    su::serialize(contextPhaseParams.mCtxDpRank, os);
     su::serialize(contextPhaseParams.mDisaggInfoEndpoint, os);
     su::serialize(static_cast<bool>(contextPhaseParams.mState), os);
     if (contextPhaseParams.mState)
@@ -687,6 +689,7 @@ size_t Serialization::serializedSize(ContextPhaseParams const& contextPhaseParam
     totalSize += su::serializedSize(contextPhaseParams.mFirstGenTokens);
     totalSize += su::serializedSize(contextPhaseParams.mDraftTokens);
     totalSize += su::serializedSize(contextPhaseParams.mDisaggId);
+    totalSize += su::serializedSize(contextPhaseParams.mCtxDpRank);
     totalSize += su::serializedSize(contextPhaseParams.mDisaggInfoEndpoint);
     totalSize += su::serializedSize(bool{});
     if (contextPhaseParams.mState)

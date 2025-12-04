@@ -803,17 +803,19 @@ class Receiver:
         context_peer_infos: InstanceInfo = self._get_context_info(disagg_params)
         print(f" _async_request_data_transfer context_peer_infos: {context_peer_infos}")
         transfer_gen_side_req_info = slice_receiver_task.create_gen_side_transfer_req_info()
-
+        if disagg_params.ctx_dp_rank is None:
+            raise ValueError("ctx_dp_rank is None")
         ctx_dp_rank = 0 if disagg_params.ctx_dp_rank is None else disagg_params.ctx_dp_rank
         agent_recv_args, target_ranks = slice_receiver_task.extract_trans_meta(
             context_peer_infos, ctx_dp_rank
         )
 
+        self.submit_receive_task(agent_recv_args)
         for rank in target_ranks:
             self._send_data_request(
                 context_peer_infos.ctx_server_endpoints[rank], transfer_gen_side_req_info
             )
-        self.submit_receive_task(agent_recv_args)
+
         return
 
     def _need_register_peer_in_first_request(self, disagg_params: DisaggregatedParams) -> bool:
@@ -1122,11 +1124,11 @@ class TransferWorker:
         cp_rank = self.mapping.cp_rank
         is_mla = self.kv_cache_manager.kv_factor == 1
         self.kv_cache_manager.kv_factor
-        heads_num_per_rank = self.kv_cache_manager.num_kv_heads
+        heads_num_per_rank = self.kv_cache_manager.num_kv_heads_per_layer[0]
         tokens_per_block = self.kv_cache_manager.tokens_per_block
         dims_per_head = self.kv_cache_manager.head_dim
         element_size = get_size_in_bytes(1, self.kv_cache_manager.dtype)
-        layer_num_per_pp = [self.kv_cache_manager.num_layers]
+        layer_num_per_pp = [len(self.kv_cache_manager.pp_layers)]
         ctx_server_endpoints = []
         self.instance_info = InstanceInfo(
             instance_name=instance_name,
