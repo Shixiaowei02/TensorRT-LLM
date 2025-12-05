@@ -77,6 +77,7 @@ class AgentSendArgs:
     src_kv_ptrs: List[int] = None
     dst_kv_ptrs: List[int] = None
     kv_sizes: List[int] = None
+    dst_device_id: int = None
     src_aux_ptrs: List[int] = None
     dst_aux_ptrs: List[int] = None
     aux_sizes: List[int] = None
@@ -243,6 +244,7 @@ class SliceSenderTask:
                 is_last_slice=self.slice.is_last_slice,
             )
 
+        dst_device_id = peer_instance_rank_info.device_id
         dst_block_ids = dst_info.block_ids
         src_block_ids = self.slice.block_ids
 
@@ -283,6 +285,7 @@ class SliceSenderTask:
             src_kv_ptrs=src_kv_blocks_transfer_ptrs,
             dst_kv_ptrs=dst_kv_blocks_transfer_ptrs,
             kv_sizes=[src_kv_blocks_size] * len(src_kv_blocks_transfer_ptrs),
+            dst_device_id=dst_device_id,
             expect_count=expect_count,
             remote_name=peer_instance_rank_info.instance_name
             + str(peer_instance_rank_info.instance_rank),
@@ -365,6 +368,7 @@ class Sender:
         return
 
     def clear_sender_session_resource(self, disagg_id: str):
+        print(f" clear_sender_session_resource disagg_id: {disagg_id}")
         del self.tx_sessions[disagg_id]
         del self.slice_tasks[disagg_id]
         del self._peer_transfer_req_info_cache[disagg_id]
@@ -407,19 +411,21 @@ class Sender:
             if agent_send_args is None:
                 break
             if agent_send_args.is_only_meta_data:
-                self._submit_send_meta_data_task(agent_send_args)
+                self._submit_send_meta_to_agent(agent_send_args)
             else:
-                self._submit_send_slice_task(agent_send_args)
+                self._submit_send_slice_to_agent(agent_send_args)
 
-    def _submit_send_slice_task(self, agent_send_args: AgentSendArgs):
+    def _submit_send_slice_to_agent(self, agent_send_args: AgentSendArgs):
         assert len(agent_send_args.src_kv_ptrs) == len(agent_send_args.dst_kv_ptrs)
         assert len(agent_send_args.kv_sizes) == len(agent_send_args.src_kv_ptrs)
         src_kv_list = [
             (src_ptr, size, self.device_id)
             for src_ptr, size in zip(agent_send_args.src_kv_ptrs, agent_send_args.kv_sizes)
         ]
+
+        # TODO : device_id should be the device id of the destination
         dst_kv_list = [
-            (dst_ptr, size, self.device_id)
+            (dst_ptr, size, agent_send_args.dst_device_id)
             for dst_ptr, size in zip(agent_send_args.dst_kv_ptrs, agent_send_args.kv_sizes)
         ]
         if self.tx_sessions[agent_send_args.disagg_id]().get_state().state != State.ERR:
@@ -431,10 +437,21 @@ class Sender:
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, ""
         )
 
-        print(f"  transfer agent submit transfer requests: {request}")
-        status = self.transfer_agent.submit_transfer_requests(request)
+        skip_send = len(src_kv_list) == 0
+        if not skip_send:
+            src_memory_descs = MemoryDescs("VRAM", src_kv_list)
+            dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
+            request = TransferRequest(
+                TransferOp.WRITE,
+                src_memory_descs,
+                dst_memory_descs,
+                agent_send_args.remote_name,
+                "",
+            )
+            print(f"  transfer agent submit transfer requests: {request}")
+            status = self.transfer_agent.submit_transfer_requests(request)
         sync_status = "SUCCESS"
-        if not status.wait():
+        if not skip_send and not status.wait():
             sync_status = "FAILED"
             agent_send_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
 
@@ -478,7 +495,7 @@ class Sender:
             if agent_send_args.is_last_slice:
                 self.tx_sessions[agent_send_args.disagg_id]().get_state().state = State.FINISHED
 
-    def _submit_send_meta_data_task(self, agent_send_args: AgentSendArgs):
+    def _submit_send_meta_to_agent(self, agent_send_args: AgentSendArgs):
         # TODO:  submit the meta data task to the transfer agent
         # pass
         assert agent_send_args.is_only_meta_data is True
@@ -1048,13 +1065,13 @@ class TransferWorker:
         self.instance_rank_info: RankInfo = None
         self.kv_cache_manager = kv_cache_manager
         self.meta_buffer = meta_buffer
+        self.device_id = device_id
 
         self.init_instance_info(instance_name)
 
         self.instance_info_server = InstanceInfoServer(self.instance_info)
         self.peer_registrar = PeerRegistrar(self.instance_rank_info, self.instance_info)
         self.peer_mapper = PeerMapper(self.peer_registrar, self.kv_cache_manager)
-        self.device_id = device_id
         self.transfer_agent = NixlTransferAgent(
             self.instance_rank_info.instance_name + str(self.instance_rank_info.instance_rank), True
         )
@@ -1156,6 +1173,7 @@ class TransferWorker:
             dp_rank=dp_rank,
             cp_size=cp_size,
             cp_rank=cp_rank,
+            device_id=self.device_id,
             kv_head_num_per_rank=heads_num_per_rank,
             tokens_per_block=tokens_per_block,
             dims_per_head=dims_per_head,

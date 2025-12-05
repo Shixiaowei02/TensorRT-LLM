@@ -30,6 +30,7 @@ class RankInfo:
     dp_rank: int
     cp_size: int
     cp_rank: int
+    device_id: int
     kv_head_num_per_rank: int
     #  [numLayers,kv_factor,heads,tokens,dimsPerHead]
     tokens_per_block: int

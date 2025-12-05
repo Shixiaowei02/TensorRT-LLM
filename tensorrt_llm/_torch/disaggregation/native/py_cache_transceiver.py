@@ -2,6 +2,8 @@ import concurrent
 import uuid
 from itertools import chain
 
+import torch
+
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
@@ -49,14 +51,15 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         self.instance_name = instance_name
 
-        device_id = mapping.local_rank
-
+        # device_id = mapping.local_rank
+        self.device_id = torch.cuda.current_device()
+        logger.info(f"device_id: {self.device_id} in PyNativeCacheTransceiver")
         transfer_angent_config = TransferAgentConfig()
 
         self.transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
             mapping=mapping,
-            device_id=device_id,
+            device_id=self.device_id,
             instance_name=instance_name,
             transfer_agent_config=transfer_angent_config,
         )
@@ -71,8 +74,14 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         self.mapping = mapping
 
-        self.need_tp_sync = mapping.tp_size > 1 and (not mapping.enable_attention_dp)
+        self.ctx_need_tp_sync = mapping.tp_size > 1 and (not mapping.enable_attention_dp)
 
+        self.gen_need_sync = not (
+            mapping.world_size == 1 or (mapping.enable_attention_dp and mapping.pp_size > 1)
+        )
+        self.gen_sync_allgather_fun = (
+            self.dist.pp_allgather if mapping.enable_attention_dp else self.dist.allgather
+        )
         ctx_server_endpoint = self.transfer_worker.sender.server_endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
 
@@ -154,7 +163,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif session.get_state().state == State.ERR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
-        if self.need_tp_sync:
+        if self.ctx_need_tp_sync:
             sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
         else:
             sync_request_ids = [local_sync_request_ids]
@@ -163,7 +172,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id in list(chain.from_iterable(sync_request_ids)):
             frequency_map[request_id] = frequency_map.get(request_id, 0) + 1
         sorted_frequency_map = sorted(frequency_map.items(), key=lambda x: x[1], reverse=True)
-        sync_size = self.dist.tp_size if self.need_tp_sync else 1
+        sync_size = self.dist.tp_size if self.ctx_need_tp_sync else 1
         to_complete_request_ids = []
         for request_id, frequency in sorted_frequency_map:
             if frequency == sync_size:
@@ -204,7 +213,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif request_id in failed_request_ids:
                 self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
             del self.id_to_request[request_id]
-            del self.sender_future_to_request_id[future]
+            del_future = (
+                self.send_sessions[request_id]
+                .slice_tasks[self.send_task_ids[request_id]]
+                .get_future_for_task()
+            )
+            del self.sender_future_to_request_id[del_future]
             del self.send_sessions[request_id]
             del self.send_task_ids[request_id]
 
@@ -264,8 +278,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif session.get_state().state == State.ERR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
-        if self.need_tp_sync:
-            sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
+        if self.gen_need_sync:
+            sync_request_ids = self.gen_sync_allgather_fun(local_sync_request_ids)
         else:
             sync_request_ids = [local_sync_request_ids]
 
@@ -273,7 +287,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id in list(chain.from_iterable(sync_request_ids)):
             frequency_map[request_id] = frequency_map.get(request_id, 0) + 1
         sorted_frequency_map = sorted(frequency_map.items(), key=lambda x: x[1], reverse=True)
-        sync_size = self.dist.tp_size if self.need_tp_sync else 1
+        sync_size = (
+            self.mapping.pp_size if self.mapping.enable_attention_dp else self.mapping.world_size
+        )
         to_complete_request_ids = []
         for request_id, frequency in sorted_frequency_map:
             if frequency == sync_size:

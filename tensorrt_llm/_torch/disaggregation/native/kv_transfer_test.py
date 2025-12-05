@@ -17,13 +17,25 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 
 
-def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
+def test_transfer_worker_with_parallel(
+    ctx_tp: int,
+    ctx_pp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_pp: int,
+    gen_enable_dp: bool,
+    is_mla: bool = False,
+):
     ctx_mappings = []
     for i in range(ctx_pp):
         for j in range(ctx_tp):
             ctx_mappings.append(
                 Mapping(
-                    world_size=ctx_tp * ctx_pp, rank=i * ctx_tp + j, tp_size=ctx_tp, pp_size=ctx_pp
+                    world_size=ctx_tp * ctx_pp,
+                    rank=i * ctx_tp + j,
+                    tp_size=ctx_tp,
+                    pp_size=ctx_pp,
+                    enable_attention_dp=ctx_enable_dp,
                 )
             )
     gen_mappings = []
@@ -31,7 +43,11 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
         for j in range(gen_tp):
             gen_mappings.append(
                 Mapping(
-                    world_size=gen_tp * gen_pp, rank=i * gen_tp + j, tp_size=gen_tp, pp_size=gen_pp
+                    world_size=gen_tp * gen_pp,
+                    rank=i * gen_tp + j,
+                    tp_size=gen_tp,
+                    pp_size=gen_pp,
+                    enable_attention_dp=gen_enable_dp,
                 )
             )
 
@@ -43,7 +59,7 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
     gen_instance_num = gen_tp * gen_pp
     num_layers = 4
     head_dim = 128
-    num_kv_heads = 4
+    num_kv_heads = 4 if not is_mla else 1
     tokens_per_block = 8
     max_seq_len = 256
     max_batch_size = 4
@@ -64,7 +80,9 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
                 max_tokens=2048,
                 enable_block_reuse=False,
             ),
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+            if not is_mla
+            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -74,10 +92,19 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
             mapping=ctx_mappings[i],
             dtype=dtype,
         )
+        random_seed = 0 if is_mla else None
         ctx_block_data_pool = ctx_kv_cache_manager.get_unique_primary_pool()
+        if random_seed is not None:
+            generator = torch.Generator(device=ctx_block_data_pool.device).manual_seed(random_seed)
+        else:
+            generator = None
         random_values = torch.rand(
-            ctx_block_data_pool.shape, dtype=torch.float32, device=ctx_block_data_pool.device
+            ctx_block_data_pool.shape,
+            dtype=torch.float32,
+            device=ctx_block_data_pool.device,
+            generator=generator,
         )
+
         ctx_block_data_pool.copy_(random_values)
         ctx_kv_cache_managers.append(ctx_kv_cache_manager)
         ctx_transfer_workers.append(
@@ -115,7 +142,9 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
                 max_tokens=2048,
                 enable_block_reuse=False,
             ),
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+            if not is_mla
+            else tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -153,6 +182,29 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
     sampling_params = SamplingParams()
 
     def add_and_verfiy_request(ctx_request_id, gen_request_id, request_len):
+        ctx_dp_rank = 0
+        if ctx_enable_dp:
+            ctx_dp_rank = ctx_request_id % ctx_tp
+            valid_ctx_kv_cache_managers = []
+            valid_ctx_transfer_workers = []
+            for i in range(ctx_pp):
+                valid_ctx_kv_cache_managers.append(ctx_kv_cache_managers[ctx_dp_rank + i * ctx_tp])
+                valid_ctx_transfer_workers.append(ctx_transfer_workers[ctx_dp_rank + i * ctx_tp])
+        else:
+            valid_ctx_kv_cache_managers = ctx_kv_cache_managers
+            valid_ctx_transfer_workers = ctx_transfer_workers
+        gen_dp_rank = 0
+        if gen_enable_dp:
+            gen_dp_rank = gen_request_id % gen_tp
+            valid_gen_kv_cache_managers = []
+            valid_gen_transfer_workers = []
+            for i in range(gen_pp):
+                valid_gen_kv_cache_managers.append(gen_kv_cache_managers[gen_dp_rank + i * gen_tp])
+                valid_gen_transfer_workers.append(gen_transfer_workers[gen_dp_rank + i * gen_tp])
+        else:
+            valid_gen_kv_cache_managers = gen_kv_cache_managers
+            valid_gen_transfer_workers = gen_transfer_workers
+
         disagg_id = str(uuid.uuid4())
         ctx_request = LlmRequest(
             request_id=ctx_request_id,
@@ -166,7 +218,7 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
         )
         ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=disagg_id)
 
-        for ctx_kv_cache_manager in ctx_kv_cache_managers:
+        for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
             ctx_kv_cache_manager.impl.add_sequence(
                 ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
             )
@@ -183,27 +235,27 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
         )
         gen_request.py_disaggregated_params = DisaggregatedParams(
             ctx_request_id=ctx_request.py_request_id,
-            ctx_dp_rank=0,
+            ctx_dp_rank=ctx_dp_rank,
             ctx_info_endpoint=ctx_info_endpoint,
             disagg_id=disagg_id,
         )
-        for gen_kv_cache_manager in gen_kv_cache_managers:
+        for gen_kv_cache_manager in valid_gen_kv_cache_managers:
             gen_kv_cache_manager.impl.add_sequence(
                 gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
             )
 
         sender_sessions = [
             ctx_transfer_worker.create_sender_session(ctx_request)
-            for ctx_transfer_worker in ctx_transfer_workers
+            for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
         receiver_sessions = [
             gen_transfer_worker.create_receiver_session(gen_request)
-            for gen_transfer_worker in gen_transfer_workers
+            for gen_transfer_worker in valid_gen_transfer_workers
         ]
 
         ctx_block_ids = [
             ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
-            for ctx_kv_cache_manager in ctx_kv_cache_managers
+            for ctx_kv_cache_manager in valid_ctx_kv_cache_managers
         ]
         send_kv_slices = [
             KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
@@ -215,7 +267,7 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
 
         gen_block_ids = [
             gen_kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
-            for gen_kv_cache_manager in gen_kv_cache_managers
+            for gen_kv_cache_manager in valid_gen_kv_cache_managers
         ]
         recv_kv_slices = [
             KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
@@ -236,11 +288,15 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
 
         ctx_block_datas = [
             ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
-            for ctx_kv_cache_manager, ctx_block_id in zip(ctx_kv_cache_managers, ctx_block_ids)
+            for ctx_kv_cache_manager, ctx_block_id in zip(
+                valid_ctx_kv_cache_managers, ctx_block_ids
+            )
         ]
         gen_block_datas = [
             gen_kv_cache_manager.get_unique_primary_pool()[gen_block_id]
-            for gen_kv_cache_manager, gen_block_id in zip(gen_kv_cache_managers, gen_block_ids)
+            for gen_kv_cache_manager, gen_block_id in zip(
+                valid_gen_kv_cache_managers, gen_block_ids
+            )
         ]
         # assert ctx_block_datas.equal(gen_block_datas)
 
@@ -255,32 +311,48 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
 
         # shape [block_num,layer_num,2,block_size]
         # block_size = [numHeads, numTokens, dimsPerHead]
+
+        valid_ctx_tp = 1 if ctx_enable_dp else ctx_tp
+        valid_gen_tp = 1 if gen_enable_dp else gen_tp
+        if is_mla:
+            valid_ctx_tp = 1
+            valid_gen_tp = 1
         ctx_block_data_merge = torch.zeros(
-            size=(ctx_block_datas[0].shape[0], num_layers, 2, ctx_block_datas[0].shape[3] * ctx_tp)
+            size=(
+                ctx_block_datas[0].shape[0],
+                num_layers,
+                2,
+                ctx_block_datas[0].shape[3] * valid_ctx_tp,
+            )
         )
         for pp_rank in range(ctx_pp):
-            for tp_rank in range(ctx_tp):
+            for tp_rank in range(valid_ctx_tp):
                 layer_start_idx = sum(ctx_layer_num_per_pp[:pp_rank])
                 layer_end_idx = layer_start_idx + ctx_layer_num_per_pp[pp_rank]
-                head_dim_per_rank = num_kv_heads // ctx_tp * head_dim * tokens_per_block
+                head_dim_per_rank = num_kv_heads // valid_ctx_tp * head_dim * tokens_per_block
                 start_head_offset = tp_rank * head_dim_per_rank
                 end_head_offset = start_head_offset + head_dim_per_rank
-                block_id = pp_rank * ctx_tp + tp_rank
+                block_id = pp_rank * valid_ctx_tp + tp_rank
                 ctx_block_data_merge[
                     :, layer_start_idx:layer_end_idx, :, start_head_offset:end_head_offset
                 ] = ctx_block_datas[block_id]
 
         gen_block_data_merge = torch.zeros(
-            size=(gen_block_datas[0].shape[0], num_layers, 2, gen_block_datas[0].shape[3] * gen_tp)
+            size=(
+                gen_block_datas[0].shape[0],
+                num_layers,
+                2,
+                gen_block_datas[0].shape[3] * valid_gen_tp,
+            )
         )
         for pp_rank in range(gen_pp):
-            for tp_rank in range(gen_tp):
+            for tp_rank in range(valid_gen_tp):
                 layer_start_idx = sum(gen_layer_num_per_pp[:pp_rank])
                 layer_end_idx = layer_start_idx + gen_layer_num_per_pp[pp_rank]
-                head_dim_per_rank = num_kv_heads // gen_tp * head_dim * tokens_per_block
+                head_dim_per_rank = num_kv_heads // valid_gen_tp * head_dim * tokens_per_block
                 start_head_offset = tp_rank * head_dim_per_rank
                 end_head_offset = start_head_offset + head_dim_per_rank
-                block_id = pp_rank * gen_tp + tp_rank
+                block_id = pp_rank * valid_gen_tp + tp_rank
                 gen_block_data_merge[
                     :, layer_start_idx:layer_end_idx, :, start_head_offset:end_head_offset
                 ] = gen_block_datas[block_id]
@@ -300,11 +372,42 @@ def test_transfer_worker_with_parallel(ctx_tp: int, ctx_pp: int, gen_tp: int, ge
 
 
 if __name__ == "__main__":
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=1, gen_tp=1, gen_pp=1)
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=1, gen_tp=1, gen_pp=2)
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=2, gen_tp=1, gen_pp=1)
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=2, gen_tp=1, gen_pp=2)
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=2, gen_tp=2, gen_pp=1)
-    test_transfer_worker_with_parallel(ctx_tp=2, ctx_pp=1, gen_tp=1, gen_pp=2)
-    test_transfer_worker_with_parallel(ctx_tp=4, ctx_pp=1, gen_tp=2, gen_pp=2)
-    test_transfer_worker_with_parallel(ctx_tp=1, ctx_pp=4, gen_tp=2, gen_pp=2)
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=2, gen_pp=1, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=2, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=4, ctx_pp=1, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=4, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=2, gen_pp=1, gen_enable_dp=True
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=1, gen_pp=2, gen_enable_dp=False
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=1, ctx_pp=4, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=True
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=2, ctx_pp=1, ctx_enable_dp=False, gen_tp=2, gen_pp=1, gen_enable_dp=True, is_mla=True
+    )
+    test_transfer_worker_with_parallel(
+        ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=2, gen_pp=1, gen_enable_dp=False, is_mla=True
+    )
