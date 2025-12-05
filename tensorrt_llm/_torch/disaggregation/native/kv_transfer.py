@@ -1,18 +1,14 @@
 import concurrent
 import pickle
 import threading
-import time
-import uuid
 import weakref
 from dataclasses import dataclass
 from typing import List, Optional
 
-import torch
 import zmq
 
 import tensorrt_llm.bindings
-import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm import Mapping, SamplingParams
+from tensorrt_llm import Mapping, logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -41,7 +37,6 @@ from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -257,7 +252,7 @@ class SliceSenderTask:
         )
         dst_kv_blocks_ptrs = peer_kv_ptr_extractor.extract_kv_block_ptrs(dst_block_ids)
         peer_kv_block_size = peer_kv_ptr_extractor.kv_pool_attributes.kv_cache_block_sizes[0]
-        print(
+        logger.debug(
             f"call extract_trans_meta src_kv_blocks_ptrs: {src_kv_blocks_ptrs} "
             f"self_kv_block_size: {self_kv_block_size} "
             f"dst_kv_blocks_ptrs: {dst_kv_blocks_ptrs} "
@@ -273,7 +268,7 @@ class SliceSenderTask:
         )
 
         src_kv_blocks_size = dst_kv_blocks_size
-        print(
+        logger.debug(
             f"src_kv_blocks_transfer_ptrs: {src_kv_blocks_transfer_ptrs} "
             f"src_kv_blocks_size: {src_kv_blocks_size} "
             f"dst_kv_blocks_transfer_ptrs: {dst_kv_blocks_transfer_ptrs} "
@@ -353,7 +348,7 @@ class Sender:
         self.slice_tasks = {}  # disagg_id -> list[KVSlice]
 
         self.meta_tasks = {}  # disagg_id -> MetaSenderTask
-        print(f" Sender init end with server_endpoint: {self.server_endpoint}")
+        logger.info(f" Sender init end with server_endpoint: {self.server_endpoint}")
 
         background_thread = threading.Thread(target=self._handle_sender_loop, daemon=True)
         background_thread.start()
@@ -368,7 +363,7 @@ class Sender:
         return
 
     def clear_sender_session_resource(self, disagg_id: str):
-        print(f" clear_sender_session_resource disagg_id: {disagg_id}")
+        logger.debug(f" clear_sender_session_resource disagg_id: {disagg_id}")
         del self.tx_sessions[disagg_id]
         del self.slice_tasks[disagg_id]
         del self._peer_transfer_req_info_cache[disagg_id]
@@ -438,6 +433,7 @@ class Sender:
         )
 
         skip_send = len(src_kv_list) == 0
+        logger.debug(f"  transfer agent submit transfer requests: {request}")
         if not skip_send:
             src_memory_descs = MemoryDescs("VRAM", src_kv_list)
             dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
@@ -448,7 +444,6 @@ class Sender:
                 agent_send_args.remote_name,
                 "",
             )
-            print(f"  transfer agent submit transfer requests: {request}")
             status = self.transfer_agent.submit_transfer_requests(request)
         sync_status = "SUCCESS"
         if not skip_send and not status.wait():
@@ -515,7 +510,7 @@ class Sender:
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, ""
         )
 
-        print(f" submit_send_meta_data_task, request: {request}")
+        logger.debug(f" submit_send_meta_data_task, request: {request}")
 
         status = self.transfer_agent.submit_transfer_requests(request)
         sync_status = "SUCCESS"
@@ -546,7 +541,6 @@ class Sender:
                 ]
         for transfer_recv_req_info in transfer_recv_req_info_dict.values():
             trans_meta = send_slice_task.extract_trans_meta(transfer_recv_req_info)
-            # print(f" call submit_send_task trans_meta: {trans_meta}")
             self.submit_send_task(trans_meta)
 
     def _handle_sender_loop(self):
@@ -586,12 +580,12 @@ class Sender:
         )
 
         agent_name = instance_rank_info.instance_name + str(instance_rank_info.instance_rank)
-        print(f"  transfer agent load remote agent: {agent_name}")
+        logger.debug(f"  transfer agent load remote agent: {agent_name}")
         self.transfer_agent.load_remote_agent(
             instance_rank_info.instance_name + str(instance_rank_info.instance_rank),
             instance_rank_info.transfer_engine_info,
         )
-        print(
+        logger.debug(
             f"_handle_register_rank_info end with instance_name, "
             f"instance_rank: {instance_rank_info.instance_name}, "
             f"{instance_rank_info.instance_rank}"
@@ -777,7 +771,9 @@ class Receiver:
 
         self.rx_sessions = {}  # disagg_id -> RxSession
         self.last_slice_counts = {}  # disagg_id -> int
-        print(f" Receiver init end with receiver_server_endpoint: {self.receiver_server_endpoint}")
+        logger.info(
+            f" Receiver init  with receiver_server_endpoint: {self.receiver_server_endpoint}"
+        )
 
     def get_endpoint(self):
         return self.receiver_server_endpoint
@@ -810,15 +806,14 @@ class Receiver:
         self.rx_sessions[rx_session.session_args.disagg_params.disagg_id] = weakref.ref(rx_session)
 
     def clear_session_resource(self, disagg_id: str):
-        print(f" clear_session_resource, rx_sessions keys {self.rx_sessions.keys()}")
+        logger.debug(f" clear_session_resource, rx_sessions keys {self.rx_sessions.keys()}")
         del self.rx_sessions[disagg_id]
         del self.slice_tasks[disagg_id]
 
     def _async_request_data_transfer(self, slice_receiver_task: SliceReceiverTask):
         disagg_params = slice_receiver_task.disagg_params
-        print(f" _async_request_data_transfer disagg_params: {disagg_params}")
+        logger.debug(f" _async_request_data_transfer disagg_params: {disagg_params}")
         context_peer_infos: InstanceInfo = self._get_context_info(disagg_params)
-        print(f" _async_request_data_transfer context_peer_infos: {context_peer_infos}")
         transfer_gen_side_req_info = slice_receiver_task.create_gen_side_transfer_req_info()
         if disagg_params.ctx_dp_rank is None:
             raise ValueError("ctx_dp_rank is None")
@@ -852,7 +847,7 @@ class Receiver:
             socket.send_multipart(message)
             message = socket.recv_multipart()
             instance_info = pickle.loads(message[0])
-            print(f" _get_context_info instance_info: {instance_info}")
+            logger.debug(f" _get_context_info instance_info: {instance_info}")
             socket.close()
 
             for endpoint in instance_info.ctx_server_endpoints:
@@ -873,7 +868,7 @@ class Receiver:
             return self.context_endpoint_to_instance_info_cache[disagg_params.ctx_info_endpoint]
 
     def submit_receive_task(self, trans_recv_meta: AgentRecvArgs):
-        print(f" call submit_receive_task trans_recv_meta: {trans_recv_meta}")
+        logger.debug(f" call submit_receive_task trans_recv_meta: {trans_recv_meta}")
         if trans_recv_meta.disagg_id not in self.last_slice_counts:
             self.last_slice_counts[trans_recv_meta.disagg_id] = 0
         self.slice_tasks[trans_recv_meta.disagg_id][
@@ -923,7 +918,7 @@ class Receiver:
                         0
                     )  # receive task slice only support slice 0
 
-                    print(f" handle_task_state, rx_seesion keys {self.rx_sessions.keys()}")
+                    logger.debug(f" handle_task_state, rx_seesion keys {self.rx_sessions.keys()}")
         elif task_state == "FAILED":
             self.slice_tasks[disagg_id][0].get_future_for_task().set_exception(
                 RuntimeError(f"Task state: {task_state}")
@@ -939,7 +934,6 @@ class Receiver:
         disagg_id = message[1].decode("ascii")
         sync_status = message[2].decode("ascii")
         if sync_status == "SUCCESS":
-            print(f" rx_seesion keys {self.rx_sessions.keys()}")
             self.rx_sessions[disagg_id]().session_state.state = State.META_DATA_SENT
         elif sync_status == "FAILED":
             self.rx_sessions[disagg_id]().session_state.state = State.ERR
@@ -949,7 +943,7 @@ class Receiver:
             )
 
     def _send_data_request(self, endpoint: str, transfer_gen_side_req_info: GenReqInfo):
-        print(
+        logger.debug(
             f" call _send_data_request endpoint: {endpoint} transfer_gen_side_req_info: {transfer_gen_side_req_info}"
         )
         socket = self._get_socket(endpoint)
@@ -1201,7 +1195,7 @@ class TransferWorker:
         )
         reg_memory_desc = RegMemoryDescs("VRAM", [memory_desc])
         self.transfer_agent.register_memory(reg_memory_desc)
-        print(f"  transfer agent register kv cache memory: {memory_desc}")
+        logger.debug(f"  transfer agent register kv cache memory: {memory_desc}")
 
     def _register_meta_buffer(self):
         meta_buffer_info = self.meta_buffer.get_buffer_info()
@@ -1213,7 +1207,7 @@ class TransferWorker:
             )
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self.transfer_agent.register_memory(reg_memory_desc)
-        print(f"  transfer agent register meta buffer: {reg_memory_desc}")
+        logger.debug(f"  transfer agent register meta buffer: {reg_memory_desc}")
 
     # pack the meta data to the meta buffer
 
@@ -1227,214 +1221,3 @@ class TransferWorker:
         request.py_first_gen_tokens = first_gen_tokens
         request.py_draft_tokens = draft_tokens
         return request
-
-
-def test_transfer_worker():
-    mapping = Mapping(world_size=1, rank=0)
-    num_layers = 2
-    head_dim = 128
-    num_kv_heads = 4
-    tokens_per_block = 8
-    max_seq_len = 256
-    max_batch_size = 1
-    dtype = DataType.FLOAT
-
-    ctx_kv_cache_manager = KVCacheManager(
-        trtllm.KvCacheConfig(
-            max_tokens=2048,
-            enable_block_reuse=False,
-        ),
-        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
-        mapping=mapping,
-        dtype=dtype,
-    )
-
-    meta_max_batch_size = 32
-    beam_width = 1
-    max_draft_len = 4
-
-    ctx_meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
-    ctx_instance_name = "ctx_instance"
-    transfer_agent_config = TransferAgentConfig()
-    ctx_transfer_worker = TransferWorker(
-        kv_cache_manager=ctx_kv_cache_manager,
-        mapping=mapping,
-        device_id=0,
-        instance_name=ctx_instance_name,
-        transfer_agent_config=transfer_agent_config,
-        meta_buffer=ctx_meta_buffer,
-    )
-    ctx_enpoint = ctx_transfer_worker.sender.server_endpoint
-    ctx_layer_num_per_pp = [num_layers]
-    ctx_transfer_worker.update_instance_info_with_collective_info(
-        update_endpoints=[ctx_enpoint], update_layer_num_per_pp=ctx_layer_num_per_pp
-    )
-    gen_kv_cache_manager = KVCacheManager(
-        trtllm.KvCacheConfig(
-            max_tokens=2048,
-            enable_block_reuse=False,
-        ),
-        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
-        mapping=mapping,
-        dtype=dtype,
-    )
-
-    gen_instance_name = "gen_instance"
-
-    gen_meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
-    gen_transfer_worker = TransferWorker(
-        kv_cache_manager=gen_kv_cache_manager,
-        mapping=mapping,
-        device_id=0,
-        instance_name=gen_instance_name,
-        transfer_agent_config=transfer_agent_config,
-        meta_buffer=gen_meta_buffer,
-    )
-
-    gen_enpoint = gen_transfer_worker.sender.server_endpoint
-    gen_layer_num_per_pp = [num_layers]
-    gen_transfer_worker.update_instance_info_with_collective_info(
-        update_endpoints=[gen_enpoint], update_layer_num_per_pp=gen_layer_num_per_pp
-    )
-
-    sampling_params = SamplingParams()
-
-    request_len = 32
-    disagg_id = str(uuid.uuid4())
-    ctx_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(request_len)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()
-        ),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
-    )
-    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=disagg_id)
-
-    ctx_kv_cache_manager.impl.add_sequence(
-        ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
-    )
-    ctx_block_ids = ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
-
-    ctx_block_data_pools = ctx_kv_cache_manager.get_unique_primary_pool()
-
-    random_values = torch.rand(
-        ctx_block_data_pools.shape, dtype=torch.float32, device=ctx_block_data_pools.device
-    )
-    ctx_block_data_pools.copy_(random_values)
-
-    gen_request = LlmRequest(
-        request_id=1,
-        max_new_tokens=1,
-        input_tokens=list(range(request_len)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()
-        ),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-    )
-
-    gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
-        ctx_dp_rank=0,
-        ctx_info_endpoint=ctx_transfer_worker.instance_info_server.get_endpoint(),
-        disagg_id=disagg_id,
-    )
-    gen_kv_cache_manager.impl.add_sequence(
-        gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
-    )
-
-    print("ctx async_send before")
-    send_session = ctx_transfer_worker.create_sender_session(ctx_request)
-    print("ctx async_send after")
-
-    print("gen async_receive before")
-    recv_session = gen_transfer_worker.create_receiver_session(gen_request)
-
-    time.sleep(0.1)
-    print("gen async_receive after")
-
-    context_block_ids = ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
-    print(f"context_block_ids: {context_block_ids}")
-    gen_block_ids = gen_kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
-    print(f"gen_block_ids: {gen_block_ids}")
-
-    recv_kv_slice = KVSlice(is_last_slice=True, block_ids=gen_block_ids)
-    recv_task_id = recv_session.receive(recv_kv_slice)
-
-    while send_session.get_state().state != State.READY:
-        time.sleep(0.1)
-        print(f"send session state: {send_session.get_state()}")
-
-    send_kv_slice = KVSlice(is_last_slice=True, block_ids=ctx_block_ids)
-    send_task_id = send_session.send(send_kv_slice)
-
-    send_slice_task = send_session.slice_tasks[send_task_id]
-    recv_slice_task = recv_session.slice_tasks[recv_task_id]
-
-    print(
-        f" gen kvcachemanager pool ptr: {gen_kv_cache_manager.get_unique_primary_pool().data_ptr()}"
-    )
-    print(
-        f" ctx kvcachemanager pool ptr: {ctx_kv_cache_manager.get_unique_primary_pool().data_ptr()}"
-    )
-    print(
-        f"send_slice_task future_result: {send_slice_task.get_future_for_task().result()}, "
-        f"state: {send_slice_task.get_state()}"
-    )
-    print(f"send session state: {send_session.get_state()}")
-    print(
-        f"recv_slice_task future_result: {recv_slice_task.get_future_for_task().result()}, "
-        f"state: {recv_slice_task.get_state()}"
-    )
-    print(f"recv session state: {recv_session.get_state()}")
-    ctx_block_datas = ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_ids]
-    print(
-        f"ctx_block_datas: {ctx_block_datas}, ctx_block_datas.shape: {ctx_block_datas.shape}, "
-        f"ctx_block_datas.data_ptr: {ctx_block_datas.data_ptr()}"
-    )
-
-    gen_block_datas = gen_kv_cache_manager.get_unique_primary_pool()[gen_block_ids]
-    print(
-        f"gen_block_datas: {gen_block_datas}, gen_block_datas.shape: {gen_block_datas.shape}, "
-        f"gen_block_datas.data_ptr: {gen_block_datas.data_ptr()}"
-    )
-    assert ctx_block_datas.equal(gen_block_datas)
-
-    ctx_meta_buffer.set_buffer(send_session.meta_slot_id, ctx_request)
-    gen_meta_buffer.set_buffer(recv_session.meta_slot_id, gen_request)
-
-    ctx_request.add_new_token(8, 0)
-    ctx_request.py_draft_tokens = [9, 10, 11, 12]
-    ctx_transfer_worker.pack_meta_data(send_session, ctx_request)
-
-    send_session.send_meta_data()
-
-    time.sleep(1)
-    print(f"send session state: {send_session.get_state()}")
-    print(f"recv session state: {recv_session.get_state()}")
-
-    gen_request = ctx_transfer_worker.unpack_meta_data(recv_session, gen_request)
-
-    print(
-        f"gen_request first_gen_tokens: {gen_request.py_first_gen_tokens}, "
-        f"gen_request draft_tokens: {gen_request.py_draft_tokens}"
-    )
-
-
-if __name__ == "__main__":
-    test_transfer_worker()

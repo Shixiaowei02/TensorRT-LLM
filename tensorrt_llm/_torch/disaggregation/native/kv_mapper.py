@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Union
 
+from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBufferInfo
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
@@ -239,7 +240,6 @@ class PeerMapper(PeerMapperBase):
     def get_peer_overlap_targets(
         self, peer_ii: InstanceInfo, peer_dp_rank: int
     ) -> PeerOverlapTargets:
-        # print(f"get_peer_overlap_targets: {peer_ii}, {peer_dp_rank}")
         k = self._key(peer_ii.instance_name, peer_dp_rank)
         if k in self._overlap_cache:
             return self._overlap_cache[k]
@@ -344,7 +344,7 @@ class PeerMapper(PeerMapperBase):
             != peer_ri.kv_head_num_per_rank * peer_tp_per_dp
         )
         head_match = is_dup_head or self.ri.is_mla or self_tp_per_dp == peer_tp_per_dp
-        print(
+        logger.debug(
             f"head_match: {head_match}, is_dup_head: {is_dup_head}, self.ri.is_mla: {self.ri.is_mla}, "
             f"self_tp_per_dp: {self_tp_per_dp}, peer_tp_per_dp: {peer_tp_per_dp}"
         )
