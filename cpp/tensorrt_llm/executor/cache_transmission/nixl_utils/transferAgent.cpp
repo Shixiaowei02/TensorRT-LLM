@@ -324,6 +324,20 @@ void NixlTransferStatus::wait() const
         ;
 }
 
+int NixlTransferStatus::waitWithStatus() const
+{
+    auto status = NIXL_IN_PROG;
+    while (status == NIXL_IN_PROG)
+    {
+        status = mRawAgent->getXferStatus(mHandle);
+    }
+    if (status == NIXL_SUCCESS)
+    {
+        return 1;
+    }
+    return 0;
+}
+
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
     return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
@@ -333,6 +347,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     nixl_status_t status;
+    if (config.useListenThread)
     {
         FileLock lock("/tmp/trtllm_nixl_port.lock");
         if (!lock.lock())
@@ -341,8 +356,16 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         }
         auto envPort = common::getEnvNixlPort();
         uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
-        nixlAgentConfig nixlConfig{config.useProgThread, true, port};
+        nixlAgentConfig nixlConfig{
+            config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT, config.numWorkers};
         mAddress = getAvailableIP() + ":" + std::to_string(port);
+        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    }
+    else
+    {
+        mAddress = "";
+        nixlAgentConfig nixlConfig{
+            config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT, config.numWorkers};
         mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 

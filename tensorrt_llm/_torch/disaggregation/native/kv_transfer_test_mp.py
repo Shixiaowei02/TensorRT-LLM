@@ -327,7 +327,7 @@ def worker_fn(
             )
 
             # Create sender session
-            sender_session = transfer_worker.create_sender_session(ctx_request)
+            sender_session = transfer_worker.create_send_session(ctx_request)
 
             # Get block ids and send
             block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
@@ -366,7 +366,7 @@ def worker_fn(
             )
 
             # Create receiver session
-            receiver_session = transfer_worker.create_receiver_session(gen_request)
+            receiver_session = transfer_worker.create_recv_session(gen_request)
 
             # Get block ids and receive
             block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]

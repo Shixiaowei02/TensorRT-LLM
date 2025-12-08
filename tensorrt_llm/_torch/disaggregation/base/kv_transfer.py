@@ -78,6 +78,10 @@ class TxSessionBase(ABC):
     @abstractmethod
     def send(self, slice: KVSlice) -> TaskIdType: ...
 
+    """
+    Async send slice to the peer. return the task id. Task state can be polled by poll_task().
+    """
+
     @abstractmethod
     def get_exception(self) -> Optional[Exception]: ...
 
@@ -94,6 +98,10 @@ class RxSessionBase(ABC):
 
     @abstractmethod
     def receive(self, slice: KVSlice) -> TaskIdType: ...
+
+    """
+    Async receive slice from the peer. return the task id. Task state can be polled by poll_task().
+    """
 
     @abstractmethod
     def get_exception(self) -> Optional[Exception]: ...

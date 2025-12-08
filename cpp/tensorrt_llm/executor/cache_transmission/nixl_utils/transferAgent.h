@@ -47,6 +47,8 @@ public:
 
     void wait() const override;
 
+    [[nodiscard]] int waitWithStatus() const;
+
 private:
     nixlAgent* mRawAgent{};
     nixlXferReqH* mHandle{};

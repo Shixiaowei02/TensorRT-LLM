@@ -1,6 +1,6 @@
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
@@ -14,6 +14,23 @@ class MetaBufferInfo:
     size: list[int]
     item_sizes: list[int] = field(default_factory=list)
     device: str = "cpu"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ptrs": self.ptrs,
+            "size": self.size,
+            "item_sizes": self.item_sizes,
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MetaBufferInfo":
+        return cls(
+            ptrs=data["ptrs"],
+            size=data["size"],
+            item_sizes=data.get("item_sizes", []),
+            device=data.get("device", "cpu"),
+        )
 
 
 class MetaBuffer(MetaBufferBase):

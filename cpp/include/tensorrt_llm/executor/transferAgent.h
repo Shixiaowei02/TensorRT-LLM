@@ -288,6 +288,8 @@ struct BaseAgentConfig
     std::string mName;
     bool useProgThread;
     bool multiThread;
+    bool useListenThread;
+    unsigned int numWorkers;
 };
 
 class BaseTransferAgent

@@ -245,11 +245,11 @@ def test_transfer_worker_with_parallel(
             )
 
         sender_sessions = [
-            ctx_transfer_worker.create_sender_session(ctx_request)
+            ctx_transfer_worker.create_send_session(ctx_request)
             for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
         receiver_sessions = [
-            gen_transfer_worker.create_receiver_session(gen_request)
+            gen_transfer_worker.create_recv_session(gen_request)
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
 
@@ -372,42 +372,55 @@ def test_transfer_worker_with_parallel(
 
 
 if __name__ == "__main__":
+    print("test ctx_tp=1, ctx_pp=1, ctx_dp=False, gen_tp=1, gen_pp=1, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=1, ctx_dp=False, gen_tp=1, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=2, ctx_dp=False, gen_tp=1, gen_pp=1, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=2, ctx_dp=False, gen_tp=1, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=2, ctx_dp=False, gen_tp=2, gen_pp=1, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=2, ctx_enable_dp=False, gen_tp=2, gen_pp=1, gen_enable_dp=False
     )
+    print("test ctx_tp=2, ctx_pp=1, ctx_dp=False, gen_tp=1, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=2, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=4, ctx_pp=1, ctx_dp=False, gen_tp=2, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=4, ctx_pp=1, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=4, ctx_dp=False, gen_tp=2, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=4, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=2, ctx_pp=1, ctx_dp=True, gen_tp=2, gen_pp=1, gen_dp=True")
     test_transfer_worker_with_parallel(
         ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=2, gen_pp=1, gen_enable_dp=True
     )
+    print("test ctx_tp=2, ctx_pp=1, ctx_dp=True, gen_tp=1, gen_pp=2, gen_dp=False")
     test_transfer_worker_with_parallel(
         ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=1, gen_pp=2, gen_enable_dp=False
     )
+    print("test ctx_tp=1, ctx_pp=4, ctx_dp=False, gen_tp=2, gen_pp=2, gen_dp=True")
     test_transfer_worker_with_parallel(
         ctx_tp=1, ctx_pp=4, ctx_enable_dp=False, gen_tp=2, gen_pp=2, gen_enable_dp=True
     )
+    print("test ctx_tp=2, ctx_pp=1, ctx_dp=False, gen_tp=2, gen_pp=1, gen_dp=True, mla")
     test_transfer_worker_with_parallel(
         ctx_tp=2, ctx_pp=1, ctx_enable_dp=False, gen_tp=2, gen_pp=1, gen_enable_dp=True, is_mla=True
     )
+    print("test ctx_tp=2, ctx_pp=1, ctx_dp=True, gen_tp=2, gen_pp=1, gen_dp=False, mla")
     test_transfer_worker_with_parallel(
         ctx_tp=2, ctx_pp=1, ctx_enable_dp=True, gen_tp=2, gen_pp=1, gen_enable_dp=False, is_mla=True
     )

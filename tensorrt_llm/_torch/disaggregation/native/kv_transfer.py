@@ -1,10 +1,10 @@
 import concurrent
-import pickle
 import threading
 import weakref
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import List, Optional
 
+import msgpack
 import zmq
 
 import tensorrt_llm.bindings
@@ -33,10 +33,10 @@ from tensorrt_llm._torch.disaggregation.native.kv_mapper import (
     RankInfo,
 )
 from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBuffer
-from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
+from tensorrt_llm._torch.disaggregation.nixl.agent import BindingsNixlTransferAgent
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -52,6 +52,13 @@ class GenReqInfo:
     disagg_id: str
     start_token_id: Optional[int] = None
     meta_slot_id: Optional[int] = None
+
+    def to_bytes(self) -> bytes:
+        return msgpack.packb(asdict(self))
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "GenReqInfo":
+        return cls(**msgpack.unpackb(data))
 
 
 @dataclass
@@ -185,7 +192,7 @@ class MetaSenderTask:
         )
 
 
-class SliceSenderTask:
+class SliceSendTask:
     def __init__(
         self,
         kv_slice: KVSlice,
@@ -212,6 +219,7 @@ class SliceSenderTask:
     def get_future_for_task(self) -> concurrent.futures.Future:
         return self.future
 
+    @nvtx_range("extract_trans_meta")
     def extract_trans_meta(self, dst_info: GenReqInfo) -> AgentSendArgs:
         peer_instance_rank_info = self.peer_mapper.get_peer_registrar().get_peer_rank_info(
             dst_info.instance_name, dst_info.instance_rank
@@ -369,13 +377,11 @@ class Sender:
         del self._peer_transfer_req_info_cache[disagg_id]
         return
 
-    def async_send_slice(
-        self, disagg_params: DisaggregatedParams, slice: KVSlice
-    ) -> SliceSenderTask:
+    def async_send_slice(self, disagg_params: DisaggregatedParams, slice: KVSlice) -> SliceSendTask:
         if disagg_params.disagg_id not in self.slice_tasks:
             self.slice_tasks[disagg_params.disagg_id] = []
         slice_id = len(self.slice_tasks[disagg_params.disagg_id])
-        new_slice_task = SliceSenderTask(slice, disagg_params, slice_id, self.peer_mapper)
+        new_slice_task = SliceSendTask(slice, disagg_params, slice_id, self.peer_mapper)
         self.slice_tasks[disagg_params.disagg_id].append(new_slice_task)
 
         self._handle_send_task(new_slice_task)
@@ -410,6 +416,7 @@ class Sender:
             else:
                 self._submit_send_slice_to_agent(agent_send_args)
 
+    @nvtx_range("submit_send_slice_to_agent")
     def _submit_send_slice_to_agent(self, agent_send_args: AgentSendArgs):
         assert len(agent_send_args.src_kv_ptrs) == len(agent_send_args.dst_kv_ptrs)
         assert len(agent_send_args.kv_sizes) == len(agent_send_args.src_kv_ptrs)
@@ -429,7 +436,7 @@ class Sender:
         src_memory_descs = MemoryDescs("VRAM", src_kv_list)
         dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
         request = TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, ""
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, None
         )
 
         skip_send = len(src_kv_list) == 0
@@ -442,7 +449,7 @@ class Sender:
                 src_memory_descs,
                 dst_memory_descs,
                 agent_send_args.remote_name,
-                "",
+                None,
             )
             status = self.transfer_agent.submit_transfer_requests(request)
         sync_status = "SUCCESS"
@@ -480,6 +487,7 @@ class Sender:
             self.slice_tasks[agent_send_args.disagg_id][agent_send_args.slice_id].transferred_count
             == agent_send_args.expect_count
         ):
+            # TODO avoid set_result if tranfser failed since it has been set exception
             agent_send_args.future_for_task.set_result(sync_status)
             self.slice_tasks[agent_send_args.disagg_id][
                 agent_send_args.slice_id
@@ -490,6 +498,7 @@ class Sender:
             if agent_send_args.is_last_slice:
                 self.tx_sessions[agent_send_args.disagg_id]().get_state().state = State.FINISHED
 
+    @nvtx_range("submit_send_meta_to_agent")
     def _submit_send_meta_to_agent(self, agent_send_args: AgentSendArgs):
         # TODO:  submit the meta data task to the transfer agent
         # pass
@@ -507,7 +516,7 @@ class Sender:
         src_memory_descs = MemoryDescs("DRAM", src_aux_list)
         dst_memory_descs = MemoryDescs("DRAM", dst_aux_list)
         request = TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, ""
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.remote_name, None
         )
 
         logger.debug(f" submit_send_meta_data_task, request: {request}")
@@ -528,7 +537,7 @@ class Sender:
         )
         self.tx_sessions[agent_send_args.disagg_id]().get_state().state = State.META_DATA_SENT
 
-    def _handle_send_task(self, send_slice_task: SliceSenderTask | MetaSenderTask):
+    def _handle_send_task(self, send_slice_task: SliceSendTask | MetaSenderTask):
         # assert send_slice_session.disagg_id in self.disagg_id_state
         # assert self.disagg_id_state[send_slice_session.disagg_id] == \
         #     SessionState.WAITING_FOR_SEND OR SessionState.TRANSFERRING
@@ -573,7 +582,7 @@ class Sender:
         return message[0] == str(MessageType.REGISTER_RANK_INFO).encode("ascii")
 
     def _handle_register_rank_info(self, send_id: bytes, message: list[bytes]):
-        instance_rank_info: RankInfo = pickle.loads(message[1])
+        instance_rank_info: RankInfo = RankInfo.from_bytes(message[1])
 
         self.peer_mapper.get_peer_registrar().register(
             instance_rank_info.instance_name, instance_rank_info.instance_rank, instance_rank_info
@@ -592,9 +601,9 @@ class Sender:
         )
 
     def _handle_request_data(self, send_id: bytes, message: list[bytes]):
-        transfer_gen_side_req_info: GenReqInfo = pickle.loads(message[1])
+        transfer_gen_side_req_info: GenReqInfo = GenReqInfo.from_bytes(message[1])
 
-        send_slice_tasks: list[SliceSenderTask] = self._get_send_slice_tasks(
+        send_slice_tasks: list[SliceSendTask] = self._get_send_slice_tasks(
             transfer_gen_side_req_info.disagg_id
         )
         self._save_peer_transfer_req_info(transfer_gen_side_req_info)
@@ -682,7 +691,7 @@ class TxSession(TxSessionBase):
         self.sender.clear_sender_session_resource(self.session_args.disagg_params.disagg_id)
 
 
-class SliceReceiverTask:
+class SliceRecvTask:
     def __init__(
         self,
         disagg_id: str,
@@ -713,7 +722,7 @@ class SliceReceiverTask:
     def get_future_for_task(self) -> concurrent.futures.Future:
         return self.future
 
-    def create_gen_side_transfer_req_info(self) -> GenReqInfo:
+    def create_transfer_req_info(self) -> GenReqInfo:
         return GenReqInfo(
             ctx_req_id=self.disagg_params.ctx_request_id,
             instance_name=self.peer_mapper.get_peer_registrar().get_self_rank_info().instance_name,
@@ -780,13 +789,13 @@ class Receiver:
 
     def async_receive_slice(
         self, disagg_params: DisaggregatedParams, slice: KVSlice, meta_slot_id: int
-    ) -> SliceReceiverTask:
+    ) -> SliceRecvTask:
         disagg_id = disagg_params.disagg_id
         if disagg_id not in self.slice_tasks:
             self.slice_tasks[disagg_id] = []
 
         slice_id = len(self.slice_tasks[disagg_id])
-        slice_receiver_task = SliceReceiverTask(
+        slice_receiver_task = SliceRecvTask(
             disagg_params.disagg_id,
             slice,
             slice_id,
@@ -810,11 +819,11 @@ class Receiver:
         del self.rx_sessions[disagg_id]
         del self.slice_tasks[disagg_id]
 
-    def _async_request_data_transfer(self, slice_receiver_task: SliceReceiverTask):
+    def _async_request_data_transfer(self, slice_receiver_task: SliceRecvTask):
         disagg_params = slice_receiver_task.disagg_params
         logger.debug(f" _async_request_data_transfer disagg_params: {disagg_params}")
         context_peer_infos: InstanceInfo = self._get_context_info(disagg_params)
-        transfer_gen_side_req_info = slice_receiver_task.create_gen_side_transfer_req_info()
+        transfer_gen_side_req_info = slice_receiver_task.create_transfer_req_info()
         if disagg_params.ctx_dp_rank is None:
             raise ValueError("ctx_dp_rank is None")
         ctx_dp_rank = 0 if disagg_params.ctx_dp_rank is None else disagg_params.ctx_dp_rank
@@ -846,7 +855,7 @@ class Receiver:
             message = [str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")]
             socket.send_multipart(message)
             message = socket.recv_multipart()
-            instance_info = pickle.loads(message[0])
+            instance_info = InstanceInfo.from_bytes(message[0])
             logger.debug(f" _get_context_info instance_info: {instance_info}")
             socket.close()
 
@@ -855,7 +864,7 @@ class Receiver:
                 send_message = []
                 send_message.append(str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
                 send_message.append(
-                    pickle.dumps(self.peer_mapper.get_peer_registrar().get_self_rank_info())
+                    self.peer_mapper.get_peer_registrar().get_self_rank_info().to_bytes()
                 )
                 socket.send_multipart(send_message)
 
@@ -949,7 +958,7 @@ class Receiver:
         socket = self._get_socket(endpoint)
         send_message = []
         send_message.append(str(MessageType.REQUEST_DATA).encode("ascii"))
-        send_message.append(pickle.dumps(transfer_gen_side_req_info))
+        send_message.append(transfer_gen_side_req_info.to_bytes())
         socket.send_multipart(send_message)
 
 
@@ -1040,7 +1049,7 @@ class InstanceInfoServer:
         return message[0] == str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")
 
     def _handle_request_instance_info(self, send_id: bytes, message: list[bytes]):
-        self.server_socket.send_multipart([send_id, pickle.dumps(self.instance_info)])
+        self.server_socket.send_multipart([send_id, self.instance_info.to_bytes()])
 
 
 class TransferWorker:
@@ -1062,14 +1071,17 @@ class TransferWorker:
         self.device_id = device_id
 
         self.init_instance_info(instance_name)
-
-        self.instance_info_server = InstanceInfoServer(self.instance_info)
+        need_info_server = self.mapping.rank == 0
+        if need_info_server:
+            self.instance_info_server = InstanceInfoServer(self.instance_info)
+        else:
+            self.instance_info_server = None
         self.peer_registrar = PeerRegistrar(self.instance_rank_info, self.instance_info)
         self.peer_mapper = PeerMapper(self.peer_registrar, self.kv_cache_manager)
-        self.transfer_agent = NixlTransferAgent(
+        self.transfer_agent = BindingsNixlTransferAgent(
             self.instance_rank_info.instance_name + str(self.instance_rank_info.instance_rank), True
         )
-
+        self.registered_memorys = []
         self._register_kv_cache()
         if self.meta_buffer is not None:
             self._register_meta_buffer()
@@ -1089,7 +1101,10 @@ class TransferWorker:
         self.instance_info.layer_num_per_pp = update_layer_num_per_pp
         self.instance_rank_info.layer_num_per_pp = update_layer_num_per_pp
 
-    def create_sender_session(self, request: LlmRequest) -> TxSession:
+    def create_send_session(self, request: LlmRequest) -> TxSession:
+        """
+        Create a txSession for the request.
+        """
         if self.meta_buffer is not None:
             meta_slot_id = self.meta_buffer.alloc_slot()
         else:
@@ -1101,7 +1116,10 @@ class TransferWorker:
             meta_slot_id=meta_slot_id,
         )
 
-    def create_receiver_session(self, request: LlmRequest) -> RxSession:
+    def create_recv_session(self, request: LlmRequest) -> RxSession:
+        """
+        Create a rxSession for the request.
+        """
         if self.meta_buffer is not None:
             meta_slot_id = self.meta_buffer.alloc_slot()
         else:
@@ -1196,6 +1214,7 @@ class TransferWorker:
         reg_memory_desc = RegMemoryDescs("VRAM", [memory_desc])
         self.transfer_agent.register_memory(reg_memory_desc)
         logger.debug(f"  transfer agent register kv cache memory: {memory_desc}")
+        self.registered_memorys.append(reg_memory_desc)
 
     def _register_meta_buffer(self):
         meta_buffer_info = self.meta_buffer.get_buffer_info()
@@ -1208,6 +1227,7 @@ class TransferWorker:
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self.transfer_agent.register_memory(reg_memory_desc)
         logger.debug(f"  transfer agent register meta buffer: {reg_memory_desc}")
+        self.registered_memorys.append(reg_memory_desc)
 
     # pack the meta data to the meta buffer
 
@@ -1221,3 +1241,8 @@ class TransferWorker:
         request.py_first_gen_tokens = first_gen_tokens
         request.py_draft_tokens = draft_tokens
         return request
+
+    def __del__(self):
+        if self.registered_memorys is not None:
+            for register_memory in self.registered_memorys:
+                self.transfer_agent.deregister_memory(register_memory)

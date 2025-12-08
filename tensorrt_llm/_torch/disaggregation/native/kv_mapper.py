@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Union
+from dataclasses import asdict, dataclass
+from typing import Callable, Dict, List, Optional, Union
+
+import msgpack
+import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBufferInfo
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 
 
 @dataclass
@@ -45,7 +48,21 @@ class RankInfo:
     server_endpoint: str
     recv_endpoint: str
     transfer_engine_info: bytes
-    meta_buffer_info: MetaBufferInfo
+    meta_buffer_info: Optional[MetaBufferInfo]
+
+    def to_bytes(self) -> bytes:
+        data = asdict(self)
+        data["meta_buffer_info"] = (
+            self.meta_buffer_info.to_dict() if self.meta_buffer_info is not None else None
+        )
+        return msgpack.packb(data)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RankInfo":
+        unpacked = msgpack.unpackb(data)
+        if unpacked["meta_buffer_info"] is not None:
+            unpacked["meta_buffer_info"] = MetaBufferInfo.from_dict(unpacked["meta_buffer_info"])
+        return cls(**unpacked)
 
 
 @dataclass
@@ -63,6 +80,13 @@ class InstanceInfo:
     is_mla: bool
     layer_num_per_pp: List[int]
     ctx_server_endpoints: List[str]
+
+    def to_bytes(self) -> bytes:
+        return msgpack.packb(asdict(self))
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "InstanceInfo":
+        return cls(**msgpack.unpackb(data))
 
 
 @dataclass
@@ -477,6 +501,7 @@ class PeerMapper(PeerMapperBase):
             * peer_ri.element_size
         )
 
+        @nvtx_range("head_match_kv_mapper")
         def kv_mapper(
             src_ptrs: List[int],
             src_size: int,
@@ -552,6 +577,7 @@ class PeerMapper(PeerMapperBase):
         src_layer_num = src_layer_kv_num * kv_factor
         dst_layer_num = dst_layer_kv_num * kv_factor
 
+        @nvtx_range("head_mismatch_kv_mapper")
         def kv_mapper(
             src_ptrs: List[int],
             src_size: int,
@@ -566,29 +592,33 @@ class PeerMapper(PeerMapperBase):
             dst_layer_kv_num: int = dst_layer_kv_num,
             cont_frag: int = cont_head_frag,
         ) -> CopyArgs:
-            src_out: List[int] = []
-            dst_out: List[int] = []
-            for i in range(len(src_ptrs)):
-                src_base = src_ptrs[i]
-                dst_base = dst_ptrs[i]
-                for idx in range(transfer_layers):
-                    src_layer_idx = src_layer_off + idx
-                    dst_layer_idx = peer_layer_off + idx
-                    for kv in range(kv_factor):
-                        src_ptr = (
-                            src_base
-                            + src_layer_num * src_layer_idx
-                            + src_layer_kv_num * kv
-                            + src_head_off
-                        )
-                        dst_ptr = (
-                            dst_base
-                            + dst_layer_num * dst_layer_idx
-                            + dst_layer_kv_num * kv
-                            + dst_head_off
-                        )
-                        src_out.append(src_ptr)
-                        dst_out.append(dst_ptr)
-            return src_out, dst_out, cont_frag
+            # Use numpy for vectorized computation
+            src_bases = np.array(src_ptrs, dtype=np.int64)  # shape: (n_ptrs,)
+            dst_bases = np.array(dst_ptrs, dtype=np.int64)  # shape: (n_ptrs,)
+
+            # Layer indices
+            layer_indices = np.arange(transfer_layers, dtype=np.int64)  # shape: (transfer_layers,)
+            src_layer_indices = src_layer_off + layer_indices
+            dst_layer_indices = peer_layer_off + layer_indices
+
+            # KV indices
+            kv_indices = np.arange(kv_factor, dtype=np.int64)  # shape: (kv_factor,)
+
+            # Compute all combinations using broadcasting
+            # Shape: (n_ptrs, transfer_layers, kv_factor)
+            src_out = (
+                src_bases[:, None, None]
+                + src_layer_num * src_layer_indices[None, :, None]
+                + src_layer_kv_num * kv_indices[None, None, :]
+                + src_head_off
+            )
+            dst_out = (
+                dst_bases[:, None, None]
+                + dst_layer_num * dst_layer_indices[None, :, None]
+                + dst_layer_kv_num * kv_indices[None, None, :]
+                + dst_head_off
+            )
+
+            return src_out.ravel().tolist(), dst_out.ravel().tolist(), cont_frag
 
         return kv_mapper
