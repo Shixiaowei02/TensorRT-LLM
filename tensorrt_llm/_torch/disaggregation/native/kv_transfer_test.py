@@ -7,7 +7,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
-from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBuffer
+from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
     TransferWorker,
@@ -73,7 +73,7 @@ def test_transfer_worker_with_parallel(
     request_len = 16
 
     for i in range(ctx_instance_num):
-        ctx_meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
+        ctx_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         transfer_agent_config = TransferAgentConfig()
         ctx_kv_cache_manager = KVCacheManager(
             trtllm.KvCacheConfig(
@@ -114,7 +114,7 @@ def test_transfer_worker_with_parallel(
                 device_id=device_id,
                 instance_name=ctx_instance_name,
                 transfer_agent_config=transfer_agent_config,
-                meta_buffer=ctx_meta_buffer,
+                aux_buffer=ctx_aux_buffer,
             )
         )
 
@@ -129,14 +129,14 @@ def test_transfer_worker_with_parallel(
         )
 
     for ctx_transfer_worker in ctx_transfer_workers:
-        ctx_transfer_worker.update_instance_info_with_collective_info(
+        ctx_transfer_worker.refresh_instance_info(
             update_endpoints=ctx_endpoints, update_layer_num_per_pp=ctx_layer_num_per_pp
         )
 
     gen_transfer_workers = []
     gen_kv_cache_managers = []
     for i in range(gen_instance_num):
-        gen_meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
+        gen_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         gen_kv_cache_manager = KVCacheManager(
             trtllm.KvCacheConfig(
                 max_tokens=2048,
@@ -162,7 +162,7 @@ def test_transfer_worker_with_parallel(
                 device_id=device_id,
                 instance_name=gen_instance_name,
                 transfer_agent_config=transfer_agent_config,
-                meta_buffer=gen_meta_buffer,
+                aux_buffer=gen_aux_buffer,
             )
         )
     _ = gen_transfer_workers[0].instance_info_server.get_endpoint()  # noqa: F841
@@ -175,7 +175,7 @@ def test_transfer_worker_with_parallel(
             len(gen_transfer_workers[pp_rank * gen_tp].kv_cache_manager.pp_layers)
         )
     for gen_transfer_worker in gen_transfer_workers:
-        gen_transfer_worker.update_instance_info_with_collective_info(
+        gen_transfer_worker.refresh_instance_info(
             update_endpoints=gen_endpoints, update_layer_num_per_pp=gen_layer_num_per_pp
         )
 
@@ -245,32 +245,32 @@ def test_transfer_worker_with_parallel(
             )
 
         sender_sessions = [
-            ctx_transfer_worker.create_send_session(ctx_request)
+            ctx_transfer_worker.create_tx_session(ctx_request)
             for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
         receiver_sessions = [
-            gen_transfer_worker.create_recv_session(gen_request)
+            gen_transfer_worker.create_rx_session(gen_request)
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
 
-        ctx_block_ids = [
+        ctx_blocks = [
             ctx_kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
             for ctx_kv_cache_manager in valid_ctx_kv_cache_managers
         ]
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, blocks=ctx_block_id) for ctx_block_id in ctx_blocks
         ]
         send_slice_tasks = [
             sender_session.slice_tasks[sender_session.send(send_kv_slice)]
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
 
-        gen_block_ids = [
+        gen_blocks = [
             gen_kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
             for gen_kv_cache_manager in valid_gen_kv_cache_managers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, blocks=gen_block_id) for gen_block_id in gen_blocks
         ]
         recv_slice_tasks = [
             receiver_session.slice_tasks[receiver_session.receive(recv_kv_slice)]
@@ -288,15 +288,11 @@ def test_transfer_worker_with_parallel(
 
         ctx_block_datas = [
             ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
-            for ctx_kv_cache_manager, ctx_block_id in zip(
-                valid_ctx_kv_cache_managers, ctx_block_ids
-            )
+            for ctx_kv_cache_manager, ctx_block_id in zip(valid_ctx_kv_cache_managers, ctx_blocks)
         ]
         gen_block_datas = [
             gen_kv_cache_manager.get_unique_primary_pool()[gen_block_id]
-            for gen_kv_cache_manager, gen_block_id in zip(
-                valid_gen_kv_cache_managers, gen_block_ids
-            )
+            for gen_kv_cache_manager, gen_block_id in zip(valid_gen_kv_cache_managers, gen_blocks)
         ]
         # assert ctx_block_datas.equal(gen_block_datas)
 

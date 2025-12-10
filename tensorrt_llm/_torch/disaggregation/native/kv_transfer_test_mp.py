@@ -16,7 +16,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
-from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBuffer
+from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
     TransferWorker,
@@ -183,7 +183,7 @@ def worker_fn(
         block_data_pool.copy_(random_values)
 
         # Create TransferWorker
-        meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
+        aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         transfer_agent_config = TransferAgentConfig()
         transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
@@ -191,7 +191,7 @@ def worker_fn(
             device_id=device_id,
             instance_name=ctx_instance_name,
             transfer_agent_config=transfer_agent_config,
-            meta_buffer=meta_buffer,
+            aux_buffer=aux_buffer,
         )
 
         # Get local endpoint
@@ -211,7 +211,7 @@ def worker_fn(
             ctx_layer_num_per_pp.append(all_layer_nums[pp * ctx_tp])
 
         # Update instance info
-        transfer_worker.update_instance_info_with_collective_info(
+        transfer_worker.refresh_instance_info(
             update_endpoints=ctx_endpoints, update_layer_num_per_pp=ctx_layer_num_per_pp
         )
 
@@ -247,7 +247,7 @@ def worker_fn(
         )
 
         # Create TransferWorker
-        meta_buffer = MetaBuffer(meta_max_batch_size, beam_width, max_draft_len)
+        aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         transfer_agent_config = TransferAgentConfig()
         transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
@@ -255,7 +255,7 @@ def worker_fn(
             device_id=device_id,
             instance_name=gen_instance_name,
             transfer_agent_config=transfer_agent_config,
-            meta_buffer=meta_buffer,
+            aux_buffer=aux_buffer,
         )
 
         # Get local endpoint
@@ -274,7 +274,7 @@ def worker_fn(
             gen_layer_num_per_pp.append(all_layer_nums[pp * gen_tp])
 
         # Update instance info
-        transfer_worker.update_instance_info_with_collective_info(
+        transfer_worker.refresh_instance_info(
             update_endpoints=gen_endpoints, update_layer_num_per_pp=gen_layer_num_per_pp
         )
 
@@ -327,11 +327,11 @@ def worker_fn(
             )
 
             # Create sender session
-            sender_session = transfer_worker.create_send_session(ctx_request)
+            sender_session = transfer_worker.create_tx_session(ctx_request)
 
             # Get block ids and send
-            block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
-            send_kv_slice = KVSlice(is_last_slice=True, block_ids=block_ids)
+            blocks = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
+            send_kv_slice = KVSlice(is_last_slice=True, blocks=blocks)
             send_slice_task = sender_session.slice_tasks[sender_session.send(send_kv_slice)]
 
             # Wait for send to complete
@@ -339,7 +339,7 @@ def worker_fn(
             assert sender_session.get_state().state == State.FINISHED
 
             # Get block data for verification
-            block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
+            block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
 
         else:  # gen process
             # Create gen request
@@ -366,11 +366,11 @@ def worker_fn(
             )
 
             # Create receiver session
-            receiver_session = transfer_worker.create_recv_session(gen_request)
+            receiver_session = transfer_worker.create_rx_session(gen_request)
 
             # Get block ids and receive
-            block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
-            recv_kv_slice = KVSlice(is_last_slice=True, block_ids=block_ids)
+            blocks = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
+            recv_kv_slice = KVSlice(is_last_slice=True, blocks=blocks)
             recv_slice_task = receiver_session.slice_tasks[receiver_session.receive(recv_kv_slice)]
 
             # Wait for receive to complete
@@ -378,7 +378,7 @@ def worker_fn(
             assert receiver_session.get_state().state == State.FINISHED
 
             # Get block data for verification
-            block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
+            block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
 
         # Synchronize before verification
         dist.barrier()

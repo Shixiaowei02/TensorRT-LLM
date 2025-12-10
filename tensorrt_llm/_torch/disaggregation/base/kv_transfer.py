@@ -14,22 +14,22 @@ class KVSlice:
 
     start_token_idx: Optional[int] = None
     end_token_idx: Optional[int] = None
-    start_layer_idx: Optional[int] = None
-    end_layer_idx: Optional[int] = None
-    block_ids: List[int] = field(default_factory=list)
+    start_layer: Optional[int] = None
+    end_layer: Optional[int] = None
+    blocks: List[int] = field(default_factory=list)
 
     is_last_slice: bool = False
 
     # def __post_init__(self) -> None:
     #     if self.start_token_idx < 0 or self.end_token_idx < 0:
     #         raise ValueError("token indices must be non-negative")
-    #     if self.start_layer_idx < 0 or self.end_layer_idx < 0:
+    #     if self.start_layer < 0 or self.end_layer < 0:
     #         raise ValueError("layer indices must be non-negative")
     #     if self.start_token_idx > self.end_token_idx:
     #         raise ValueError("start_token_idx cannot be greater than end_token_idx")
-    #     if self.start_layer_idx > self.end_layer_idx:
-    #         raise ValueError("start_layer_idx cannot be greater than end_layer_idx")
-    #     if any(b < 0 for b in self.block_ids):
+    #     if self.start_layer > self.end_layer:
+    #         raise ValueError("start_layer cannot be greater than end_layer")
+    #     if any(b < 0 for b in self.blocks):
     #         raise ValueError("block_ids must contain non-negative integers")
 
 
@@ -105,14 +105,3 @@ class RxSessionBase(ABC):
 
     @abstractmethod
     def get_exception(self) -> Optional[Exception]: ...
-
-
-class MetaBufferBase(ABC):
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def alloc_slot(self) -> int: ...
-
-    @abstractmethod
-    def free_slot(self, slot_id: int) -> None: ...

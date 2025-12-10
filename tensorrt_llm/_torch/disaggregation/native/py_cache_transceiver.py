@@ -105,12 +105,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.id_to_request = {}  # request_id to request
 
     def _create_kv_slice(self, req: LlmRequest):
-        block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
-        return KVSlice(is_last_slice=True, block_ids=block_ids)
+        blocks = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
+        return KVSlice(is_last_slice=True, blocks=blocks)
 
     def respond_and_send_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        send_session = self.transfer_worker.create_send_session(req)
+        send_session = self.transfer_worker.create_tx_session(req)
         self.send_sessions[req.request_id] = send_session
         kv_slice = self._create_kv_slice(req)
         send_task_id = send_session.send(kv_slice)
@@ -139,7 +139,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
     def request_and_receive_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        recv_session = self.transfer_worker.create_recv_session(req)
+        recv_session = self.transfer_worker.create_rx_session(req)
         self.recv_sessions[req.request_id] = recv_session
         kv_slice = self._create_kv_slice(req)
         recv_task_id = recv_session.receive(kv_slice)

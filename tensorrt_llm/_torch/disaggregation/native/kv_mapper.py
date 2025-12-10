@@ -6,7 +6,7 @@ import msgpack
 import numpy as np
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.native.kv_meta_buffer import MetaBufferInfo
+from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBufferMeta
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 
@@ -48,20 +48,18 @@ class RankInfo:
     server_endpoint: str
     recv_endpoint: str
     transfer_engine_info: bytes
-    meta_buffer_info: Optional[MetaBufferInfo]
+    aux_meta: Optional[AuxBufferMeta]
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
-        data["meta_buffer_info"] = (
-            self.meta_buffer_info.to_dict() if self.meta_buffer_info is not None else None
-        )
+        data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         return msgpack.packb(data)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data)
-        if unpacked["meta_buffer_info"] is not None:
-            unpacked["meta_buffer_info"] = MetaBufferInfo.from_dict(unpacked["meta_buffer_info"])
+        if unpacked["aux_meta"] is not None:
+            unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)
 
 
@@ -102,12 +100,12 @@ class KVPtrExtractor:
         else:
             self.kv_pool_attributes = kv_pool_attributes
 
-    def extract_kv_block_ptrs(self, kv_block_ids: List[int], pool_idx: int = 0) -> List[int]:
+    def extract_kv_block_ptrs(self, kv_blocks: List[int], pool_idx: int = 0) -> List[int]:
         """
         Given KV block ids, return the base pointers for each block in the chosen pool.
 
         Args:
-            kv_block_ids: list of integer block ids (0-based).
+            kv_blocks: list of integer block ids (0-based).
             pool_idx: index of the pool to use (default 0). Must be valid for configured pools.
 
         Returns:
@@ -121,7 +119,7 @@ class KVPtrExtractor:
 
         base_ptr = ptrs[pool_idx]
         block_size = sizes[pool_idx]
-        return [base_ptr + block_size * bid for bid in kv_block_ids]
+        return [base_ptr + block_size * bid for bid in kv_blocks]
 
     # ---------------- internal helpers ----------------
     @staticmethod
@@ -221,7 +219,7 @@ class PeerMapperBase(ABC):
 
     @abstractmethod
     def get_peer_overlap_targets(
-        self, peer_ii: InstanceInfo, peer_dp_rank: int
+        self, peer_instance_info: InstanceInfo, peer_dp_rank: int
     ) -> PeerOverlapTargets: ...
 
     @abstractmethod
@@ -240,7 +238,7 @@ class PeerMapper(PeerMapperBase):
         self._kv_mapper_cache: Dict[str, callable] = {}
         self._kv_pool_cache: Dict[str, KVPtrExtractor] = {}
 
-        self.kv_block_ptr_extractor = KVPtrExtractor(kv_cache_manager)
+        self.kv_ptr_extractor = KVPtrExtractor(kv_cache_manager)
 
         self.ri = self._registrar.get_self_rank_info()
         self.ii = self._registrar.get_self_instance_info()
@@ -262,8 +260,9 @@ class PeerMapper(PeerMapperBase):
 
     # ---------------- peer overlap targets ----------------
     def get_peer_overlap_targets(
-        self, peer_ii: InstanceInfo, peer_dp_rank: int
+        self, peer_instance_info: InstanceInfo, peer_dp_rank: int
     ) -> PeerOverlapTargets:
+        peer_ii = peer_instance_info
         k = self._key(peer_ii.instance_name, peer_dp_rank)
         if k in self._overlap_cache:
             return self._overlap_cache[k]
