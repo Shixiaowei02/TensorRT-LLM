@@ -18,9 +18,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "transferAgent.h"
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
@@ -165,46 +163,4 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
-
-    // poll_until_complete utility function
-    m.def(
-        "poll_until_complete",
-        [](std::function<std::string()> check_fn, double initial_sleep_sec, double max_sleep_sec,
-            double timeout_sec) -> std::pair<bool, double>
-        {
-            nb::gil_scoped_release release;
-
-            auto start_time = std::chrono::steady_clock::now();
-            double sleep_sec = initial_sleep_sec;
-
-            while (true)
-            {
-                std::string status;
-                {
-                    nb::gil_scoped_acquire acquire;
-                    status = check_fn();
-                }
-
-                if (status == "DONE")
-                {
-                    auto end_time = std::chrono::steady_clock::now();
-                    double elapsed = std::chrono::duration<double>(end_time - start_time).count();
-                    return {true, elapsed};
-                }
-
-                auto now = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration<double>(now - start_time).count();
-
-                if (timeout_sec > 0.0 && elapsed >= timeout_sec)
-                {
-                    return {false, elapsed};
-                }
-
-                std::this_thread::sleep_for(std::chrono::duration<double>(sleep_sec));
-
-                sleep_sec = std::min(sleep_sec * 2.0, max_sleep_sec);
-            }
-        },
-        nb::arg("check_fn"), nb::arg("initial_sleep_sec") = 0.0001, nb::arg("max_sleep_sec") = 0.01,
-        nb::arg("timeout_sec") = 0.0, "Poll a check function until it returns 'DONE', releasing the GIL during sleep.");
 }

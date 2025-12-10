@@ -8,6 +8,8 @@ The standalone nixl_bindings module is separate from the main trtllm bindings,
 so trtllm can still function normally even without NIXL dependencies.
 """
 
+import time
+
 from tensorrt_llm._utils import nvtx_range
 
 # Import base classes for type compatibility
@@ -32,7 +34,6 @@ try:
     TransferOp = _agent_binding.TransferOp
     CppTransferRequest = _agent_binding.TransferRequest
     AgentDesc = _agent_binding.AgentDesc
-    poll_until_complete = _agent_binding.poll_until_complete
 
 except ImportError:
     # tensorrt_llm_transfer_agent_binding not available, will fall back to Python nixl or raise error
@@ -196,33 +197,6 @@ NixlTransferStatus = None
 try:
     from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle  # noqa: E402
 
-    # For Python nixl, we need poll_until_complete
-    if _AGENT_BINDING_AVAILABLE:
-        _poll_until_complete = poll_until_complete
-    else:
-        # Fallback pure Python implementation
-        import time
-
-        def _poll_until_complete(
-            check_fn, initial_sleep_sec=0.0001, max_sleep_sec=0.01, timeout_sec=0.0
-        ):
-            """Poll a check function until it returns 'DONE'."""
-            start_time = time.monotonic()
-            sleep_sec = initial_sleep_sec
-
-            while True:
-                status = check_fn()
-                if status == "DONE":
-                    elapsed = time.monotonic() - start_time
-                    return (True, elapsed)
-
-                elapsed = time.monotonic() - start_time
-                if timeout_sec > 0.0 and elapsed >= timeout_sec:
-                    return (False, elapsed)
-
-                time.sleep(sleep_sec)
-                sleep_sec = min(sleep_sec * 2.0, max_sleep_sec)
-
     class NixlTransferStatus(TransferStatus):
         """TransferStatus using Python nixl library."""
 
@@ -234,15 +208,19 @@ try:
             status = self.agent.check_xfer_state(self.handle)
             return status == "DONE"
 
-        def wait(self, timeout_sec: float = 0.0) -> bool:
-            """Wait for transfer to complete, releasing GIL during sleep."""
-            success, _ = _poll_until_complete(
-                lambda: self.agent.check_xfer_state(self.handle),
-                initial_sleep_sec=0.0001,
-                max_sleep_sec=0.01,
-                timeout_sec=timeout_sec,
-            )
-            return success
+        def wait(self):
+            status = "PROC"
+            sleep_time = 0.0001  # 0.1ms
+            max_sleep_time = 0.01  # 10ms
+            while status == "PROC":
+                status = self.agent.check_xfer_state(self.handle)
+                if status == "ERR":
+                    return False  # transfer failed
+                # sleep(0.1)
+                # sleep to release GIL
+                time.sleep(sleep_time)
+                sleep_time = min(sleep_time * 2, max_sleep_time)
+            return True
 
     class NixlTransferAgent(BaseTransferAgent):
         """NixlTransferAgent using Python nixl library."""
