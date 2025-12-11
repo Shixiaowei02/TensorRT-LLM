@@ -190,6 +190,10 @@ class PeerRegistrar:
     # ---------------- public simple APIs ----------------
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         # TODO: check  if peer is valid for registration
+        if not self._check_peer_compatible(peer_ri):
+            raise ValueError(
+                f"PeerRegistrar: register: peer {peer_name} {peer_rank} is not compatible"
+            )
         self._peer_ri_cache[self._key(peer_name, peer_rank)] = peer_ri
 
     def unregister(self, peer_name: str, peer_rank: int):
@@ -206,6 +210,54 @@ class PeerRegistrar:
 
     def _key(self, name: str, rank: int) -> str:
         return name + str(rank)
+
+    def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
+        if self.ri.is_mla != peer_ri.is_mla:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: is_mla mismatch: {self.ri.is_mla} != {peer_ri.is_mla}"
+            )
+            return False
+        if self.ri.cp_size != 1 or peer_ri.cp_size != 1:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: only support context parallelism is 1: "
+                f"{self.ri.cp_size} != {peer_ri.cp_size}"
+            )
+            return False
+        if self.ri.element_size != peer_ri.element_size:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: element size mismatch: "
+                f"{self.ri.element_size} != {peer_ri.element_size}"
+            )
+            return False
+        if self.ri.tokens_per_block != peer_ri.tokens_per_block:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: tokens per block mismatch: "
+                f"{self.ri.tokens_per_block} != {peer_ri.tokens_per_block}"
+            )
+            return False
+        if self.ri.dims_per_head != peer_ri.dims_per_head:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: dims per head mismatch: "
+                f"{self.ri.dims_per_head} != {peer_ri.dims_per_head}"
+            )
+            return False
+
+        self_layers = sum(self.ri.layer_num_per_pp)
+        peer_layers = sum(peer_ri.layer_num_per_pp)
+        if self_layers != peer_layers:
+            logger.warning(
+                f"PeerRegistrar: _check_peer_compatible: number of layers mismatch: {self_layers} != {peer_layers}"
+            )
+            return False
+
+        if self.ri.is_mla:
+            if peer_ri.kv_head_num_per_rank != 1 or self.ri.kv_head_num_per_rank != 1:
+                logger.warning(
+                    f"PeerRegistrar: _check_peer_compatible: only support MLA with 1 head per layer: "
+                    f"{self.ri.kv_head_num_per_rank} != {peer_ri.kv_head_num_per_rank}"
+                )
+                return False
+        return True
 
 
 class PeerMapperBase(ABC):

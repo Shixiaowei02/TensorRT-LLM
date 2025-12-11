@@ -39,6 +39,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.kv_cache_manager = kv_cache_manager
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         self.mapping = mapping
+        self._check_compatible()
         self.sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
@@ -381,3 +382,14 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError("cancel_request is not implemented")
         # self.transfer_worker.cancel_request(req)
+
+    def _check_compatible(self):
+        if self.mapping.cp_size != 1:
+            raise ValueError(
+                f"PyNativeCacheTransceiver: _check_compatible: only support context parallelism is 1: "
+                f"cp_size: {self.mapping.cp_size}"
+            )
+
+        if self.kv_cache_manager.is_vswa:
+            raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
+        return
