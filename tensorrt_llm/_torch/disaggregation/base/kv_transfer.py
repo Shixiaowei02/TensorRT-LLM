@@ -69,8 +69,9 @@ class TxSessionBase(ABC):
     def __init__(self, sender: SenderBase, args: SessionArgsBase):
         self.session_args = args
 
+    @property
     @abstractmethod
-    def get_state(self) -> SessionState: ...
+    def state(self) -> SessionState: ...
 
     @abstractmethod
     def poll_task(self, id: TaskIdType) -> State: ...
@@ -82,16 +83,18 @@ class TxSessionBase(ABC):
     Async send slice to the peer. return the task id. Task state can be polled by poll_task().
     """
 
+    @property
     @abstractmethod
-    def get_exception(self) -> Optional[Exception]: ...
+    def exception(self) -> Optional[Exception]: ...
 
 
 class RxSessionBase(ABC):
     def __init__(self, receiver: ReceiverBase, args: SessionArgsBase):
         self.session_args = args
 
+    @property
     @abstractmethod
-    def get_state(self) -> SessionState: ...
+    def state(self) -> SessionState: ...
 
     @abstractmethod
     def poll_task(self, id: TaskIdType) -> State: ...
@@ -103,5 +106,6 @@ class RxSessionBase(ABC):
     Async receive slice from the peer. return the task id. Task state can be polled by poll_task().
     """
 
+    @property
     @abstractmethod
-    def get_exception(self) -> Optional[Exception]: ...
+    def exception(self) -> Optional[Exception]: ...

@@ -195,7 +195,7 @@ def worker_fn(
         )
 
         # Get local endpoint
-        local_endpoint = transfer_worker.sender.server_endpoint
+        local_endpoint = transfer_worker._sender.endpoint
         local_layer_num = len(kv_cache_manager.pp_layers)
 
         # Allgather endpoints within ctx group
@@ -217,7 +217,7 @@ def worker_fn(
 
         # Get ctx_info_endpoint (only rank 0 has the real value)
         if local_rank == 0:
-            ctx_info_endpoint = transfer_worker.instance_info_server.get_endpoint()
+            ctx_info_endpoint = transfer_worker._instance_info_server.endpoint
         else:
             ctx_info_endpoint = None
 
@@ -259,7 +259,7 @@ def worker_fn(
         )
 
         # Get local endpoint
-        local_endpoint = transfer_worker.sender.server_endpoint
+        local_endpoint = transfer_worker._sender.endpoint
         local_layer_num = len(kv_cache_manager.pp_layers)
 
         # Allgather endpoints within gen group
@@ -335,8 +335,8 @@ def worker_fn(
             send_slice_task = sender_session.slice_tasks[sender_session.send(send_kv_slice)]
 
             # Wait for send to complete
-            send_slice_task.get_future_for_task().result()
-            assert sender_session.get_state().state == State.FINISHED
+            send_slice_task.future.result()
+            assert sender_session.state.state == State.FINISHED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
@@ -374,8 +374,8 @@ def worker_fn(
             recv_slice_task = receiver_session.slice_tasks[receiver_session.receive(recv_kv_slice)]
 
             # Wait for receive to complete
-            recv_slice_task.get_future_for_task().result()
-            assert receiver_session.get_state().state == State.FINISHED
+            recv_slice_task.future.result()
+            assert receiver_session.state.state == State.FINISHED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]

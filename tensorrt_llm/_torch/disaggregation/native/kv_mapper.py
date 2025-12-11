@@ -58,7 +58,7 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data)
-        if unpacked["aux_meta"] is not None:
+        if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)
 
@@ -77,7 +77,7 @@ class InstanceInfo:
     enable_attention_dp: bool
     is_mla: bool
     layer_num_per_pp: List[int]
-    ctx_server_endpoints: List[str]
+    ctx_endpoints: List[str]
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(asdict(self))
@@ -95,10 +95,11 @@ class KVPoolAttributes:
 
 class KVPtrExtractor:
     def __init__(self, kv_pool_attributes: Union[KVPoolAttributes, KVCacheManager]):
+        # store as a private attribute
         if self._is_kv_cache_manager(kv_pool_attributes):
-            self.kv_pool_attributes = self._attrs_from_manager(kv_pool_attributes)
+            self._kv_pool_attributes = self._attrs_from_manager(kv_pool_attributes)
         else:
-            self.kv_pool_attributes = kv_pool_attributes
+            self._kv_pool_attributes = kv_pool_attributes
 
     def extract_kv_block_ptrs(self, kv_blocks: List[int], pool_idx: int = 0) -> List[int]:
         """
@@ -111,15 +112,22 @@ class KVPtrExtractor:
         Returns:
             List[int]: list of pointers (one pointer per block id).
         """
-        ptrs = self.kv_pool_attributes.kv_cache_ptrs
-        sizes = self.kv_pool_attributes.kv_cache_block_sizes
+        ptrs = self._kv_pool_attributes.kv_cache_ptrs
+        sizes = self._kv_pool_attributes.kv_cache_block_sizes
 
         if pool_idx < 0 or pool_idx >= len(ptrs):
-            raise IndexError(f"pool_idx {pool_idx} out of range, available pools: {len(ptrs)}")
+            raise IndexError(
+                f"KVPtrExtractor.extract_kv_block_ptrs: pool_idx {pool_idx} out of range "
+                f"(available pools = {len(ptrs)})"
+            )
 
-        base_ptr = ptrs[pool_idx]
-        block_size = sizes[pool_idx]
-        return [base_ptr + block_size * bid for bid in kv_blocks]
+        base_ptr = int(ptrs[pool_idx])
+        block_size = int(sizes[pool_idx])
+        return [base_ptr + block_size * int(bid) for bid in kv_blocks]
+
+    @property
+    def kv_pool_attributes(self) -> KVPoolAttributes:
+        return self._kv_pool_attributes
 
     # ---------------- internal helpers ----------------
     @staticmethod
@@ -130,12 +138,19 @@ class KVPtrExtractor:
 
     @staticmethod
     def _attrs_from_manager(manager: KVCacheManager) -> KVPoolAttributes:
+        """
+        Convert a KVCacheManager into KVPoolAttributes (ptr list and block sizes).
+        Error messages are made more informative to help debugging.
+        """
         try:
             pools = manager.get_unique_primary_pool()
         except Exception as ex:
-            raise ValueError("Failed to obtain pool(s) from KVCacheManager: " + str(ex))
+            raise ValueError(
+                "KVPtrExtractor: failed to get pool(s) from KVCacheManager via "
+                "get_unique_primary_pool(): " + str(ex)
+            )
 
-        # Normalize to list
+        # Normalize to list for uniform handling
         if isinstance(pools, (list, tuple)):
             pool_list = list(pools)
         else:
@@ -146,23 +161,45 @@ class KVPtrExtractor:
         ptrs: List[int] = []
         block_sizes: List[int] = []
         for p in pool_list:
-            # data_ptr
+            # pointer extraction
             if hasattr(p, "data_ptr") and callable(getattr(p, "data_ptr")):
-                ptr = p.data_ptr()
+                try:
+                    ptr = int(p.data_ptr())
+                except Exception as ex:
+                    raise ValueError(
+                        f"KVPtrExtractor: failed to call data_ptr() on pool object: {ex}"
+                    )
             elif isinstance(p, int):
                 ptr = int(p)
             else:
-                raise ValueError("Pool object does not expose data_ptr(): " + repr(p))
+                raise ValueError(
+                    "KVPtrExtractor: pool object does not expose data_ptr() and is not an int: "
+                    + repr(p)
+                )
             ptrs.append(ptr)
 
-            # numel -> block size
-            # use p[0] , p is a tensor shape (num_blocks,block_size)
-            if hasattr(p, "numel") and callable(getattr(p, "numel")):
-                n = p[0].numel()
-            elif hasattr(p, "num_elements"):
-                n = getattr(p[0], "num_elements")
-            else:
-                raise ValueError("Pool object does not expose numel()/num_elements: " + repr(p))
+            # compute block size: try to infer using first sub-tensor or tensor properties
+            try:
+                # if p is indexable and has a first element representing a block
+                if (
+                    hasattr(p, "__getitem__")
+                    and hasattr(p[0], "numel")
+                    and callable(getattr(p[0], "numel"))
+                ):
+                    n = int(p[0].numel())
+                # fall back to tensor.numel()
+                elif hasattr(p, "numel") and callable(getattr(p, "numel")):
+                    n = int(p.numel())
+                # or a numpy-like field
+                else:
+                    raise RuntimeError("cannot determine number of elements for pool object")
+            except Exception as ex:
+                raise ValueError(
+                    "KVPtrExtractor: failed to determine block size from pool object: "
+                    + repr(p)
+                    + " -> "
+                    + str(ex)
+                )
 
             block_sizes.append(int(n) * int(element_size))
 
@@ -182,79 +219,88 @@ class PeerRegistrar:
         rank_info: RankInfo,
         instance_info: InstanceInfo,
     ):
-        self.ri = rank_info
-        self.ii = instance_info
+        # store original inputs as private members
+        self._ri = rank_info
+        self._ii = instance_info
 
         self._peer_ri_cache: Dict[str, RankInfo] = {}
 
     # ---------------- public simple APIs ----------------
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
-        # TODO: check  if peer is valid for registration
+        # TODO: check if peer is valid for registration
         if not self._check_peer_compatible(peer_ri):
             raise ValueError(
-                f"PeerRegistrar: register: peer {peer_name} {peer_rank} is not compatible"
+                f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."
             )
         self._peer_ri_cache[self._key(peer_name, peer_rank)] = peer_ri
 
     def unregister(self, peer_name: str, peer_rank: int):
-        del self._peer_ri_cache[self._key(peer_name, peer_rank)]
+        key = self._key(peer_name, peer_rank)
+        if key in self._peer_ri_cache:
+            del self._peer_ri_cache[key]
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._key(peer_name, peer_rank)]
 
     def get_self_instance_info(self) -> InstanceInfo:
-        return self.ii
+        return self._ii
 
     def get_self_rank_info(self) -> RankInfo:
-        return self.ri
+        return self._ri
 
     def _key(self, name: str, rank: int) -> str:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
-        if self.ri.is_mla != peer_ri.is_mla:
+        """
+        Check basic compatibility between local rank info and peer rank info.
+        Log human-friendly warnings for mismatches.
+        """
+        if self._ri.is_mla != peer_ri.is_mla:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: is_mla mismatch: {self.ri.is_mla} != {peer_ri.is_mla}"
+                "PeerRegistrar: compatibility check failed: 'is_mla' differs "
+                f"(local={self._ri.is_mla}, peer={peer_ri.is_mla})."
             )
             return False
-        if self.ri.cp_size != 1 or peer_ri.cp_size != 1:
+        if self._ri.cp_size != 1 or peer_ri.cp_size != 1:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: only support context parallelism is 1: "
-                f"{self.ri.cp_size} != {peer_ri.cp_size}"
+                "PeerRegistrar: unsupported configuration: context parallelism (cp_size) "
+                f"must be 1 for both local and peer ranks (local={self._ri.cp_size}, peer={peer_ri.cp_size})."
             )
             return False
-        if self.ri.element_size != peer_ri.element_size:
+        if self._ri.element_size != peer_ri.element_size:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: element size mismatch: "
-                f"{self.ri.element_size} != {peer_ri.element_size}"
+                "PeerRegistrar: element size mismatch "
+                f"(local={self._ri.element_size} bytes, peer={peer_ri.element_size} bytes)."
             )
             return False
-        if self.ri.tokens_per_block != peer_ri.tokens_per_block:
+        if self._ri.tokens_per_block != peer_ri.tokens_per_block:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: tokens per block mismatch: "
-                f"{self.ri.tokens_per_block} != {peer_ri.tokens_per_block}"
+                "PeerRegistrar: tokens_per_block mismatch "
+                f"(local={self._ri.tokens_per_block}, peer={peer_ri.tokens_per_block})."
             )
             return False
-        if self.ri.dims_per_head != peer_ri.dims_per_head:
+        if self._ri.dims_per_head != peer_ri.dims_per_head:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: dims per head mismatch: "
-                f"{self.ri.dims_per_head} != {peer_ri.dims_per_head}"
+                "PeerRegistrar: dims_per_head mismatch "
+                f"(local={self._ri.dims_per_head}, peer={peer_ri.dims_per_head})."
             )
             return False
 
-        self_layers = sum(self.ri.layer_num_per_pp)
+        self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
         if self_layers != peer_layers:
             logger.warning(
-                f"PeerRegistrar: _check_peer_compatible: number of layers mismatch: {self_layers} != {peer_layers}"
+                "PeerRegistrar: total layer count mismatch "
+                f"(local={self_layers}, peer={peer_layers})."
             )
             return False
 
-        if self.ri.is_mla:
-            if peer_ri.kv_head_num_per_rank != 1 or self.ri.kv_head_num_per_rank != 1:
+        if self._ri.is_mla:
+            if peer_ri.kv_head_num_per_rank != 1 or self._ri.kv_head_num_per_rank != 1:
                 logger.warning(
-                    f"PeerRegistrar: _check_peer_compatible: only support MLA with 1 head per layer: "
-                    f"{self.ri.kv_head_num_per_rank} != {peer_ri.kv_head_num_per_rank}"
+                    "PeerRegistrar: MLA mode requires exactly 1 KV head per rank for both local and peer."
+                    f" (local={self._ri.kv_head_num_per_rank}, peer={peer_ri.kv_head_num_per_rank})"
                 )
                 return False
         return True
@@ -290,10 +336,16 @@ class PeerMapper(PeerMapperBase):
         self._kv_mapper_cache: Dict[str, callable] = {}
         self._kv_pool_cache: Dict[str, KVPtrExtractor] = {}
 
-        self.kv_ptr_extractor = KVPtrExtractor(kv_cache_manager)
+        # keep extractor exposed via property for compatibility
+        self._kv_ptr_extractor = KVPtrExtractor(kv_cache_manager)
 
-        self.ri = self._registrar.get_self_rank_info()
-        self.ii = self._registrar.get_self_instance_info()
+        # cache self info
+        self._ri = self._registrar.get_self_rank_info()
+        self._ii = self._registrar.get_self_instance_info()
+
+    @property
+    def kv_ptr_extractor(self) -> KVPtrExtractor:
+        return self._kv_ptr_extractor
 
     # ---------------- kv pool extractor ----------------
     def get_kv_extractor(self, peer_name: str, peer_rank: int) -> KVPtrExtractor:
@@ -320,8 +372,8 @@ class PeerMapper(PeerMapperBase):
             return self._overlap_cache[k]
 
         # compute pp overlap and target layers
-        self_start_layer = sum(self.ri.layer_num_per_pp[: self.ri.pp_rank])
-        self_end_layer = self_start_layer + self.ri.layer_num_per_pp[self.ri.pp_rank]
+        self_start_layer = sum(self._ri.layer_num_per_pp[: self._ri.pp_rank])
+        self_end_layer = self_start_layer + self._ri.layer_num_per_pp[self._ri.pp_rank]
 
         pre = 0
         tgt_pp_ranks: List[int] = []
@@ -336,14 +388,28 @@ class PeerMapper(PeerMapperBase):
                 )
             pre += peer_ii.layer_num_per_pp[p]
 
+        if not tgt_pp_ranks:
+            # no overlap found
+            pd = PeerOverlapTargets(
+                overlap_pp_size=0,
+                overlap_tp_size=0,
+                overlap_cp_size=0,
+                duplicate_head_factor=1,
+                peer_duplicate_head_factor=1,
+                target_peer_pp_layer_num=[],
+                ranks=[],
+            )
+            self._overlap_cache[k] = pd
+            return pd
+
         peer_pp_start = tgt_pp_ranks[0]
         overlap_pp_size = len(tgt_pp_ranks)
         peer_pp_end = peer_pp_start + overlap_pp_size
 
         # tp per dp-group
-        self_tp_per_dp = self._tp_per_dp(self.ri)
+        self_tp_per_dp = self._tp_per_dp(self._ri)
         peer_tp_per_dp = self._tp_per_dp(peer_ii)
-        self_tp_rank_in_dp = self.ri.tp_rank % self_tp_per_dp
+        self_tp_rank_in_dp = self._ri.tp_rank % self_tp_per_dp
 
         # compute tp overlap
         if self_tp_per_dp <= peer_tp_per_dp:
@@ -357,13 +423,13 @@ class PeerMapper(PeerMapperBase):
             peer_tp_end = peer_tp_start + overlap_tp
 
         # cp overlap
-        if self.ri.cp_size <= peer_ii.cp_size:
-            overlap_cp = peer_ii.cp_size // self.ri.cp_size
-            peer_cp_start = self.ri.cp_rank * overlap_cp
+        if self._ri.cp_size <= peer_ii.cp_size:
+            overlap_cp = peer_ii.cp_size // self._ri.cp_size
+            peer_cp_start = self._ri.cp_rank * overlap_cp
             peer_cp_end = peer_cp_start + overlap_cp
         else:
-            ratio = self.ri.cp_size // peer_ii.cp_size
-            peer_cp_start = self.ri.cp_rank // ratio
+            ratio = self._ri.cp_size // peer_ii.cp_size
+            peer_cp_start = self._ri.cp_rank // ratio
             overlap_cp = 1
             peer_cp_end = peer_cp_start + overlap_cp
 
@@ -375,7 +441,7 @@ class PeerMapper(PeerMapperBase):
 
         dup_head = max(
             1,
-            self.ri.kv_head_num_per_rank
+            self._ri.kv_head_num_per_rank
             * self_tp_per_dp
             // (peer_ii.kv_head_num_per_rank * peer_tp_per_dp),
         )
@@ -383,7 +449,7 @@ class PeerMapper(PeerMapperBase):
             1,
             peer_ii.kv_head_num_per_rank
             * peer_tp_per_dp
-            // (self.ri.kv_head_num_per_rank * self_tp_per_dp),
+            // (self._ri.kv_head_num_per_rank * self_tp_per_dp),
         )
 
         pd = PeerOverlapTargets(
@@ -407,31 +473,32 @@ class PeerMapper(PeerMapperBase):
         if k in self._kv_mapper_cache:
             return self._kv_mapper_cache[k]
 
-        kv_factor = 1 if self.ri.is_mla else 2
-        self_tp_per_dp = self._tp_per_dp(self.ri)
+        kv_factor = 1 if self._ri.is_mla else 2
+        self_tp_per_dp = self._tp_per_dp(self._ri)
         peer_tp_per_dp = self._tp_per_dp(peer_ri)
-        self_tp_rank = self.ri.tp_rank % self_tp_per_dp
+        self_tp_rank = self._ri.tp_rank % self_tp_per_dp
         peer_tp_rank = peer_ri.tp_rank % peer_tp_per_dp
 
         # head_num_per_rank =1 when is_dup_head
         is_dup_head = (
-            self.ri.kv_head_num_per_rank * self_tp_per_dp
+            self._ri.kv_head_num_per_rank * self_tp_per_dp
             != peer_ri.kv_head_num_per_rank * peer_tp_per_dp
         )
-        head_match = is_dup_head or self.ri.is_mla or self_tp_per_dp == peer_tp_per_dp
+        head_match = is_dup_head or self._ri.is_mla or self_tp_per_dp == peer_tp_per_dp
         logger.debug(
-            f"head_match: {head_match}, is_dup_head: {is_dup_head}, self.ri.is_mla: {self.ri.is_mla}, "
-            f"self_tp_per_dp: {self_tp_per_dp}, peer_tp_per_dp: {peer_tp_per_dp}"
+            "PeerMapper.get_kv_ptrs_mapper: "
+            f"head_match={head_match}, is_dup_head={is_dup_head}, self_is_mla={self._ri.is_mla}, "
+            f"self_tp_per_dp={self_tp_per_dp}, peer_tp_per_dp={peer_tp_per_dp}"
         )
         # fast identity when write_all and same pp_size
-        if head_match and self.ri.pp_size == peer_ri.pp_size:
+        if head_match and self._ri.pp_size == peer_ri.pp_size:
             mapper = self._identity_kv_mapper()
             self._kv_mapper_cache[k] = mapper
             return mapper
 
         # compute overlapping layers
-        self_start_layer = sum(self.ri.layer_num_per_pp[: self.ri.pp_rank])
-        self_end_layer = self_start_layer + self.ri.layer_num_per_pp[self.ri.pp_rank]
+        self_start_layer = sum(self._ri.layer_num_per_pp[: self._ri.pp_rank])
+        self_end_layer = self_start_layer + self._ri.layer_num_per_pp[self._ri.pp_rank]
         peer_start_layer = sum(peer_ri.layer_num_per_pp[: peer_ri.pp_rank])
         peer_end_layer = peer_start_layer + peer_ri.layer_num_per_pp[peer_ri.pp_rank]
         start = max(self_start_layer, peer_start_layer)
@@ -530,18 +597,18 @@ class PeerMapper(PeerMapperBase):
         frag_sz = (
             transfer_layers
             * kv_factor
-            * self.ri.kv_head_num_per_rank
-            * self.ri.tokens_per_block
-            * self.ri.dims_per_head
-            * self.ri.element_size
+            * self._ri.kv_head_num_per_rank
+            * self._ri.tokens_per_block
+            * self._ri.dims_per_head
+            * self._ri.element_size
         )
         src_block_off = (
             src_layer_off
             * kv_factor
-            * self.ri.kv_head_num_per_rank
-            * self.ri.tokens_per_block
-            * self.ri.dims_per_head
-            * self.ri.element_size
+            * self._ri.kv_head_num_per_rank
+            * self._ri.tokens_per_block
+            * self._ri.dims_per_head
+            * self._ri.element_size
         )
         dst_block_off = (
             dst_layer_off
@@ -601,8 +668,10 @@ class PeerMapper(PeerMapperBase):
         peer_layer_off: int,
         peer_ri: RankInfo,
     ) -> PeerMapperBase.PtrMapper:
-        head_frag = self.ri.tokens_per_block * self.ri.dims_per_head * self.ri.element_size
-        cont_head_frag = min(self.ri.kv_head_num_per_rank, peer_ri.kv_head_num_per_rank) * head_frag
+        head_frag = self._ri.tokens_per_block * self._ri.dims_per_head * self._ri.element_size
+        cont_head_frag = (
+            min(self._ri.kv_head_num_per_rank, peer_ri.kv_head_num_per_rank) * head_frag
+        )
 
         src_head_off = 0
         dst_head_off = 0
@@ -614,10 +683,10 @@ class PeerMapper(PeerMapperBase):
             dst_head_off = (self_tp_rank % ratio) * cont_head_frag
 
         src_layer_kv_num = (
-            self.ri.kv_head_num_per_rank
-            * self.ri.tokens_per_block
-            * self.ri.dims_per_head
-            * self.ri.element_size
+            self._ri.kv_head_num_per_rank
+            * self._ri.tokens_per_block
+            * self._ri.dims_per_head
+            * self._ri.element_size
         )
         dst_layer_kv_num = (
             peer_ri.kv_head_num_per_rank

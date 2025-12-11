@@ -118,14 +118,14 @@ def test_transfer_worker_with_parallel(
             )
         )
 
-    ctx_info_endpoint = ctx_transfer_workers[0].instance_info_server.get_endpoint()
+    ctx_info_endpoint = ctx_transfer_workers[0]._instance_info_server.endpoint
     ctx_endpoints = [
-        ctx_transfer_worker.sender.server_endpoint for ctx_transfer_worker in ctx_transfer_workers
+        ctx_transfer_worker._sender.endpoint for ctx_transfer_worker in ctx_transfer_workers
     ]
     ctx_layer_num_per_pp = []
     for pp_rank in range(ctx_pp):
         ctx_layer_num_per_pp.append(
-            len(ctx_transfer_workers[pp_rank * ctx_tp].kv_cache_manager.pp_layers)
+            len(ctx_transfer_workers[pp_rank * ctx_tp]._kv_cache_manager.pp_layers)
         )
 
     for ctx_transfer_worker in ctx_transfer_workers:
@@ -165,14 +165,14 @@ def test_transfer_worker_with_parallel(
                 aux_buffer=gen_aux_buffer,
             )
         )
-    _ = gen_transfer_workers[0].instance_info_server.get_endpoint()  # noqa: F841
+    _ = gen_transfer_workers[0]._instance_info_server.endpoint  # noqa: F841
     gen_endpoints = [
-        gen_transfer_worker.sender.server_endpoint for gen_transfer_worker in gen_transfer_workers
+        gen_transfer_worker._sender.endpoint for gen_transfer_worker in gen_transfer_workers
     ]
     gen_layer_num_per_pp = []
     for pp_rank in range(gen_pp):
         gen_layer_num_per_pp.append(
-            len(gen_transfer_workers[pp_rank * gen_tp].kv_cache_manager.pp_layers)
+            len(gen_transfer_workers[pp_rank * gen_tp]._kv_cache_manager.pp_layers)
         )
     for gen_transfer_worker in gen_transfer_workers:
         gen_transfer_worker.refresh_instance_info(
@@ -278,13 +278,13 @@ def test_transfer_worker_with_parallel(
         ]
 
         for send_slice_task in send_slice_tasks:
-            send_slice_task.get_future_for_task().result()
+            send_slice_task.future.result()
         for recv_slice_task in recv_slice_tasks:
-            recv_slice_task.get_future_for_task().result()
+            recv_slice_task.future.result()
         for sender_session in sender_sessions:
-            assert sender_session.get_state().state == State.FINISHED
+            assert sender_session.state.state == State.FINISHED
         for receiver_session in receiver_sessions:
-            assert receiver_session.get_state().state == State.FINISHED
+            assert receiver_session.state.state == State.FINISHED
 
         ctx_block_datas = [
             ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
