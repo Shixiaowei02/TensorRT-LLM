@@ -207,6 +207,13 @@ class KVSendTask:
         dst_blocks = req_info.blocks
         src_blocks = self.slice.blocks
 
+        if len(src_blocks) + 1 == len(dst_blocks):
+            # FIXME: this is a temporary solution, need to be fixed for the draft tokens
+            logger.warning(
+                " src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
+                " remove the last block from dst_block_ids "
+            )
+            dst_blocks = dst_blocks[:-1]
         src_blocks, dst_blocks = self._filter_kv_blocks(src_blocks, dst_blocks)
 
         kv_ptr_extractor = self.peer_mapper.kv_ptr_extractor
