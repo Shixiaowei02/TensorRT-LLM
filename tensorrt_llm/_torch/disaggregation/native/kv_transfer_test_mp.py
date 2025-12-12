@@ -15,7 +15,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
 from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
@@ -302,7 +302,7 @@ def worker_fn(
 
     # Helper function to process and verify a single request
     def process_and_verify_request(
-        ctx_request_id: int, gen_request_id: int, req_len: int, req_disagg_id: str
+        ctx_request_id: int, gen_request_id: int, req_len: int, unique_rid: str
     ):
         """Process a single request and verify the transfer."""
         sampling_params = SamplingParams()
@@ -319,7 +319,7 @@ def worker_fn(
                 is_streaming=False,
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
             )
-            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=req_disagg_id)
+            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=unique_rid)
 
             # Add sequence to KVCacheManager
             kv_cache_manager.impl.add_sequence(
@@ -336,7 +336,7 @@ def worker_fn(
 
             # Wait for send to complete
             send_slice_task.future.result()
-            assert sender_session.state.state == State.FINISHED
+            assert sender_session.state.status == Status.FINISHED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
@@ -357,7 +357,7 @@ def worker_fn(
                 ctx_request_id=ctx_request_id,
                 ctx_dp_rank=0,
                 ctx_info_endpoint=ctx_info_endpoint,
-                disagg_id=req_disagg_id,
+                disagg_id=unique_rid,
             )
 
             # Add sequence to KVCacheManager
@@ -375,7 +375,7 @@ def worker_fn(
 
             # Wait for receive to complete
             recv_slice_task.future.result()
-            assert receiver_session.state.state == State.FINISHED
+            assert receiver_session.state.status == Status.FINISHED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
@@ -515,15 +515,15 @@ def worker_fn(
 
     # ===== Process multiple requests =====
     # Request 1
-    disagg_id_1 = broadcast_string(str(uuid.uuid4()) if rank == 0 else None, src=0)
+    unique_rid_1 = broadcast_string(str(uuid.uuid4()) if rank == 0 else None, src=0)
     process_and_verify_request(
-        ctx_request_id=0, gen_request_id=1, req_len=request_len, req_disagg_id=disagg_id_1
+        ctx_request_id=0, gen_request_id=1, req_len=request_len, unique_rid=unique_rid_1
     )
 
     # Request 2 (with different length)
-    disagg_id_2 = broadcast_string(str(uuid.uuid4()) if rank == 0 else None, src=0)
+    unique_rid_2 = broadcast_string(str(uuid.uuid4()) if rank == 0 else None, src=0)
     process_and_verify_request(
-        ctx_request_id=2, gen_request_id=3, req_len=request_len * 2, req_disagg_id=disagg_id_2
+        ctx_request_id=2, gen_request_id=3, req_len=request_len * 2, unique_rid=unique_rid_2
     )
 
     if rank == 0:

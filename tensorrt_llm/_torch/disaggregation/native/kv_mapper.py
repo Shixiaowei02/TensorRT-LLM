@@ -95,7 +95,6 @@ class KVPoolAttributes:
 
 class KVPtrExtractor:
     def __init__(self, kv_pool_attributes: Union[KVPoolAttributes, KVCacheManager]):
-        # store as a private attribute
         if self._is_kv_cache_manager(kv_pool_attributes):
             self._kv_pool_attributes = self._attrs_from_manager(kv_pool_attributes)
         else:
@@ -140,7 +139,6 @@ class KVPtrExtractor:
     def _attrs_from_manager(manager: KVCacheManager) -> KVPoolAttributes:
         """
         Convert a KVCacheManager into KVPoolAttributes (ptr list and block sizes).
-        Error messages are made more informative to help debugging.
         """
         try:
             pools = manager.get_unique_primary_pool()
@@ -219,7 +217,6 @@ class PeerRegistrar:
         rank_info: RankInfo,
         instance_info: InstanceInfo,
     ):
-        # store original inputs as private members
         self._ri = rank_info
         self._ii = instance_info
 
@@ -242,20 +239,18 @@ class PeerRegistrar:
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._key(peer_name, peer_rank)]
 
-    def get_self_instance_info(self) -> InstanceInfo:
+    @property
+    def instance_info(self) -> InstanceInfo:
         return self._ii
 
-    def get_self_rank_info(self) -> RankInfo:
+    @property
+    def rank_info(self) -> RankInfo:
         return self._ri
 
     def _key(self, name: str, rank: int) -> str:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
-        """
-        Check basic compatibility between local rank info and peer rank info.
-        Log human-friendly warnings for mismatches.
-        """
         if self._ri.is_mla != peer_ri.is_mla:
             logger.warning(
                 "PeerRegistrar: compatibility check failed: 'is_mla' differs "
@@ -335,13 +330,11 @@ class PeerMapper(PeerMapperBase):
         self._overlap_cache: Dict[str, PeerOverlapTargets] = {}
         self._kv_mapper_cache: Dict[str, callable] = {}
         self._kv_pool_cache: Dict[str, KVPtrExtractor] = {}
-
-        # keep extractor exposed via property for compatibility
         self._kv_ptr_extractor = KVPtrExtractor(kv_cache_manager)
 
         # cache self info
-        self._ri = self._registrar.get_self_rank_info()
-        self._ii = self._registrar.get_self_instance_info()
+        self._ri = self._registrar.rank_info
+        self._ii = self._registrar.instance_info
 
     @property
     def kv_ptr_extractor(self) -> KVPtrExtractor:
@@ -464,7 +457,8 @@ class PeerMapper(PeerMapperBase):
         self._overlap_cache[k] = pd
         return pd
 
-    def get_peer_registrar(self) -> PeerRegistrar:
+    @property
+    def peer_registrar(self) -> PeerRegistrar:
         return self._registrar
 
     # ---------------- kv block ptrs mapper ----------------

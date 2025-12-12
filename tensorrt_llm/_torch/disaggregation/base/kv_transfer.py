@@ -17,30 +17,15 @@ class KVSlice:
     start_layer: Optional[int] = None
     end_layer: Optional[int] = None
     blocks: List[int] = field(default_factory=list)
-
     is_last_slice: bool = False
 
-    # def __post_init__(self) -> None:
-    #     if self.start_token_idx < 0 or self.end_token_idx < 0:
-    #         raise ValueError("token indices must be non-negative")
-    #     if self.start_layer < 0 or self.end_layer < 0:
-    #         raise ValueError("layer indices must be non-negative")
-    #     if self.start_token_idx > self.end_token_idx:
-    #         raise ValueError("start_token_idx cannot be greater than end_token_idx")
-    #     if self.start_layer > self.end_layer:
-    #         raise ValueError("start_layer cannot be greater than end_layer")
-    #     if any(b < 0 for b in self.blocks):
-    #         raise ValueError("block_ids must contain non-negative integers")
 
-
-class State(Enum):
-    """States of a transfer session."""
-
+class Status(Enum):
     INIT = "Init"  # Session contains only the required members for construction.
     READY = "Ready"  # Resources are ready for processing.
     TRANSFERRING = "Transferring"  # Data is being transffered.
     FINISHED = "Finished"  # Processing is finished.
-    META_DATA_SENT = "MetaDataSent"  # Meta data has been sent.
+    AUX_DATA_SENT = "AuxDataSent"  # Aux data has been sent.
     ERR = "Err"  # An error has occurred.
 
 
@@ -49,14 +34,14 @@ TaskIdType = int
 
 @dataclass
 class SessionState:
-    state: State
+    status: Status
     finished_tasks: List[TaskIdType]
 
 
 @dataclass
 class SessionArgsBase:
     request_id: int
-    disagg_params: DisaggregatedParams
+    params: DisaggregatedParams
 
 
 class SenderBase(ABC): ...
@@ -74,7 +59,7 @@ class TxSessionBase(ABC):
     def state(self) -> SessionState: ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> State: ...
+    def poll_task(self, id: TaskIdType) -> Status: ...
 
     @abstractmethod
     def send(self, slice: KVSlice) -> TaskIdType: ...
@@ -97,7 +82,7 @@ class RxSessionBase(ABC):
     def state(self) -> SessionState: ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> State: ...
+    def poll_task(self, id: TaskIdType) -> Status: ...
 
     @abstractmethod
     def receive(self, slice: KVSlice) -> TaskIdType: ...

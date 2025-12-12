@@ -1,4 +1,5 @@
 import concurrent
+import queue
 import threading
 import weakref
 from dataclasses import asdict, dataclass
@@ -21,7 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
     RxSessionBase,
     SessionArgsBase,
     SessionState,
-    State,
+    Status,
     TaskIdType,
     TxSessionBase,
 )
@@ -50,7 +51,7 @@ class GenReqInfo:
     instance_name: str
     instance_rank: int
     blocks: list[int]
-    disagg_id: str
+    unique_rid: str
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
 
@@ -64,9 +65,9 @@ class GenReqInfo:
 
 @dataclass
 class AgentRecvArgs:
-    disagg_id: str
+    unique_rid: str
     future_for_task: concurrent.futures.Future
-    expected_count: int
+    expected_transfers: int
     peer_name: str
     slice_id: int
 
@@ -75,7 +76,7 @@ class AgentRecvArgs:
 class AgentSendArgs:
     future_for_task: concurrent.futures.Future
 
-    expected_count: int
+    expected_transfers: int
     peer_name: str
     src_kv_ptrs: List[int] = None
     dst_kv_ptrs: List[int] = None
@@ -85,10 +86,10 @@ class AgentSendArgs:
     dst_aux_ptrs: List[int] = None
     aux_sizes: List[int] = None
     peer_endpoint: Optional[str] = None  # used for send state
-    disagg_id: Optional[str] = None
+    unique_rid: Optional[str] = None
     slice_id: Optional[int] = None
     is_last_slice: Optional[bool] = False
-    is_only_meta_data: Optional[bool] = False
+    is_only_aux: Optional[bool] = False
 
 
 class MessageType:
@@ -97,41 +98,51 @@ class MessageType:
     PEER_INFO = "PEER_INFO"
     REQUEST_DATA = "REQUEST_DATA"
     REQUEST_INSTANCE_INFO = "REQUEST_INSTANCE_INFO"
-    REGISTER_RANK_INFO = "REQUEST_RANK_INFO"
-    META_SEND_STATE = "META_SEND_STATE"
+    REGISTER_RANK_INFO = "REGISTER_RANK_INFO"
+    AUX_SEND_STATE = "AUX_SEND_STATE"
+
+
+def _message_is_termination(message: list[bytes]):
+    return message[0] == str(MessageType.TERMINATION).encode("ascii")
+
+
+def _message_is_request_data(message: list[bytes]):
+    return message[0] == str(MessageType.REQUEST_DATA).encode("ascii")
+
+
+def _message_is_register_rank_info(message: list[bytes]):
+    return message[0] == str(MessageType.REGISTER_RANK_INFO).encode("ascii")
 
 
 class AuxSendTask:
     def __init__(self, params: DisaggregatedParams, slot: int, mapper: PeerMapper):
         self._params = params
-        self._disagg_id = params.disagg_id
+        self._unique_rid = params.disagg_id
         self._slot = slot
         self._mapper = mapper
-        self._state = State.INIT
+        self._status = Status.INIT
         self._future = concurrent.futures.Future()
 
     @property
-    def state(self) -> State:
-        return self._state
+    def status(self) -> Status:
+        return self._status
 
-    @state.setter
-    def state(self, s: State):
-        self._state = s
+    @status.setter
+    def status(self, s: Status):
+        self._status = s
 
     @property
     def future(self) -> concurrent.futures.Future:
         return self._future
 
-    def extract_trans_meta(self, req_info: GenReqInfo) -> AgentSendArgs:
-        peer_aux_meta = (
-            self._mapper.get_peer_registrar()
-            .get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-            .aux_meta
-        )
+    def extract_transfer_metadata(self, req_info: GenReqInfo) -> AgentSendArgs:
+        peer_aux_meta = self._mapper.peer_registrar.get_peer_rank_info(
+            req_info.instance_name, req_info.instance_rank
+        ).aux_meta
 
         peer_slot = req_info.aux_slot
 
-        src_aux_meta = self._mapper.get_peer_registrar().get_self_rank_info().aux_meta
+        src_aux_meta = self._mapper.peer_registrar.rank_info.aux_meta
 
         src_ptrs = [
             ptr + item_size * self._slot
@@ -147,13 +158,13 @@ class AuxSendTask:
             src_aux_ptrs=src_ptrs,
             dst_aux_ptrs=dst_ptrs,
             aux_sizes=size,
-            expected_count=1,
-            is_only_meta_data=True,
+            expected_transfers=1,
+            is_only_aux=True,
             peer_name=req_info.instance_name + str(req_info.instance_rank),
-            peer_endpoint=self._mapper.get_peer_registrar()
-            .get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-            .recv_endpoint,
-            disagg_id=self._disagg_id,
+            peer_endpoint=self._mapper.peer_registrar.get_peer_rank_info(
+                req_info.instance_name, req_info.instance_rank
+            ).recv_endpoint,
+            unique_rid=self._unique_rid,
         )
 
 
@@ -167,23 +178,23 @@ class KVSendTask:
     ):
         self._mapper = mapper
         self._future = concurrent.futures.Future()
-        self._first = False
-        self._enc = 0
-        self._expected = 0
+        self._first_transfer = False
+        self._extraction_count = 0
+        self._expected_transfers = 0
         self._slice = kv_slice
         self._params = params
-        self._disagg_id = params.disagg_id
+        self._unique_rid = params.disagg_id
         self._slice_id = slice_id
-        self._state = State.INIT
-        self._transferred = 0
+        self._status = Status.INIT
+        self._transferred_count = 0
 
     @property
-    def state(self) -> State:
-        return self._state
+    def status(self) -> Status:
+        return self._status
 
-    @state.setter
-    def state(self, s: State):
-        self._state = s
+    @status.setter
+    def status(self, s: Status):
+        self._status = s
 
     @property
     def future(self) -> concurrent.futures.Future:
@@ -195,33 +206,33 @@ class KVSendTask:
 
     @property
     def transferred_count(self) -> int:
-        return self._transferred
+        return self._transferred_count
 
     @transferred_count.setter
     def transferred_count(self, v: int):
-        self._transferred = v
+        self._transferred_count = v
 
-    @nvtx_range("extract_trans_meta")
-    def extract_trans_meta(self, req_info: GenReqInfo) -> AgentSendArgs:
-        peer_ri = self._mapper.get_peer_registrar().get_peer_rank_info(
+    @nvtx_range("extract_transfer_metadata")
+    def extract_transfer_metadata(self, req_info: GenReqInfo) -> AgentSendArgs:
+        peer_ri = self._mapper.peer_registrar.get_peer_rank_info(
             req_info.instance_name, req_info.instance_rank
         )
-        peer_overlap_targets = self._mapper.get_peer_overlap_targets(peer_ri, peer_ri.dp_rank)
-        expected_count = len(peer_overlap_targets.ranks)
-        if not self._first:
-            self._first = True
-            self._expected = expected_count
-        self._enc = self._enc + 1
-        if not self._need_send_transfer(peer_overlap_targets, peer_ri):
+        targets = self._mapper.get_peer_overlap_targets(peer_ri, peer_ri.dp_rank)
+        expected_transfers = len(targets.ranks)
+        if not self._first_transfer:
+            self._first_transfer = True
+            self._expected_transfers = expected_transfers
+        self._extraction_count = self._extraction_count + 1
+        if not self._should_send(targets, peer_ri):
             return AgentSendArgs(
                 future_for_task=self._future,
                 src_kv_ptrs=[],
                 dst_kv_ptrs=[],
                 kv_sizes=[],
-                expected_count=expected_count,
+                expected_transfers=expected_transfers,
                 peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
                 peer_endpoint=peer_ri.recv_endpoint,
-                disagg_id=self._disagg_id,
+                unique_rid=self._unique_rid,
                 slice_id=self._slice_id,
                 is_last_slice=self._slice.is_last_slice,
             )
@@ -239,75 +250,65 @@ class KVSendTask:
             dst_blocks = dst_blocks[:-1]
         src_blocks, dst_blocks = self._filter_kv_blocks(src_blocks, dst_blocks)
 
-        kv_ptr_extractor = self._mapper.kv_ptr_extractor
-        src_kv_blocks_ptrs = kv_ptr_extractor.extract_kv_block_ptrs(src_blocks)
-        self_kv_block_size = kv_ptr_extractor.kv_pool_attributes.kv_cache_block_sizes[0]
-        peer_kv_ptr_extractor = self._mapper.get_kv_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
-        )
-        dst_kv_blocks_ptrs = peer_kv_ptr_extractor.extract_kv_block_ptrs(dst_blocks)
-        peer_kv_block_size = peer_kv_ptr_extractor.kv_pool_attributes.kv_cache_block_sizes[0]
+        extractor = self._mapper._kv_ptr_extractor
+        src_ptrs = extractor.extract_kv_block_ptrs(src_blocks)
+        self_block_size = extractor.kv_pool_attributes.kv_cache_block_sizes[0]
+        peer_extractor = self._mapper.get_kv_extractor(peer_ri.instance_name, peer_ri.instance_rank)
+        dst_ptrs = peer_extractor.extract_kv_block_ptrs(dst_blocks)
+        dst_block_size = peer_extractor.kv_pool_attributes.kv_cache_block_sizes[0]
         logger.debug(
-            f"KVSendTask.extract_trans_meta: extracted KV block pointers -> "
-            f"src_ptrs={src_kv_blocks_ptrs}, src_block_size={self_kv_block_size}, "
-            f"dst_ptrs={dst_kv_blocks_ptrs}, dst_block_size={peer_kv_block_size}"
+            f"KVSendTask.extract_transfer_metadata: extracted KV block pointers -> "
+            f"src_ptrs={src_ptrs}, src_block_size={self_block_size}, "
+            f"dst_ptrs={dst_ptrs}, dst_block_size={dst_block_size}"
         )
         transformer = self._mapper.get_kv_ptrs_mapper(peer_ri)
         (
-            src_kv_blocks_transfer_ptrs,
-            dst_kv_blocks_transfer_ptrs,
-            dst_kv_blocks_size,
-        ) = transformer(
-            src_kv_blocks_ptrs, self_kv_block_size, dst_kv_blocks_ptrs, peer_kv_block_size
-        )
+            src_ptrs,
+            dst_ptrs,
+            dst_blocks_size,
+        ) = transformer(src_ptrs, self_block_size, dst_ptrs, dst_block_size)
 
-        src_kv_blocks_size = dst_kv_blocks_size
+        src_blocks_size = dst_blocks_size
         logger.debug(
-            f"KVSendTask.extract_trans_meta: mapped KV pointers for transfer -> "
-            f"src_transfer_ptrs={src_kv_blocks_transfer_ptrs}, src_transfer_block_size={src_kv_blocks_size}, "
-            f"dst_transfer_ptrs={dst_kv_blocks_transfer_ptrs}, dst_transfer_block_size={dst_kv_blocks_size}"
+            f"KVSendTask.extract_transfer_metadata: mapped KV pointers for transfer -> "
+            f"src_transfer_ptrs={src_ptrs}, src_transfer_block_size={src_blocks_size}, "
+            f"dst_transfer_ptrs={dst_ptrs}, dst_transfer_block_size={dst_blocks_size}"
         )
 
         return AgentSendArgs(
             future_for_task=self._future,
-            src_kv_ptrs=src_kv_blocks_transfer_ptrs,
-            dst_kv_ptrs=dst_kv_blocks_transfer_ptrs,
-            kv_sizes=[src_kv_blocks_size] * len(src_kv_blocks_transfer_ptrs),
+            src_kv_ptrs=src_ptrs,
+            dst_kv_ptrs=dst_ptrs,
+            kv_sizes=[src_blocks_size] * len(src_ptrs),
             dst_device_id=dst_device_id,
-            expected_count=expected_count,
+            expected_transfers=expected_transfers,
             peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
             peer_endpoint=peer_ri.recv_endpoint,
-            disagg_id=self._disagg_id,
+            unique_rid=self._unique_rid,
             slice_id=self._slice_id,
             is_last_slice=self._slice.is_last_slice,
         )
 
     def is_active(self) -> bool:
-        if self._first:
-            return self._enc < self._expected
+        if self._first_transfer:
+            return self._extraction_count < self._expected_transfers
         else:
             return True
 
-    def _need_send_transfer(
+    def _should_send(
         self, peer_overlap_targets: PeerOverlapTargets, peer_rank_info: RankInfo
     ) -> bool:
-        if peer_overlap_targets.duplicate_head_factor <= 1:
+        dup_head_factor = peer_overlap_targets.duplicate_head_factor
+        if dup_head_factor <= 1:
             return True
         peer_ri = peer_rank_info
         peer_dp_rank = peer_ri.dp_rank if peer_ri.enable_attention_dp else 0
+        self_ri = self._mapper.peer_registrar.rank_info
         self_tp_size_per_dp_group = (
-            self._mapper.get_peer_registrar().get_self_rank_info().tp_size
-            // self._mapper.get_peer_registrar().get_self_rank_info().dp_size
-            if self._mapper.get_peer_registrar().get_self_rank_info().enable_attention_dp
-            else self._mapper.get_peer_registrar().get_self_rank_info().tp_size
+            self_ri.tp_size // self_ri.dp_size if self_ri.enable_attention_dp else self_ri.tp_size
         )
-        self_tprank_in_dp_group = (
-            self._mapper.get_peer_registrar().get_self_rank_info().tp_rank
-            % self_tp_size_per_dp_group
-        )
-        return (peer_dp_rank % peer_overlap_targets.duplicate_head_factor) == (
-            self_tprank_in_dp_group % peer_overlap_targets.duplicate_head_factor
-        )
+        self_tp_rank_in_dp_group = self_ri.tp_rank % self_tp_size_per_dp_group
+        return (peer_dp_rank % dup_head_factor) == (self_tp_rank_in_dp_group % dup_head_factor)
 
     def _filter_kv_blocks(self, src_blocks, dst_blocks) -> tuple[list[int], list[int]]:
         # TODO: filter the kv blocks according to the peer_overlap_targets
@@ -324,256 +325,239 @@ class Sender:
         self._mapper = mapper
         self._device_id = device_id
         self._agent = agent
-        self._send_session_lock = threading.Lock()
-
-        self._peer_req_cache = {}
+        self._peer_reqs = {}
         self._peer_req_lock = threading.Lock()
 
         self._zmq_context = zmq.Context()
         self._socket = self._zmq_context.socket(zmq.ROUTER)
         self._socket.bind(f"tcp://{get_local_ip()}:*")
         self._endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
-
         self._socket_cache = {}
+        self._kv_tasks = {}  # unique_rid -> list[KVSlice]
+        self._aux_tasks = {}  # unique_rid -> AuxSendTask
+        self._tx_sessions = {}  # unique_rid -> TxSession
 
-        self._slice_tasks = {}  # disagg_id -> list[KVSlice]
-
-        self._meta_tasks = {}  # disagg_id -> AuxSendTask
         logger.info(f" Sender init end with endpoint: {self.endpoint}")
 
         background_thread = threading.Thread(target=self._handle_sender_loop, daemon=True)
         background_thread.start()
-
-        self._tx_sessions = {}  # disagg_id -> TxSession
 
     @property
     def endpoint(self):
         return self._endpoint
 
     def init_session_resource(self, tx_session: TxSessionBase):
-        self._tx_sessions[tx_session.session_args.disagg_params.disagg_id] = weakref.ref(tx_session)
+        self._tx_sessions[tx_session.session_args.params.disagg_id] = weakref.ref(tx_session)
         return
 
-    def _get_tx_session(self, disagg_id: str) -> TxSessionBase:
-        session_ref = self._tx_sessions[disagg_id]
+    def _get_tx_session(self, unique_rid: str) -> TxSessionBase:
+        session_ref = self._tx_sessions[unique_rid]
         if session_ref is None:
-            raise RuntimeError(f"TxSession {disagg_id} not found")
+            raise RuntimeError(f"TxSession {unique_rid} not found")
         session = session_ref()
         if session is None:
-            raise RuntimeError(f"TxSession {disagg_id} has been cleared")
+            raise RuntimeError(f"TxSession {unique_rid} has been cleared")
         return session
 
-    def clear_session_resource(self, disagg_id: str):
-        logger.debug(f"Clearing session resources for disagg_id={disagg_id}")
-        self._slice_tasks.pop(disagg_id, None)
-        self._peer_req_cache.pop(disagg_id, None)
+    def clear_session_resource(self, unique_rid: str):
+        logger.debug(f"Clearing session resources for unique_rid={unique_rid}")
+        self._kv_tasks.pop(unique_rid, None)
+        self._peer_reqs.pop(unique_rid, None)
         return
 
-    def async_send_slice(self, params: DisaggregatedParams, slice: KVSlice) -> KVSendTask:
-        if params.disagg_id not in self._slice_tasks:
-            self._slice_tasks[params.disagg_id] = []
-        slice_id = len(self._slice_tasks[params.disagg_id])
-        new_slice_task = KVSendTask(slice, params, slice_id, self._mapper)
-        self._slice_tasks[params.disagg_id].append(new_slice_task)
+    def async_send_kv(self, params: DisaggregatedParams, slice: KVSlice) -> KVSendTask:
+        unique_rid = params.disagg_id
+        if unique_rid not in self._kv_tasks:
+            self._kv_tasks[unique_rid] = []
+        slice_id = len(self._kv_tasks[unique_rid])
+        task = KVSendTask(slice, params, slice_id, self._mapper)
+        self._kv_tasks[unique_rid].append(task)
 
-        self._handle_send_task(new_slice_task)
-        return new_slice_task
+        self._dispatch_task(task)
+        return task
 
-    def async_send_meta_data(self, params: DisaggregatedParams, slot: int):
-        meta_sender_task = AuxSendTask(params, slot, self._mapper)
+    def async_send_aux(self, params: DisaggregatedParams, slot: int):
+        task = AuxSendTask(params, slot, self._mapper)
 
-        self._meta_tasks[params.disagg_id] = meta_sender_task
-        self._handle_send_task(meta_sender_task)
-        return meta_sender_task
+        self._aux_tasks[params.disagg_id] = task
+        self._dispatch_task(task)
+        return task
 
-    def submit_send_task(self, agent_send_args: AgentSendArgs):
+    def submit_task(self, agent_args: AgentSendArgs):
         if not hasattr(self, "_send_task_queue"):
-            import queue
-            import threading
-
             self._send_task_queue = queue.Queue()
-            self._background_thread = threading.Thread(
-                target=self._handle_send_task_loop, daemon=True
-            )
+            self._background_thread = threading.Thread(target=self._process_task_queue, daemon=True)
             self._background_thread.start()
-        self._send_task_queue.put(agent_send_args)
+        self._send_task_queue.put(agent_args)
 
-    def _handle_send_task_loop(self):
+    def _process_task_queue(self):
         while True:
-            agent_send_args = self._send_task_queue.get()
-            if agent_send_args is None:
+            agent_args = self._send_task_queue.get()
+            if agent_args is None:
                 break
-            if agent_send_args.is_only_meta_data:
-                self._submit_send_meta_to_agent(agent_send_args)
+            if agent_args.is_only_aux:
+                self._deliver_aux_to_agent(agent_args)
             else:
-                self._submit_send_slice_to_agent(agent_send_args)
+                self._deliver_kv_to_agent(agent_args)
 
-    @nvtx_range("submit_send_slice_to_agent")
-    def _submit_send_slice_to_agent(self, agent_send_args: AgentSendArgs):
-        assert len(agent_send_args.src_kv_ptrs) == len(agent_send_args.dst_kv_ptrs)
-        assert len(agent_send_args.kv_sizes) == len(agent_send_args.src_kv_ptrs)
-        src_kv_list = [
-            (src_ptr, size, self._device_id)
-            for src_ptr, size in zip(agent_send_args.src_kv_ptrs, agent_send_args.kv_sizes)
-        ]
+    @staticmethod
+    def _prepare_transfer_request(agent_args: AgentSendArgs, is_aux: bool, device_id: int):
+        if is_aux:
+            assert agent_args.src_aux_ptrs is not None and agent_args.dst_aux_ptrs is not None
+            src_list = [
+                (src_ptr, size, 0)
+                for src_ptr, size in zip(agent_args.src_aux_ptrs, agent_args.aux_sizes)
+            ]
+            dst_list = [
+                (dst_ptr, size, 0)
+                for dst_ptr, size in zip(agent_args.dst_aux_ptrs, agent_args.aux_sizes)
+            ]
+            src_mem_type = "DRAM"
+            dst_mem_type = "DRAM"
+            peer_name = agent_args.peer_name
+        else:
+            assert agent_args.src_kv_ptrs is not None and agent_args.dst_kv_ptrs is not None
+            src_list = [
+                (src_ptr, size, device_id)
+                for src_ptr, size in zip(agent_args.src_kv_ptrs, agent_args.kv_sizes)
+            ]
+            # TODO : device_id should be the device id of the destination
+            dst_list = [
+                (dst_ptr, size, agent_args.dst_device_id)
+                for dst_ptr, size in zip(agent_args.dst_kv_ptrs, agent_args.kv_sizes)
+            ]
+            src_mem_type = "VRAM"
+            dst_mem_type = "VRAM"
+            peer_name = agent_args.peer_name
 
-        # TODO : device_id should be the device id of the destination
-        dst_kv_list = [
-            (dst_ptr, size, agent_send_args.dst_device_id)
-            for dst_ptr, size in zip(agent_send_args.dst_kv_ptrs, agent_send_args.kv_sizes)
-        ]
-        if self._get_tx_session(agent_send_args.disagg_id).state.state != State.ERR:
-            self._get_tx_session(agent_send_args.disagg_id).state.state = State.TRANSFERRING
-
-        src_memory_descs = MemoryDescs("VRAM", src_kv_list)
-        dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
+        src_memory_descs = MemoryDescs(src_mem_type, src_list)
+        dst_memory_descs = MemoryDescs(dst_mem_type, dst_list)
         request = TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.peer_name, None
+            TransferOp.WRITE, src_memory_descs, dst_memory_descs, peer_name, None
+        )
+        return request, src_list, dst_list
+
+    @nvtx_range("_deliver_kv_to_agent")
+    def _deliver_kv_to_agent(self, agent_args: AgentSendArgs):
+        assert len(agent_args.src_kv_ptrs) == len(agent_args.dst_kv_ptrs)
+        assert len(agent_args.kv_sizes) == len(agent_args.src_kv_ptrs)
+        unique_rid = agent_args.unique_rid
+        slice_id = agent_args.slice_id
+        peer_endpoint = agent_args.peer_endpoint
+
+        session = self._get_tx_session(unique_rid)
+        if session.state.status != Status.ERR:
+            session.state.status = Status.TRANSFERRING
+
+        request, src_kv_list, _ = Sender._prepare_transfer_request(
+            agent_args, is_aux=False, device_id=self._device_id
         )
 
         skip_send = len(src_kv_list) == 0
         logger.debug(f"Submitting transfer request to transfer agent: {request}")
+        status = None
         if not skip_send:
-            src_memory_descs = MemoryDescs("VRAM", src_kv_list)
-            dst_memory_descs = MemoryDescs("VRAM", dst_kv_list)
-            request = TransferRequest(
-                TransferOp.WRITE,
-                src_memory_descs,
-                dst_memory_descs,
-                agent_send_args.peer_name,
-                None,
-            )
             status = self._agent.submit_transfer_requests(request)
+
         sync_status = "SUCCESS"
         if not skip_send and not status.wait():
             sync_status = "FAILED"
-            agent_send_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
+            agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
+            self._kv_tasks[unique_rid][slice_id].status = Status.ERR
+            session.state.status = Status.ERR
 
-            self._slice_tasks[agent_send_args.disagg_id][agent_send_args.slice_id].state = State.ERR
-            self._get_tx_session(agent_send_args.disagg_id).state.state = State.ERR
-        socket = self._get_socket(agent_send_args.peer_endpoint)
+        socket = self._get_socket(peer_endpoint)
 
-        ## TODO: just last slice need to send task state ?
+        ## TODO: just last slice need to send task state?
         socket.send_multipart(
             [
                 str(MessageType.TASK_STATE).encode("ascii"),
-                agent_send_args.disagg_id.encode("ascii"),
-                str(agent_send_args.slice_id).encode("ascii"),
-                str(agent_send_args.is_last_slice).encode("ascii"),
+                unique_rid.encode("ascii"),
+                str(slice_id).encode("ascii"),
+                str(agent_args.is_last_slice).encode("ascii"),
                 sync_status.encode("ascii"),
             ]
         )
-        # update transferred_count via property
-        curr = self._slice_tasks[agent_send_args.disagg_id][
-            agent_send_args.slice_id
-        ].transferred_count
-        self._slice_tasks[agent_send_args.disagg_id][agent_send_args.slice_id].transferred_count = (
-            curr + 1
-        )
 
-        if (
-            self._slice_tasks[agent_send_args.disagg_id][agent_send_args.slice_id].transferred_count
-            > agent_send_args.expected_count
-        ):
-            agent_send_args.future_for_task.set_exception(
+        task = self._kv_tasks[unique_rid][slice_id]
+        curr = task.transferred_count
+        task.transferred_count = curr + 1
+
+        if task.transferred_count > agent_args.expected_transfers:
+            agent_args.future_for_task.set_exception(
                 RuntimeError(
-                    f"Session {agent_send_args.disagg_id} has more than {agent_send_args.expected_count} transfers"
+                    f"Session {unique_rid} has more than {agent_args.expected_transfers} transfers"
                 )
             )
             # TODO: set exception for the session ?
-            self._get_tx_session(agent_send_args.disagg_id).state.state = State.ERR
-        elif (
-            self._slice_tasks[agent_send_args.disagg_id][agent_send_args.slice_id].transferred_count
-            == agent_send_args.expected_count
-        ):
+            session.state.status = Status.ERR
+        elif task.transferred_count == agent_args.expected_transfers:
             # TODO avoid set_result if tranfser failed since it has been set exception
-            agent_send_args.future_for_task.set_result(sync_status)
-            self._slice_tasks[agent_send_args.disagg_id][
-                agent_send_args.slice_id
-            ].state = State.FINISHED
-            self._get_tx_session(agent_send_args.disagg_id).state.finished_tasks.append(
-                agent_send_args.slice_id
-            )
-            if agent_send_args.is_last_slice:
-                self._get_tx_session(agent_send_args.disagg_id).state.state = State.FINISHED
+            agent_args.future_for_task.set_result(sync_status)
+            task.status = Status.FINISHED
+            session.state.finished_tasks.append(slice_id)
+            if agent_args.is_last_slice:
+                session.state.status = Status.FINISHED
 
-    @nvtx_range("submit_send_meta_to_agent")
-    def _submit_send_meta_to_agent(self, agent_send_args: AgentSendArgs):
-        # TODO:  submit the meta data task to the transfer agent
-        assert agent_send_args.is_only_meta_data is True
-        assert agent_send_args.src_aux_ptrs is not None
+    @nvtx_range("submit_send_aux_to_agent")
+    def _deliver_aux_to_agent(self, agent_args: AgentSendArgs):
+        # TODO: submit the aux data task to the transfer agent
+        assert agent_args.is_only_aux is True
+        assert agent_args.src_aux_ptrs is not None
 
-        src_aux_list = [
-            (src_ptr, size, 0)
-            for src_ptr, size in zip(agent_send_args.src_aux_ptrs, agent_send_args.aux_sizes)
-        ]
-        dst_aux_list = [
-            (dst_ptr, size, 0)
-            for dst_ptr, size in zip(agent_send_args.dst_aux_ptrs, agent_send_args.aux_sizes)
-        ]
-        src_memory_descs = MemoryDescs("DRAM", src_aux_list)
-        dst_memory_descs = MemoryDescs("DRAM", dst_aux_list)
-        request = TransferRequest(
-            TransferOp.WRITE, src_memory_descs, dst_memory_descs, agent_send_args.peer_name, None
+        request, _, _ = Sender._prepare_transfer_request(
+            agent_args, is_aux=True, device_id=self._device_id
         )
 
-        logger.debug(f"Submitting metadata transfer request to transfer agent: {request}")
+        logger.debug(f"Submitting aux data transfer request to transfer agent: {request}")
 
         status = self._agent.submit_transfer_requests(request)
         sync_status = "SUCCESS"
         if not status.wait():
             sync_status = "FAILED"
-            agent_send_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
-            self._get_tx_session(agent_send_args.disagg_id).state.state = State.ERR
-        socket = self._get_socket(agent_send_args.peer_endpoint)
+            agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
+            self._get_tx_session(agent_args.unique_rid).state.status = Status.ERR
+        socket = self._get_socket(agent_args.peer_endpoint)
         socket.send_multipart(
             [
-                str(MessageType.META_SEND_STATE).encode("ascii"),
-                agent_send_args.disagg_id.encode("ascii"),
+                str(MessageType.AUX_SEND_STATE).encode("ascii"),
+                agent_args.unique_rid.encode("ascii"),
                 sync_status.encode("ascii"),
             ]
         )
-        self._get_tx_session(agent_send_args.disagg_id).state.state = State.META_DATA_SENT
+        self._get_tx_session(agent_args.unique_rid).state.status = Status.AUX_DATA_SENT
 
-    def _handle_send_task(self, send_slice_task: KVSendTask | AuxSendTask):
-        send_slice_task.state = State.TRANSFERRING
-        transfer_recv_req_info_dict = {}
+    def _dispatch_task(self, send_kv_slice_task: KVSendTask | AuxSendTask):
+        task = send_kv_slice_task
+        task.status = Status.TRANSFERRING
+        req_info_dict = {}
         with self._peer_req_lock:
-            if send_slice_task._disagg_id in self._peer_req_cache:
-                transfer_recv_req_info_dict = self._peer_req_cache[send_slice_task._disagg_id]
-        for transfer_recv_req_info in transfer_recv_req_info_dict.values():
-            trans_meta = send_slice_task.extract_trans_meta(transfer_recv_req_info)
-            self.submit_send_task(trans_meta)
+            if task._unique_rid in self._peer_reqs:
+                req_info_dict = self._peer_reqs[task._unique_rid]
+        for info in req_info_dict.values():
+            trans_meta = task.extract_transfer_metadata(info)
+            self.submit_task(trans_meta)
 
     def _handle_sender_loop(self):
         while True:
             message = self._socket.recv_multipart()
             send_id = message[0]
             recv_message = message[1:]
-            if self._message_is_termination(recv_message):
+            if _message_is_termination(recv_message):
                 break
-            elif self._message_is_request_data(recv_message):
-                self._handle_request_data(send_id, recv_message)
-            elif self._message_is_register_rank_info(recv_message):
-                self._handle_register_rank_info(send_id, recv_message)
+            elif _message_is_request_data(recv_message):
+                self._respond_with_kv(send_id, recv_message)
+            elif _message_is_register_rank_info(recv_message):
+                self._register_peer_rank(send_id, recv_message)
             else:
                 raise ValueError(
                     f"transceiver sender loop received unknown message type: {recv_message[0]}"
                 )
 
-    def _message_is_termination(self, message: list[bytes]):
-        return message[0] == str(MessageType.TERMINATION).encode("ascii")
-
-    def _message_is_request_data(self, message: list[bytes]):
-        return message[0] == str(MessageType.REQUEST_DATA).encode("ascii")
-
-    def _message_is_register_rank_info(self, message: list[bytes]):
-        return message[0] == str(MessageType.REGISTER_RANK_INFO).encode("ascii")
-
-    def _handle_register_rank_info(self, send_id: bytes, message: list[bytes]):
+    def _register_peer_rank(self, send_id: bytes, message: list[bytes]):
         ri: RankInfo = RankInfo.from_bytes(message[1])
 
-        self._mapper.get_peer_registrar().register(ri.instance_name, ri.instance_rank, ri)
+        self._mapper.peer_registrar.register(ri.instance_name, ri.instance_rank, ri)
 
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
@@ -585,22 +569,22 @@ class Sender:
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
 
-    def _handle_request_data(self, send_id: bytes, message: list[bytes]):
-        gen_req_info: GenReqInfo = GenReqInfo.from_bytes(message[1])
+    def _respond_with_kv(self, send_id: bytes, message: list[bytes]):
+        info: GenReqInfo = GenReqInfo.from_bytes(message[1])
 
-        send_slice_tasks: list[KVSendTask] = self._get_send_slice_tasks(gen_req_info.disagg_id)
-        self._save_peer_transfer_req_info(gen_req_info)
-        if send_slice_tasks is None:
+        tasks: list[KVSendTask] = self._get_kv_tasks(info.unique_rid)
+        self._save_peer_req_info(info)
+        if tasks is None:
             pass
         else:
-            for send_slice_task in send_slice_tasks:
-                trans_meta = send_slice_task.extract_trans_meta(gen_req_info)
-                self.submit_send_task(trans_meta)
+            for task in tasks:
+                trans_meta = task.extract_transfer_metadata(info)
+                self.submit_task(trans_meta)
 
-    def _get_send_slice_tasks(self, disagg_id: str):
-        if disagg_id not in self._slice_tasks:
+    def _get_kv_tasks(self, unique_rid: str):
+        if unique_rid not in self._kv_tasks:
             return None
-        return self._slice_tasks[disagg_id]
+        return self._kv_tasks[unique_rid]
 
     def _get_socket(self, endpoint: str):
         if endpoint is None:
@@ -610,34 +594,29 @@ class Sender:
             self._socket_cache[endpoint].connect(endpoint)
         return self._socket_cache[endpoint]
 
-    def _save_peer_transfer_req_info(self, peer_transfer_req_info: GenReqInfo):
+    def _save_peer_req_info(self, peer_transfer_req_info: GenReqInfo):
+        req_info = peer_transfer_req_info
         with self._peer_req_lock:
-            if peer_transfer_req_info.disagg_id not in self._peer_req_cache:
-                self._peer_req_cache[peer_transfer_req_info.disagg_id] = {}
-            self._peer_req_cache[peer_transfer_req_info.disagg_id][
-                peer_transfer_req_info.instance_rank
-            ] = peer_transfer_req_info
-            peer_ri = self._mapper.get_peer_registrar().get_peer_rank_info(
-                peer_transfer_req_info.instance_name, peer_transfer_req_info.instance_rank
+            if req_info.unique_rid not in self._peer_reqs:
+                self._peer_reqs[req_info.unique_rid] = {}
+            self._peer_reqs[req_info.unique_rid][req_info.instance_rank] = req_info
+            peer_ri = self._mapper.peer_registrar.get_peer_rank_info(
+                req_info.instance_name, req_info.instance_rank
             )
-            expected_count = len(
-                self._mapper.get_peer_overlap_targets(
-                    peer_ri, peer_transfer_req_info.instance_rank
-                ).ranks
+            expected_transfers = len(
+                self._mapper.get_peer_overlap_targets(peer_ri, req_info.instance_rank).ranks
             )
-            if expected_count == len(self._peer_req_cache[peer_transfer_req_info.disagg_id]):
-                if peer_transfer_req_info.disagg_id in self._tx_sessions:
-                    self._get_tx_session(peer_transfer_req_info.disagg_id).state.state = State.READY
+            if expected_transfers == len(self._peer_reqs[req_info.unique_rid]):
+                if req_info.unique_rid in self._tx_sessions:
+                    self._get_tx_session(req_info.unique_rid).state.status = Status.READY
 
 
 class TxSession(TxSessionBase):
-    def __init__(
-        self, request_id: int, disagg_params: DisaggregatedParams, sender: Sender, aux_slot: int
-    ):
-        super().__init__(sender, SessionArgsBase(request_id, disagg_params))
+    def __init__(self, request_id: int, params: DisaggregatedParams, sender: Sender, aux_slot: int):
+        super().__init__(sender, SessionArgsBase(request_id, params))
         self.request_id = request_id
         self._sender = sender
-        self._state = SessionState(state=State.INIT, finished_tasks=[])
+        self._state = SessionState(status=Status.INIT, finished_tasks=[])
         self._exception = None
         self.slice_tasks = []  # slice_id -> SliceTxSession
         self._sender.init_session_resource(self)
@@ -653,14 +632,14 @@ class TxSession(TxSessionBase):
         self._state = s
 
     def send(self, slice: KVSlice) -> TaskIdType:
-        slice_sender_task = self._sender.async_send_slice(self.session_args.disagg_params, slice)
+        slice_sender_task = self._sender.async_send_kv(self.session_args.params, slice)
         self.slice_tasks.append(slice_sender_task)
         return slice_sender_task.slice_id
 
-    def send_meta_data(self):
-        return self._sender.async_send_meta_data(self.session_args.disagg_params, self.aux_slot)
+    def send_aux(self):
+        return self._sender.async_send_aux(self.session_args.params, self.aux_slot)
 
-    def poll_task(self, id: TaskIdType) -> State:
+    def poll_task(self, id: TaskIdType) -> Status:
         return self.slice_tasks[id].state
 
     @property
@@ -674,7 +653,7 @@ class TxSession(TxSessionBase):
         try:
             if hasattr(self, "_sender"):
                 try:
-                    self._sender.clear_session_resource(self.session_args.disagg_params.disagg_id)
+                    self._sender.clear_session_resource(self.session_args.params.disagg_id)
                 except Exception:
                     raise RuntimeError("Sender clear_session_resource failed")
         except Exception:
@@ -699,32 +678,32 @@ class TxSession(TxSessionBase):
 class KVRecvTask:
     def __init__(
         self,
-        disagg_id: str,
+        unique_rid: str,
         kv_slice: KVSlice,
         slice_id: int,
         params: DisaggregatedParams,
         mapper: PeerMapper,
         aux_slot: int,
     ):
-        self._disagg_id = disagg_id
+        self._unique_rid = unique_rid
         self._kv_slice = kv_slice
         self._slice_id = slice_id
         self._params = params
         self._mapper = mapper
-        self._state = State.INIT
+        self._status = Status.INIT
         self._exception = None
         self._future = concurrent.futures.Future()
-        self._first = False
-        self._expected = 0
+        self._first_transfer = False
+        self._expected_transfers = 0
         self._aux_slot = aux_slot
 
     @property
-    def state(self) -> State:
-        return self._state
+    def status(self) -> Status:
+        return self._status
 
-    @state.setter
-    def state(self, s: State):
-        self._state = s
+    @status.setter
+    def status(self, s: Status):
+        self._status = s
 
     @property
     def future(self) -> concurrent.futures.Future:
@@ -735,35 +714,35 @@ class KVRecvTask:
         return self._slice_id
 
     @property
-    def expected_count(self) -> int:
-        return self._expected
+    def expected_transfers(self) -> int:
+        return self._expected_transfers
 
-    @expected_count.setter
-    def expected_count(self, v: int):
-        self._expected = v
+    @expected_transfers.setter
+    def expected_transfers(self, v: int):
+        self._expected_transfers = v
 
     def create_transfer_req_info(self) -> GenReqInfo:
         return GenReqInfo(
             ctx_req_id=self._params.ctx_request_id,
-            instance_name=self._mapper.get_peer_registrar().get_self_rank_info().instance_name,
-            instance_rank=self._mapper.get_peer_registrar().get_self_rank_info().instance_rank,
+            instance_name=self._mapper.peer_registrar.rank_info.instance_name,
+            instance_rank=self._mapper.peer_registrar.rank_info.instance_rank,
             blocks=self._kv_slice.blocks,
-            disagg_id=self._disagg_id,
+            unique_rid=self._unique_rid,
             aux_slot=self._aux_slot,
         )
 
-    def extract_trans_meta(self, peer_ii, peer_dp_rank) -> AgentRecvArgs:
+    def extract_transfer_metadata(self, peer_ii, peer_dp_rank) -> AgentRecvArgs:
         peer_overlap_targets = self._mapper.get_peer_overlap_targets(peer_ii, peer_dp_rank)
-        expected_count = len(peer_overlap_targets.ranks)
-        if not self._first:
-            self._first = True
-            self._expected = expected_count
+        expected_transfers = len(peer_overlap_targets.ranks)
+        if not self._first_transfer:
+            self._first_transfer = True
+            self._expected_transfers = expected_transfers
         return AgentRecvArgs(
             future_for_task=self._future,
-            expected_count=expected_count,
+            expected_transfers=expected_transfers,
             peer_name=None,
             slice_id=self._slice_id,
-            disagg_id=self._disagg_id,
+            unique_rid=self._unique_rid,
         ), peer_overlap_targets.ranks
 
 
@@ -782,7 +761,7 @@ class Receiver:
 
         self._zmq_context = zmq.Context()
         self._socket_cache = {}
-        self._ctx_ep_ii = {}
+        self._ctx_ep_instance_map = {}
 
         self._socket = self._zmq_context.socket(zmq.ROUTER)
         self._socket.bind(f"tcp://{get_local_ip()}:*")
@@ -792,24 +771,24 @@ class Receiver:
         )
         self._receiver_background_thread.start()
 
-        self._slice_tasks = {}  # disagg_id -> list[SliceReceiverTask]
+        self._kv_tasks = {}  # unique_rid -> list[SliceReceiverTask]
 
-        self._rx_sessions = {}  # disagg_id -> RxSession
-        self._last_slice_counts = {}  # disagg_id -> int
+        self._rx_sessions = {}  # unique_rid -> RxSession
+        self._last_slice_counts = {}  # unique_rid -> int
         logger.info(f" Receiver init  with endpoint: {self._endpoint}")
 
     @property
     def endpoint(self):
         return self._endpoint
 
-    def async_receive_slice(
+    def async_receive_kv_slice(
         self, params: DisaggregatedParams, slice: KVSlice, aux_slot: int
     ) -> KVRecvTask:
-        disagg_id = params.disagg_id
-        if disagg_id not in self._slice_tasks:
-            self._slice_tasks[disagg_id] = []
+        unique_rid = params.disagg_id
+        if unique_rid not in self._kv_tasks:
+            self._kv_tasks[unique_rid] = []
 
-        slice_id = len(self._slice_tasks[disagg_id])
+        slice_id = len(self._kv_tasks[unique_rid])
         slice_receiver_task = KVRecvTask(
             params.disagg_id,
             slice,
@@ -818,28 +797,28 @@ class Receiver:
             self._mapper,
             aux_slot=aux_slot,
         )
-        self._slice_tasks[disagg_id].append(slice_receiver_task)
+        self._kv_tasks[unique_rid].append(slice_receiver_task)
 
         self._async_request_data_transfer(slice_receiver_task)
 
         return slice_receiver_task
 
     def init_session_resource(self, rx_session: RxSessionBase):
-        self._rx_sessions[rx_session.session_args.disagg_params.disagg_id] = weakref.ref(rx_session)
+        self._rx_sessions[rx_session.session_args.params.disagg_id] = weakref.ref(rx_session)
 
-    def _get_rx_sessions(self, disagg_id: str) -> RxSessionBase:
-        session_ref = self._rx_sessions[disagg_id]
+    def _get_rx_sessions(self, unique_rid: str) -> RxSessionBase:
+        session_ref = self._rx_sessions[unique_rid]
         if session_ref is None:
-            raise RuntimeError(f"RxSession {disagg_id} not found")
+            raise RuntimeError(f"RxSession {unique_rid} not found")
         session = session_ref()
         if session is None:
-            raise RuntimeError(f"RxSession {disagg_id} has been cleared")
+            raise RuntimeError(f"RxSession {unique_rid} has been cleared")
         return session
 
-    def clear_session_resource(self, disagg_id: str):
-        logger.debug(f"Clearing RX session resources for disagg_id={disagg_id}")
-        self._rx_sessions.pop(disagg_id, None)
-        self._slice_tasks.pop(disagg_id, None)
+    def clear_session_resource(self, unique_rid: str):
+        logger.debug(f"Clearing RX session resources for unique_rid={unique_rid}")
+        self._rx_sessions.pop(unique_rid, None)
+        self._kv_tasks.pop(unique_rid, None)
 
     def _async_request_data_transfer(self, slice_receiver_task: KVRecvTask):
         params = slice_receiver_task._params
@@ -849,18 +828,18 @@ class Receiver:
         if params.ctx_dp_rank is None:
             raise ValueError("ctx_dp_rank is None")
         ctx_dp_rank = params.ctx_dp_rank
-        agent_recv_args, target_ranks = slice_receiver_task.extract_trans_meta(
+        agent_args, target_ranks = slice_receiver_task.extract_transfer_metadata(
             context_peer_infos, ctx_dp_rank
         )
 
-        self.submit_receive_task(agent_recv_args)
+        self.submit_receive_task(agent_args)
         for rank in target_ranks:
             self._send_data_request(context_peer_infos.ctx_endpoints[rank], gen_req)
 
         return
 
     def _need_register_peer_in_first_request(self, params: DisaggregatedParams) -> bool:
-        return params.ctx_info_endpoint not in self._ctx_ep_ii
+        return params.ctx_info_endpoint not in self._ctx_ep_instance_map
 
     def _get_socket(self, endpoint: str):
         if endpoint not in self._socket_cache:
@@ -881,42 +860,37 @@ class Receiver:
 
             for endpoint in ii.ctx_endpoints:
                 socket = self._get_socket(endpoint)
-                send_message = []
-                send_message.append(str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
-                send_message.append(
-                    self._mapper.get_peer_registrar().get_self_rank_info().to_bytes()
-                )
-                socket.send_multipart(send_message)
+                msg = []
+                msg.append(str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
+                msg.append(self._mapper.peer_registrar.rank_info.to_bytes())
+                socket.send_multipart(msg)
 
-            self._ctx_ep_ii[params.ctx_info_endpoint] = ii
+            self._ctx_ep_instance_map[params.ctx_info_endpoint] = ii
             return ii
 
         else:
-            return self._ctx_ep_ii[params.ctx_info_endpoint]
+            return self._ctx_ep_instance_map[params.ctx_info_endpoint]
 
-    def submit_receive_task(self, trans_recv_meta: AgentRecvArgs):
-        logger.debug(f"Registering receive task: {trans_recv_meta}")
-        if trans_recv_meta.disagg_id not in self._last_slice_counts:
-            self._last_slice_counts[trans_recv_meta.disagg_id] = 0
-        # set state via property
-        self._slice_tasks[trans_recv_meta.disagg_id][
-            trans_recv_meta.slice_id
-        ].state = State.TRANSFERRING
+    def submit_receive_task(self, recv_meta: AgentRecvArgs):
+        logger.debug(f"Registering receive task: {recv_meta}")
+        if recv_meta.unique_rid not in self._last_slice_counts:
+            self._last_slice_counts[recv_meta.unique_rid] = 0
+        self._kv_tasks[recv_meta.unique_rid][recv_meta.slice_id].status = Status.TRANSFERRING
 
     def _handle_receiver_loop(self):
         while True:
-            message = self._socket.recv_multipart()
-            send_id = message[0]
-            recv_message = message[1:]
-            if self._message_is_termination(recv_message):
+            messages = self._socket.recv_multipart()
+            send_id = messages[0]
+            msg = messages[1:]
+            if self._message_is_termination(msg):
                 break
-            elif self._message_is_task_state(recv_message):
-                self._handle_task_state(send_id, recv_message)
-            elif self._message_is_meta_send_state(recv_message):
-                self._handle_meta_send_state(send_id, recv_message)
+            elif self._message_is_task_state(msg):
+                self._handle_task_state(send_id, msg)
+            elif self._message_is_aux_send_state(msg):
+                self._handle_aux_send_state(send_id, msg)
             else:
                 raise ValueError(
-                    f"transceiver receiver loop received unknown message type: {recv_message[0]}"
+                    f"transceiver receiver loop received unknown message type: {messages[0]}"
                 )
 
     def _message_is_termination(self, message: list[bytes]):
@@ -925,28 +899,27 @@ class Receiver:
     def _message_is_task_state(self, message: list[bytes]):
         return message[0] == str(MessageType.TASK_STATE).encode("ascii")
 
-    def _message_is_meta_send_state(self, message: list[bytes]):
-        return message[0] == str(MessageType.META_SEND_STATE).encode("ascii")
+    def _message_is_aux_send_state(self, message: list[bytes]):
+        return message[0] == str(MessageType.AUX_SEND_STATE).encode("ascii")
 
     def _handle_task_state(self, send_id: bytes, message: list[bytes]):
         assert len(message) == 5
         assert message[0].decode("ascii") == str(MessageType.TASK_STATE)
-        disagg_id = message[1].decode("ascii")
-        # peer_slice_id = int(message[2].decode("ascii"))  # Not used
+        unique_rid = message[1].decode("ascii")
         is_last_slice = message[3].decode("ascii") == "True"
         task_state = message[4].decode("ascii")
         if task_state == "SUCCESS":
             if is_last_slice:
-                self._last_slice_counts[disagg_id] += 1
+                self._last_slice_counts[unique_rid] += 1
                 if (
-                    self._last_slice_counts[disagg_id]
-                    == self._slice_tasks[disagg_id][0].expected_count
+                    self._last_slice_counts[unique_rid]
+                    == self._kv_tasks[unique_rid][0].expected_transfers
                 ):
                     # use future property
-                    self._slice_tasks[disagg_id][0].future.set_result("SUCCESS")
-                    self._slice_tasks[disagg_id][0].state = State.FINISHED
-                    self._get_rx_sessions(disagg_id).state.state = State.FINISHED
-                    self._get_rx_sessions(disagg_id).state.finished_tasks.append(
+                    self._kv_tasks[unique_rid][0].future.set_result("SUCCESS")
+                    self._kv_tasks[unique_rid][0].status = Status.FINISHED
+                    self._get_rx_sessions(unique_rid).state.status = Status.FINISHED
+                    self._get_rx_sessions(unique_rid).state.finished_tasks.append(
                         0
                     )  # receive task slice only support slice 0
 
@@ -954,26 +927,26 @@ class Receiver:
                         f"Task state handled successfully; current rx_sessions keys: {list(self._rx_sessions.keys())}"
                     )
         elif task_state == "FAILED":
-            self._slice_tasks[disagg_id][0].future.set_exception(
+            self._kv_tasks[unique_rid][0].future.set_exception(
                 RuntimeError(f"Task state: {task_state}")
             )
-            self._slice_tasks[disagg_id][0].state = State.ERR
-            self._get_rx_sessions(disagg_id).state.state = State.ERR
+            self._kv_tasks[unique_rid][0].status = Status.ERR
+            self._get_rx_sessions(unique_rid).state.status = Status.ERR
         else:
-            raise ValueError(f" session {disagg_id} received unknown task state: {task_state}")
+            raise ValueError(f" session {unique_rid} received unknown task state: {task_state}")
 
-    def _handle_meta_send_state(self, send_id: bytes, message: list[bytes]):
+    def _handle_aux_send_state(self, send_id: bytes, message: list[bytes]):
         assert len(message) == 3
-        assert message[0].decode("ascii") == str(MessageType.META_SEND_STATE)
-        disagg_id = message[1].decode("ascii")
+        assert message[0].decode("ascii") == str(MessageType.AUX_SEND_STATE)
+        unique_rid = message[1].decode("ascii")
         sync_status = message[2].decode("ascii")
         if sync_status == "SUCCESS":
-            self._get_rx_sessions(disagg_id).state.state = State.META_DATA_SENT
+            self._get_rx_sessions(unique_rid).state.status = Status.AUX_DATA_SENT
         elif sync_status == "FAILED":
-            self._get_rx_sessions(disagg_id).state.state = State.ERR
+            self._get_rx_sessions(unique_rid).state.status = Status.ERR
         else:
             raise ValueError(
-                f" session {disagg_id} received unknown meta send state: {sync_status}"
+                f" session {unique_rid} received unknown aux send state: {sync_status}"
             )
 
     def _send_data_request(self, endpoint: str, transfer_gen_side_req_info: GenReqInfo):
@@ -981,30 +954,30 @@ class Receiver:
             f"Sending data request to endpoint '{endpoint}' with request info: {transfer_gen_side_req_info}"
         )
         socket = self._get_socket(endpoint)
-        send_message = []
-        send_message.append(str(MessageType.REQUEST_DATA).encode("ascii"))
-        send_message.append(transfer_gen_side_req_info.to_bytes())
-        socket.send_multipart(send_message)
+        msg = []
+        msg.append(str(MessageType.REQUEST_DATA).encode("ascii"))
+        msg.append(transfer_gen_side_req_info.to_bytes())
+        socket.send_multipart(msg)
 
 
 class RxSession(RxSessionBase):
     def __init__(
         self,
         request_id: int,
-        disagg_params: DisaggregatedParams,
+        params: DisaggregatedParams,
         receiver: Receiver,
         aux_slot: int,
     ):
-        super().__init__(receiver, SessionArgsBase(request_id, disagg_params))
+        super().__init__(receiver, SessionArgsBase(request_id, params))
         self.request_id = request_id
         self.aux_slot = aux_slot
-        self._params = disagg_params
-        self._disagg_id = disagg_params.disagg_id
+        self._params = params
+        self._unique_rid = params.disagg_id
         self._receiver = receiver
         self._receiver.init_session_resource(self)
         self._exception = None
         self.slice_tasks = []
-        self._state = SessionState(state=State.INIT, finished_tasks=[])
+        self._state = SessionState(status=Status.INIT, finished_tasks=[])
 
     @property
     def state(self) -> SessionState:
@@ -1016,13 +989,13 @@ class RxSession(RxSessionBase):
 
     def receive(self, slice: KVSlice) -> TaskIdType:
         self.slice_tasks.append(
-            self._receiver.async_receive_slice(self._params, slice, self.aux_slot)
+            self._receiver.async_receive_kv_slice(self._params, slice, self.aux_slot)
         )
 
         task_id = self.slice_tasks[-1].slice_id
         return task_id
 
-    def poll_task(self, id: TaskIdType) -> State:
+    def poll_task(self, id: TaskIdType) -> Status:
         return self.slice_tasks[id].state
 
     @property
@@ -1083,16 +1056,16 @@ class InstanceInfoServer:
 
     def _loop_handle_request(self):
         while True:
-            message = self._socket.recv_multipart()
-            send_id = message[0]
-            recv_message = message[1:]
-            if self._is_termination(recv_message):
+            messages = self._socket.recv_multipart()
+            send_id = messages[0]
+            msg = messages[1:]
+            if self._is_termination(msg):
                 break
-            elif self._is_request_instance_info(recv_message):
-                self._handle_request_instance_info(send_id, recv_message)
+            elif self._is_request_instance_info(msg):
+                self._handle_request_instance_info(send_id, msg)
             else:
                 raise ValueError(
-                    f" instance info server received unknown message type: {recv_message[0]}"
+                    f" instance info server received unknown message type: {messages[0]}"
                 )
 
     def _is_termination(self, message: list[bytes]):
@@ -1181,7 +1154,7 @@ class TransferWorker:
             aux_slot = None
         return TxSession(
             request_id=request.py_request_id,
-            disagg_params=request.py_disaggregated_params,
+            params=request.py_disaggregated_params,
             sender=self._sender,
             aux_slot=aux_slot,
         )
@@ -1196,7 +1169,7 @@ class TransferWorker:
             aux_slot = None
         return RxSession(
             request_id=request.py_request_id,
-            disagg_params=request.py_disaggregated_params,
+            params=request.py_disaggregated_params,
             receiver=self._receiver,
             aux_slot=aux_slot,
         )
@@ -1289,18 +1262,18 @@ class TransferWorker:
         ptr_num = len(aux_meta.ptrs)
         ptr_descs = []
         for i in range(ptr_num):
-            ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
+            ptr_descs.append((aux_meta.ptrs[i], aux_meta.item_sizes[i], 0, f"aux_buffer_ptr_{i}"))
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
         self._registered_mem.append(reg_memory_desc)
 
-    # pack the meta data to the meta buffer
+    # pack the aux data to the meta buffer
 
-    def pack_meta_data(self, tx_session: TxSession, request: LlmRequest):
+    def pack_aux(self, tx_session: TxSession, request: LlmRequest):
         self._aux_buffer.fill_slot(tx_session.aux_slot, request)
 
-    def unpack_meta_data(self, rx_session: RxSession, request: LlmRequest):
+    def unpack_aux(self, rx_session: RxSession, request: LlmRequest):
         first_gen_tokens, draft_tokens = self._aux_buffer.get_slot_tokens(rx_session.aux_slot)
 
         # TODO: not first gen ,but add_tokens?

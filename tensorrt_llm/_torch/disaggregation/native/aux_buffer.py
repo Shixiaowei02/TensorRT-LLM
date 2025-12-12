@@ -157,8 +157,6 @@ class AuxBuffer(AuxBufferBase):
                 "Consider truncating draft tokens or increasing `max_draft_len` when creating the `AuxBuffer`."
             )
 
-        # build tensors on the buffer device for efficient copy
-        # Use the same device as the buffers to avoid unnecessary host/device transfers.
         self._first_tokens_buffer[slot][: len(first_gen_tokens)].copy_(
             torch.tensor(first_gen_tokens, dtype=torch.int32, device=self._device)
         )

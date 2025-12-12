@@ -6,7 +6,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
 from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
@@ -205,7 +205,7 @@ def test_transfer_worker_with_parallel(
             valid_gen_kv_cache_managers = gen_kv_cache_managers
             valid_gen_transfer_workers = gen_transfer_workers
 
-        disagg_id = str(uuid.uuid4())
+        unique_rid = str(uuid.uuid4())
         ctx_request = LlmRequest(
             request_id=ctx_request_id,
             max_new_tokens=1,
@@ -216,7 +216,7 @@ def test_transfer_worker_with_parallel(
             is_streaming=False,
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
         )
-        ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=disagg_id)
+        ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_id=unique_rid)
 
         for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
             ctx_kv_cache_manager.impl.add_sequence(
@@ -237,7 +237,7 @@ def test_transfer_worker_with_parallel(
             ctx_request_id=ctx_request.py_request_id,
             ctx_dp_rank=ctx_dp_rank,
             ctx_info_endpoint=ctx_info_endpoint,
-            disagg_id=disagg_id,
+            disagg_id=unique_rid,
         )
         for gen_kv_cache_manager in valid_gen_kv_cache_managers:
             gen_kv_cache_manager.impl.add_sequence(
@@ -282,9 +282,9 @@ def test_transfer_worker_with_parallel(
         for recv_slice_task in recv_slice_tasks:
             recv_slice_task.future.result()
         for sender_session in sender_sessions:
-            assert sender_session.state.state == State.FINISHED
+            assert sender_session.state.status == Status.FINISHED
         for receiver_session in receiver_sessions:
-            assert receiver_session.state.state == State.FINISHED
+            assert receiver_session.state.status == Status.FINISHED
 
         ctx_block_datas = [
             ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]
