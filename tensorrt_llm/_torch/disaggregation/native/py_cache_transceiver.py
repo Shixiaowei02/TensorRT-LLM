@@ -6,7 +6,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, State
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
     TransferWorker,
@@ -68,7 +68,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.context_info_endpoint = None
         self.dp_rank = self.mapping.tp_rank if self.mapping.enable_attention_dp else 0
         if self.dist.rank == 0:
-            self.context_info_endpoint = self.transfer_worker.instance_info_server.get_endpoint()
+            self.context_info_endpoint = self.transfer_worker._instance_info_server.endpoint
             self.dist.broadcast(self.context_info_endpoint, 0)
         else:
             self.context_info_endpoint = self.dist.broadcast(self.context_info_endpoint, 0)
@@ -83,12 +83,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.gen_sync_allgather_fun = (
             self.dist.pp_allgather if mapping.enable_attention_dp else self.dist.allgather
         )
-        ctx_server_endpoint = self.transfer_worker.sender.server_endpoint
+        ctx_server_endpoint = self.transfer_worker._sender.endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
 
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
         layer_num_per_pp = self.dist.pp_allgather(layer_num)
-        self.transfer_worker.update_instance_info_with_collective_info(
+        self.transfer_worker.refresh_instance_info(
             update_endpoints=ctx_server_endpoints, update_layer_num_per_pp=layer_num_per_pp
         )
 
@@ -116,9 +116,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         kv_slice = self._create_kv_slice(req)
         send_task_id = send_session.send(kv_slice)
         self.send_task_ids[req.request_id] = send_task_id
-        self.sender_future_to_request_id[
-            send_session.slice_tasks[send_task_id].get_future_for_task()
-        ] = req.request_id
+        self.sender_future_to_request_id[send_session.slice_tasks[send_task_id].future] = (
+            req.request_id
+        )
 
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
@@ -133,8 +133,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         return
 
-        # executor::ContextPhaseParams{{}, llmRequest->mRequestId, contextState.release(), std::nullopt}
-
     def request_and_receive_sync(self, req: LlmRequest):
         raise NotImplementedError("request_and_receive_sync is not implemented")
 
@@ -145,9 +143,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         kv_slice = self._create_kv_slice(req)
         recv_task_id = recv_session.receive(kv_slice)
         self.recv_task_ids[req.request_id] = recv_task_id
-        self.receiver_future_to_request_id[
-            recv_session.slice_tasks[recv_task_id].get_future_for_task()
-        ] = req.request_id
+        self.receiver_future_to_request_id[recv_session.slice_tasks[recv_task_id].future] = (
+            req.request_id
+        )
         self.id_to_request[req.request_id] = req
         return
 
@@ -159,9 +157,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.send_sessions.items():
-            if session.get_state().state == State.FINISHED:
+            if session.state.status == Status.FINISHED:
                 local_completed_request_ids.append(request_id)
-            elif session.get_state().state == State.ERR:
+            elif session.state.status == Status.ERR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.ctx_need_tp_sync:
@@ -192,9 +190,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         failed_request_ids = []
         for request_id in to_complete_request_ids:
             future = (
-                self.send_sessions[request_id]
-                .slice_tasks[self.send_task_ids[request_id]]
-                .get_future_for_task()
+                self.send_sessions[request_id].slice_tasks[self.send_task_ids[request_id]].future
             )
             try:
                 sync_status = future.result(timeout=self.sender_future_timeout_ms)
@@ -215,52 +211,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
             del self.id_to_request[request_id]
             del_future = (
-                self.send_sessions[request_id]
-                .slice_tasks[self.send_task_ids[request_id]]
-                .get_future_for_task()
+                self.send_sessions[request_id].slice_tasks[self.send_task_ids[request_id]].future
             )
             del self.sender_future_to_request_id[del_future]
-            del self.send_sessions[request_id]
-            del self.send_task_ids[request_id]
-
-        return
-
-    def check_context_transfer_status_v1(self, at_least_request_num: int):
-        # TODO: add logic to handle multiple tp
-        # block_all = at_least_request_num is None
-
-        wait_num = (
-            at_least_request_num
-            if at_least_request_num is not None
-            else len(self.id_to_request.keys())
-        )
-
-        remaining_futures = self.sender_future_to_request_id.keys()
-        completed_futures_appended = []
-        while len(completed_futures_appended) < wait_num:
-            completed_futures, remaining_futures = concurrent.futures.wait(
-                remaining_futures, timeout=None, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for future in completed_futures:
-                completed_futures_appended.append(future)
-
-        completed_request_ids = []
-        failed_request_ids = []
-        for request_id, session in self.send_sessions.items():
-            if session.get_state().state == State.FINISHED:
-                completed_request_ids.append(request_id)
-            elif session.get_state().state == State.ERR:
-                failed_request_ids.append(request_id)
-        for request_id in completed_request_ids + failed_request_ids:
-            if request_id in completed_request_ids:
-                self.id_to_request[request_id].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-            else:
-                self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
-            del self.id_to_request[request_id]
-
-            del self.sender_future_to_request_id[
-                session.slice_tasks[self.send_task_ids[request_id]].get_future_for_task()
-            ]
             del self.send_sessions[request_id]
             del self.send_task_ids[request_id]
 
@@ -274,9 +227,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
-            if session.get_state().state == State.FINISHED:
+            if session.state.status == Status.FINISHED:
                 local_completed_request_ids.append(request_id)
-            elif session.get_state().state == State.ERR:
+            elif session.state.status == Status.ERR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.gen_need_sync:
@@ -308,9 +261,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         failed_request_ids = []
         for request_id in to_complete_request_ids:
             future = (
-                self.recv_sessions[request_id]
-                .slice_tasks[self.recv_task_ids[request_id]]
-                .get_future_for_task()
+                self.recv_sessions[request_id].slice_tasks[self.recv_task_ids[request_id]].future
             )
             try:
                 sync_status = future.result(timeout=self.sender_future_timeout_ms)
@@ -322,9 +273,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 failed_request_ids.append(request_id)
         for request_id in completed_request_ids + failed_request_ids:
             future = (
-                self.recv_sessions[request_id]
-                .slice_tasks[self.recv_task_ids[request_id]]
-                .get_future_for_task()
+                self.recv_sessions[request_id].slice_tasks[self.recv_task_ids[request_id]].future
             )
             if request_id in completed_request_ids:
                 self.id_to_request[
@@ -334,41 +283,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 self.id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
             del self.id_to_request[request_id]
             del self.receiver_future_to_request_id[future]
-            del self.recv_sessions[request_id]
-            del self.recv_task_ids[request_id]
-
-        return
-
-    def check_gen_transfer_status_v1(self, at_least_request_num: int):
-        # TODO: add logic to handle multiple tp
-        # block_all = at_least_request_num is None
-
-        wait_num = (
-            at_least_request_num
-            if at_least_request_num is not None
-            else len(self.receiver_future_to_request_id)
-        )
-
-        remaining_futures = self.receiver_future_to_request_id.keys()
-        completed_futures_appended = []
-        while len(completed_futures_appended) < wait_num:
-            completed_futures, remaining_futures = concurrent.futures.wait(
-                remaining_futures, timeout=None, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for future in completed_futures:
-                completed_futures_appended.append(future)
-
-        completed_request_ids = []
-        for request_id, session in self.recv_sessions.items():
-            if session.get_state().state == State.FINISHED:
-                completed_request_ids.append(request_id)
-
-        for request_id in completed_request_ids:
-            self.id_to_request[request_id].state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            del self.id_to_request[request_id]
-            del self.receiver_future_to_request_id[
-                session.slice_tasks[self.recv_task_ids[request_id]].get_future_for_task()
-            ]
             del self.recv_sessions[request_id]
             del self.recv_task_ids[request_id]
 

@@ -339,8 +339,9 @@ class Sender:
 
         logger.info(f" Sender init end with endpoint: {self.endpoint}")
 
-        background_thread = threading.Thread(target=self._handle_sender_loop, daemon=True)
-        background_thread.start()
+        self._sender_thread = threading.Thread(target=self._handle_sender_loop, daemon=True)
+        self._sender_thread.start()
+        self._closed = False
 
     @property
     def endpoint(self):
@@ -610,6 +611,30 @@ class Sender:
                 if req_info.unique_rid in self._tx_sessions:
                     self._get_tx_session(req_info.unique_rid).state.status = Status.READY
 
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+
+        # Stop the _process_task_queue thread if it exists
+        if hasattr(self, "_send_task_queue"):
+            self._send_task_queue.put(None)
+            if hasattr(self, "_background_thread"):
+                self._background_thread.join(timeout=5)
+
+            # Send termination message to stop _handle_sender_loop
+        term_socket = self._zmq_context.socket(zmq.DEALER)
+        term_socket.connect(self._endpoint)
+        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
+        self._sender_thread.join(timeout=5)
+        term_socket.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception as e:
+            logger.error(f"Exception in Sender.__del__: {e}")
+
 
 class TxSession(TxSessionBase):
     def __init__(self, request_id: int, params: DisaggregatedParams, sender: Sender, aux_slot: int):
@@ -775,11 +800,27 @@ class Receiver:
 
         self._rx_sessions = {}  # unique_rid -> RxSession
         self._last_slice_counts = {}  # unique_rid -> int
+        self._closed = False
         logger.info(f" Receiver init  with endpoint: {self._endpoint}")
 
     @property
     def endpoint(self):
         return self._endpoint
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger.debug("Receiver.close() called")
+
+        # Send termination message to stop _handle_receiver_loop
+        term_socket = self._zmq_context.socket(zmq.DEALER)
+        term_socket.connect(self._endpoint)
+        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
+        self._receiver_background_thread.join(timeout=5)
+        term_socket.close()
+
+        logger.debug("Receiver.close() completed")
 
     def async_receive_kv_slice(
         self, params: DisaggregatedParams, slice: KVSlice, aux_slot: int
@@ -959,6 +1000,12 @@ class Receiver:
         msg.append(transfer_gen_side_req_info.to_bytes())
         socket.send_multipart(msg)
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception as e:
+            logger.error(f"Exception in Receiver.__del__: {e}")
+
 
 class RxSession(RxSessionBase):
     def __init__(
@@ -1045,6 +1092,7 @@ class InstanceInfoServer:
         self._endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
         self._thread = threading.Thread(target=self._loop_handle_request, daemon=True)
         self._thread.start()
+        self._closed = False
 
     @property
     def endpoint(self) -> str:
@@ -1053,6 +1101,19 @@ class InstanceInfoServer:
     @endpoint.setter
     def endpoint(self, value) -> None:
         self._endpoint = value
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger.debug("InstanceInfoServer.close() called")
+
+        # Send termination message to stop _loop_handle_request
+        term_socket = self._zmq_context.socket(zmq.DEALER)
+        term_socket.connect(self._endpoint)
+        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
+        self._thread.join(timeout=5)
+        term_socket.close()
 
     def _loop_handle_request(self):
         while True:
@@ -1076,6 +1137,12 @@ class InstanceInfoServer:
 
     def _handle_request_instance_info(self, send_id: bytes, message: list[bytes]):
         self._socket.send_multipart([send_id, self._instance_info.to_bytes()])
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception as e:
+            logger.error(f"Exception in InstanceInfoServer.__del__: {e}")
 
 
 def _deregister_registered_memory(transfer_agent, registered_memorys):
@@ -1283,14 +1350,9 @@ class TransferWorker:
 
     def __del__(self):
         try:
-            if (
-                hasattr(self, "_finalizer")
-                and self._finalizer is not None
-                and self._finalizer.alive
-            ):
-                try:
-                    pass
-                except Exception:
-                    logger.error("TransferWorker.__del__: finalizer invocation failed")
-        except Exception:
-            logger.error("Exception in TransferWorker.__del__")
+            if self._instance_info_server is not None:
+                self._instance_info_server.close()
+            self._sender.close()
+            self._receiver.close()
+        except Exception as e:
+            logger.error(f"Exception in TransferWorker.__del__ error: {e}")

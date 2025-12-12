@@ -127,7 +127,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def respond_and_send_async(self, req: LlmRequest):
         self.impl.respond_and_send_async(req)
-        req.context_phase_params.disagg_id = req.py_disaggregated_params.disagg_id
+        if (req.py_disaggregated_params is not None):
+            req.context_phase_params.disagg_id = req.py_disaggregated_params.disagg_id
         return
 
     def request_and_receive_sync(self, req: LlmRequest):
