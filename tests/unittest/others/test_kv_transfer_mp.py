@@ -1,12 +1,7 @@
-"""Multi-process version of kv_transfer_test.py
-
-Usage:
-    python kv_transfer_test_mp.py
-"""
-
 import os
 import uuid
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -533,16 +528,9 @@ def worker_fn(
     dist.destroy_process_group()
 
 
-def test_transfer_worker_mp(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
+def run_transfer_worker_mp(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
     """Multi-process test for TransferWorker using mp.spawn."""
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
-    # num_gpus = torch.cuda.device_count()
-
-    # if num_gpus < world_size:
-    #     print(
-    #         f"Warning: Requested {world_size} processes but only {num_gpus} GPUs available. "
-    #         f"Processes will share GPUs."
-    #     )
 
     master_addr = "127.0.0.1"
     master_port = find_free_port()
@@ -563,16 +551,27 @@ def test_transfer_worker_mp(ctx_tp: int, ctx_pp: int, gen_tp: int, gen_pp: int):
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
 
-if __name__ == "__main__":
-    # Set multiprocessing start method
-    mp.set_start_method("spawn", force=True)
+# Test configurations as pytest parameters
+MP_TEST_CONFIGS = [
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, test_id)
+    (1, 1, 1, 1, "mp_tp1_pp1_to_tp1_pp1"),
+    (1, 1, 1, 2, "mp_tp1_pp1_to_tp1_pp2"),
+    (2, 1, 1, 2, "mp_tp2_pp1_to_tp1_pp2"),
+]
 
-    # Run tests
-    test_transfer_worker_mp(ctx_tp=1, ctx_pp=1, gen_tp=1, gen_pp=1)
-    test_transfer_worker_mp(ctx_tp=1, ctx_pp=1, gen_tp=1, gen_pp=2)
-    # test_transfer_worker_mp(ctx_tp=1, ctx_pp=2, gen_tp=1, gen_pp=1)
-    # test_transfer_worker_mp(ctx_tp=1, ctx_pp=2, gen_tp=1, gen_pp=2)
-    # test_transfer_worker_mp(ctx_tp=1, ctx_pp=2, gen_tp=2, gen_pp=1)
-    test_transfer_worker_mp(ctx_tp=2, ctx_pp=1, gen_tp=1, gen_pp=2)
-    # test_transfer_worker_mp(ctx_tp=4, ctx_pp=1, gen_tp=2, gen_pp=2)
-    # test_transfer_worker_mp(ctx_tp=1, ctx_pp=4, gen_tp=2, gen_pp=2)
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,gen_tp,gen_pp",
+    [(c[0], c[1], c[2], c[3]) for c in MP_TEST_CONFIGS],
+    ids=[c[4] for c in MP_TEST_CONFIGS],
+)
+def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp):
+    """Test transfer worker with multi-process configurations."""
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
+
+    run_transfer_worker_mp(ctx_tp=ctx_tp, ctx_pp=ctx_pp, gen_tp=gen_tp, gen_pp=gen_pp)

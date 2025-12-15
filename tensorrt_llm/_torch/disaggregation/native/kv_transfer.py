@@ -360,6 +360,25 @@ class Sender:
 
     def init_session_resource(self, tx_session: TxSessionBase):
         self._tx_sessions[tx_session.session_args.params.disagg_id] = weakref.ref(tx_session)
+
+        req_info_num = 0
+        req_info = None
+        with self._peer_req_lock:
+            if tx_session.session_args.params.disagg_id in self._peer_reqs:
+                req_info_num = len(self._peer_reqs[tx_session.session_args.params.disagg_id])
+                if req_info_num > 0:
+                    req_info = list(
+                        self._peer_reqs[tx_session.session_args.params.disagg_id].values()
+                    )[0]
+        if req_info is not None:
+            peer_ri = self._mapper.peer_registrar.get_peer_rank_info(
+                req_info.instance_name, req_info.instance_rank
+            )
+            expected_transfers = len(
+                self._mapper.get_peer_overlap_targets(peer_ri, peer_ri.instance_rank).ranks
+            )
+            if expected_transfers == req_info_num:
+                tx_session.state.status = SessionStatus.READY
         return
 
     def _get_tx_session(self, unique_rid: str) -> TxSessionBase:
@@ -433,7 +452,6 @@ class Sender:
                 (src_ptr, size, device_id)
                 for src_ptr, size in zip(agent_args.src_kv_ptrs, agent_args.kv_sizes)
             ]
-            # TODO : device_id should be the device id of the destination
             dst_list = [
                 (dst_ptr, size, agent_args.dst_device_id)
                 for dst_ptr, size in zip(agent_args.dst_kv_ptrs, agent_args.kv_sizes)
@@ -462,6 +480,7 @@ class Sender:
         session = self._get_tx_session(unique_rid)
         assert session.state.status != SessionStatus.ERROR
         session.state.status = SessionStatus.TRANSFERRING
+        self._kv_tasks[unique_rid][slice_id].status = TaskStatus.TRANSFERRING
 
         request, src_kv_list, _ = Sender._prepare_transfer_request(
             agent_args, is_aux=False, device_id=self._device_id
@@ -542,7 +561,6 @@ class Sender:
         self._get_tx_session(agent_args.unique_rid).state.status = SessionStatus.AUX_TRANSMITTED
 
     def _dispatch_task(self, task: KVSendTask | AuxSendTask):
-        task.status = TaskStatus.TRANSFERRING
         req_info_dict = {}
         with self._peer_req_lock:
             if task._unique_rid in self._peer_reqs:
@@ -613,15 +631,17 @@ class Sender:
             if req_info.unique_rid not in self._peer_reqs:
                 self._peer_reqs[req_info.unique_rid] = {}
             self._peer_reqs[req_info.unique_rid][req_info.instance_rank] = req_info
-            peer_ri = self._mapper.peer_registrar.get_peer_rank_info(
-                req_info.instance_name, req_info.instance_rank
-            )
-            expected_transfers = len(
-                self._mapper.get_peer_overlap_targets(peer_ri, req_info.instance_rank).ranks
-            )
-            if expected_transfers == len(self._peer_reqs[req_info.unique_rid]):
-                if req_info.unique_rid in self._tx_sessions:
-                    self._get_tx_session(req_info.unique_rid).state.status = SessionStatus.READY
+        peer_ri = self._mapper.peer_registrar.get_peer_rank_info(
+            req_info.instance_name, req_info.instance_rank
+        )
+        expected_transfers = len(
+            self._mapper.get_peer_overlap_targets(peer_ri, req_info.instance_rank).ranks
+        )
+        if expected_transfers == len(self._peer_reqs[req_info.unique_rid]):
+            if req_info.unique_rid in self._tx_sessions:
+                session = self._get_tx_session(req_info.unique_rid)
+                if session.state.status == SessionStatus.INIT:
+                    session.state.status = SessionStatus.READY
 
     def close(self):
         if self._closed:

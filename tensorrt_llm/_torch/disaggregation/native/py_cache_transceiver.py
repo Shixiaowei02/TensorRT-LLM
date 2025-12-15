@@ -88,8 +88,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
         layer_num_per_pp = self.dist.pp_allgather(layer_num)
-        self.transfer_worker.refresh_instance_info(
-            update_endpoints=ctx_server_endpoints, update_layer_num_per_pp=layer_num_per_pp
+        self.transfer_worker.populate_instance_and_rank_info(
+            endpoints=ctx_server_endpoints, layer_num_per_pp=layer_num_per_pp
         )
 
         logger.info(f" transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
