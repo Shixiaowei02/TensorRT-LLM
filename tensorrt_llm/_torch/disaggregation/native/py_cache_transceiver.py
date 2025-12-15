@@ -6,7 +6,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
     TransferWorker,
@@ -157,9 +157,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.send_sessions.items():
-            if session.state.status == Status.FINISHED:
+            if session.state.status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == Status.ERR:
+            elif session.state.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.ctx_need_tp_sync:
@@ -227,9 +227,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
-            if session.state.status == Status.FINISHED:
+            if session.state.status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == Status.ERR:
+            elif session.state.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.gen_need_sync:

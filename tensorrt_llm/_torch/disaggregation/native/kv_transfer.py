@@ -3,6 +3,7 @@ import queue
 import threading
 import weakref
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import List, Optional
 
 import msgpack
@@ -22,7 +23,7 @@ from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
     RxSessionBase,
     SessionArgsBase,
     SessionState,
-    Status,
+    SessionStatus,
     TaskIdType,
     TxSessionBase,
 )
@@ -114,21 +115,31 @@ def _message_is_register_rank_info(message: list[bytes]):
     return message[0] == str(MessageType.REGISTER_RANK_INFO).encode("ascii")
 
 
+class TaskStatus(Enum):
+    INIT = "INIT"
+    READY = "READY"
+    TRANSFERRING = "TRANSFERRING"
+    TRANSFERRED = "TRANSFERRED"
+    COMPLETED = "COMPLETED"
+    ERROR = "ERROR"
+    AUX_TRANSMITTED = "AUX_TRANSMITTED"
+
+
 class AuxSendTask:
     def __init__(self, params: DisaggregatedParams, slot: int, mapper: PeerMapper):
         self._params = params
         self._unique_rid = params.disagg_id
         self._slot = slot
         self._mapper = mapper
-        self._status = Status.INIT
+        self._status = TaskStatus.INIT
         self._future = concurrent.futures.Future()
 
     @property
-    def status(self) -> Status:
+    def status(self) -> TaskStatus:
         return self._status
 
     @status.setter
-    def status(self, s: Status):
+    def status(self, s: TaskStatus):
         self._status = s
 
     @property
@@ -185,15 +196,15 @@ class KVSendTask:
         self._params = params
         self._unique_rid = params.disagg_id
         self._slice_id = slice_id
-        self._status = Status.INIT
+        self._status = TaskStatus.INIT
         self._transferred_count = 0
 
     @property
-    def status(self) -> Status:
+    def status(self) -> TaskStatus:
         return self._status
 
     @status.setter
-    def status(self, s: Status):
+    def status(self, s: TaskStatus):
         self._status = s
 
     @property
@@ -442,13 +453,15 @@ class Sender:
     def _deliver_kv_to_agent(self, agent_args: AgentSendArgs):
         assert len(agent_args.src_kv_ptrs) == len(agent_args.dst_kv_ptrs)
         assert len(agent_args.kv_sizes) == len(agent_args.src_kv_ptrs)
+        assert agent_args.is_only_aux is False
+
         unique_rid = agent_args.unique_rid
         slice_id = agent_args.slice_id
         peer_endpoint = agent_args.peer_endpoint
 
         session = self._get_tx_session(unique_rid)
-        if session.state.status != Status.ERR:
-            session.state.status = Status.TRANSFERRING
+        assert session.state.status != SessionStatus.ERROR
+        session.state.status = SessionStatus.TRANSFERRING
 
         request, src_kv_list, _ = Sender._prepare_transfer_request(
             agent_args, is_aux=False, device_id=self._device_id
@@ -456,16 +469,16 @@ class Sender:
 
         skip_send = len(src_kv_list) == 0
         logger.debug(f"Submitting transfer request to transfer agent: {request}")
-        status = None
+        agent_handler = None
         if not skip_send:
-            status = self._agent.submit_transfer_requests(request)
+            agent_handler = self._agent.submit_transfer_requests(request)
 
         sync_status = "SUCCESS"
-        if not skip_send and not status.wait():
+        if not skip_send and not agent_handler.wait():
             sync_status = "FAILED"
             agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
-            self._kv_tasks[unique_rid][slice_id].status = Status.ERR
-            session.state.status = Status.ERR
+            self._kv_tasks[unique_rid][slice_id].status = TaskStatus.ERROR
+            session.state.status = SessionStatus.ERROR
 
         socket = self._get_socket(peer_endpoint)
 
@@ -491,14 +504,14 @@ class Sender:
                 )
             )
             # TODO: set exception for the session ?
-            session.state.status = Status.ERR
+            session.state.status = SessionStatus.ERROR
         elif task.transferred_count == agent_args.expected_transfers:
             # TODO avoid set_result if tranfser failed since it has been set exception
             agent_args.future_for_task.set_result(sync_status)
-            task.status = Status.FINISHED
+            task.status = TaskStatus.TRANSFERRED
             session.state.finished_tasks.append(slice_id)
             if agent_args.is_last_slice:
-                session.state.status = Status.FINISHED
+                session.state.status = SessionStatus.TRANSFERRED
 
     @nvtx_range("submit_send_aux_to_agent")
     def _deliver_aux_to_agent(self, agent_args: AgentSendArgs):
@@ -517,7 +530,7 @@ class Sender:
         if not status.wait():
             sync_status = "FAILED"
             agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
-            self._get_tx_session(agent_args.unique_rid).state.status = Status.ERR
+            self._get_tx_session(agent_args.unique_rid).state.status = SessionStatus.ERROR
         socket = self._get_socket(agent_args.peer_endpoint)
         socket.send_multipart(
             [
@@ -526,11 +539,10 @@ class Sender:
                 sync_status.encode("ascii"),
             ]
         )
-        self._get_tx_session(agent_args.unique_rid).state.status = Status.AUX_DATA_SENT
+        self._get_tx_session(agent_args.unique_rid).state.status = SessionStatus.AUX_TRANSMITTED
 
-    def _dispatch_task(self, send_kv_slice_task: KVSendTask | AuxSendTask):
-        task = send_kv_slice_task
-        task.status = Status.TRANSFERRING
+    def _dispatch_task(self, task: KVSendTask | AuxSendTask):
+        task.status = TaskStatus.TRANSFERRING
         req_info_dict = {}
         with self._peer_req_lock:
             if task._unique_rid in self._peer_reqs:
@@ -609,7 +621,7 @@ class Sender:
             )
             if expected_transfers == len(self._peer_reqs[req_info.unique_rid]):
                 if req_info.unique_rid in self._tx_sessions:
-                    self._get_tx_session(req_info.unique_rid).state.status = Status.READY
+                    self._get_tx_session(req_info.unique_rid).state.status = SessionStatus.READY
 
     def close(self):
         if self._closed:
@@ -641,7 +653,7 @@ class TxSession(TxSessionBase):
         super().__init__(sender, SessionArgsBase(request_id, params))
         self.request_id = request_id
         self._sender = sender
-        self._state = SessionState(status=Status.INIT, finished_tasks=[])
+        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
         self._exception = None
         self.slice_tasks = []  # slice_id -> SliceTxSession
         self._sender.init_session_resource(self)
@@ -664,7 +676,7 @@ class TxSession(TxSessionBase):
     def send_aux(self):
         return self._sender.async_send_aux(self.session_args.params, self.aux_slot)
 
-    def poll_task(self, id: TaskIdType) -> Status:
+    def poll_task(self, id: TaskIdType) -> SessionStatus:
         return self.slice_tasks[id].state
 
     @property
@@ -715,7 +727,7 @@ class KVRecvTask:
         self._slice_id = slice_id
         self._params = params
         self._mapper = mapper
-        self._status = Status.INIT
+        self._status = TaskStatus.INIT
         self._exception = None
         self._future = concurrent.futures.Future()
         self._first_transfer = False
@@ -723,11 +735,11 @@ class KVRecvTask:
         self._aux_slot = aux_slot
 
     @property
-    def status(self) -> Status:
+    def status(self) -> TaskStatus:
         return self._status
 
     @status.setter
-    def status(self, s: Status):
+    def status(self, s: TaskStatus):
         self._status = s
 
     @property
@@ -916,7 +928,7 @@ class Receiver:
         logger.debug(f"Registering receive task: {recv_meta}")
         if recv_meta.unique_rid not in self._last_slice_counts:
             self._last_slice_counts[recv_meta.unique_rid] = 0
-        self._kv_tasks[recv_meta.unique_rid][recv_meta.slice_id].status = Status.TRANSFERRING
+        self._kv_tasks[recv_meta.unique_rid][recv_meta.slice_id].status = TaskStatus.TRANSFERRING
 
     def _handle_receiver_loop(self):
         while True:
@@ -958,8 +970,8 @@ class Receiver:
                 ):
                     # use future property
                     self._kv_tasks[unique_rid][0].future.set_result("SUCCESS")
-                    self._kv_tasks[unique_rid][0].status = Status.FINISHED
-                    self._get_rx_sessions(unique_rid).state.status = Status.FINISHED
+                    self._kv_tasks[unique_rid][0].status = TaskStatus.TRANSFERRED
+                    self._get_rx_sessions(unique_rid).state.status = SessionStatus.TRANSFERRED
                     self._get_rx_sessions(unique_rid).state.finished_tasks.append(
                         0
                     )  # receive task slice only support slice 0
@@ -971,8 +983,8 @@ class Receiver:
             self._kv_tasks[unique_rid][0].future.set_exception(
                 RuntimeError(f"Task state: {task_state}")
             )
-            self._kv_tasks[unique_rid][0].status = Status.ERR
-            self._get_rx_sessions(unique_rid).state.status = Status.ERR
+            self._kv_tasks[unique_rid][0].status = TaskStatus.ERROR
+            self._get_rx_sessions(unique_rid).state.status = SessionStatus.ERROR
         else:
             raise ValueError(f" session {unique_rid} received unknown task state: {task_state}")
 
@@ -982,9 +994,9 @@ class Receiver:
         unique_rid = message[1].decode("ascii")
         sync_status = message[2].decode("ascii")
         if sync_status == "SUCCESS":
-            self._get_rx_sessions(unique_rid).state.status = Status.AUX_DATA_SENT
+            self._get_rx_sessions(unique_rid).state.status = SessionStatus.AUX_TRANSMITTED
         elif sync_status == "FAILED":
-            self._get_rx_sessions(unique_rid).state.status = Status.ERR
+            self._get_rx_sessions(unique_rid).state.status = SessionStatus.ERROR
         else:
             raise ValueError(
                 f" session {unique_rid} received unknown aux send state: {sync_status}"
@@ -1024,7 +1036,7 @@ class RxSession(RxSessionBase):
         self._receiver.init_session_resource(self)
         self._exception = None
         self.slice_tasks = []
-        self._state = SessionState(status=Status.INIT, finished_tasks=[])
+        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
 
     @property
     def state(self) -> SessionState:
@@ -1042,7 +1054,7 @@ class RxSession(RxSessionBase):
         task_id = self.slice_tasks[-1].slice_id
         return task_id
 
-    def poll_task(self, id: TaskIdType) -> Status:
+    def poll_task(self, id: TaskIdType) -> SessionStatus:
         return self.slice_tasks[id].state
 
     @property
@@ -1178,8 +1190,8 @@ class TransferWorker:
         self._finalizer = None
 
         self.init_instance_info(instance_name)
-        need_info_server = self._mapping.rank == 0
-        if need_info_server:
+        is_leader = self._mapping.rank == 0
+        if is_leader:
             self._instance_info_server = InstanceInfoServer(self._instance_info)
         else:
             self._instance_info_server = None
@@ -1204,12 +1216,10 @@ class TransferWorker:
             self, _deregister_registered_memory, self._agent, reg_snapshot
         )
 
-    def refresh_instance_info(
-        self, update_endpoints: list[str], update_layer_num_per_pp: list[int]
-    ):
-        self._instance_info.ctx_endpoints = update_endpoints
-        self._instance_info.layer_num_per_pp = update_layer_num_per_pp
-        self._rank_info.layer_num_per_pp = update_layer_num_per_pp
+    def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
+        self._instance_info.ctx_endpoints = endpoints
+        self._instance_info.layer_num_per_pp = layer_num_per_pp
+        self._rank_info.layer_num_per_pp = layer_num_per_pp
 
     def create_tx_session(self, request: LlmRequest) -> TxSession:
         """

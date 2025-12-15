@@ -214,7 +214,7 @@ try:
             max_sleep_time = 0.01  # 10ms
             while status == "PROC":
                 status = self.agent.check_xfer_state(self.handle)
-                if status == "ERR":
+                if status == "ERROR":
                     return False  # transfer failed
                 # sleep(0.1)
                 # sleep to release GIL
@@ -270,7 +270,7 @@ try:
                 request.sync_message,
             )
             status = self.agent.transfer(handle)
-            assert status != "ERR"
+            assert status != "ERROR"
             return NixlTransferStatus(self.agent, handle)
 
 except ImportError:

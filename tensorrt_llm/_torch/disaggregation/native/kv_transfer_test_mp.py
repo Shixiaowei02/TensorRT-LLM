@@ -15,7 +15,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
@@ -211,8 +211,8 @@ def worker_fn(
             ctx_layer_num_per_pp.append(all_layer_nums[pp * ctx_tp])
 
         # Update instance info
-        transfer_worker.refresh_instance_info(
-            update_endpoints=ctx_endpoints, update_layer_num_per_pp=ctx_layer_num_per_pp
+        transfer_worker.populate_instance_and_rank_info(
+            endpoints=ctx_endpoints, layer_num_per_pp=ctx_layer_num_per_pp
         )
 
         # Get ctx_info_endpoint (only rank 0 has the real value)
@@ -274,8 +274,8 @@ def worker_fn(
             gen_layer_num_per_pp.append(all_layer_nums[pp * gen_tp])
 
         # Update instance info
-        transfer_worker.refresh_instance_info(
-            update_endpoints=gen_endpoints, update_layer_num_per_pp=gen_layer_num_per_pp
+        transfer_worker.populate_instance_and_rank_info(
+            endpoints=gen_endpoints, layer_num_per_pp=gen_layer_num_per_pp
         )
 
         ctx_info_endpoint = None  # Will be received later
@@ -336,7 +336,7 @@ def worker_fn(
 
             # Wait for send to complete
             send_slice_task.future.result()
-            assert sender_session.state.status == Status.FINISHED
+            assert sender_session.state.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
@@ -375,7 +375,7 @@ def worker_fn(
 
             # Wait for receive to complete
             recv_slice_task.future.result()
-            assert receiver_session.state.status == Status.FINISHED
+            assert receiver_session.state.status == SessionStatus.TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[blocks]

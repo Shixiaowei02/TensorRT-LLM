@@ -6,7 +6,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, Status
+from tensorrt_llm._torch.disaggregation.base.kv_transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.aux_buffer import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.kv_transfer import (
     TransferAgentConfig,
@@ -129,8 +129,8 @@ def test_transfer_worker_with_parallel(
         )
 
     for ctx_transfer_worker in ctx_transfer_workers:
-        ctx_transfer_worker.refresh_instance_info(
-            update_endpoints=ctx_endpoints, update_layer_num_per_pp=ctx_layer_num_per_pp
+        ctx_transfer_worker.populate_instance_and_rank_info(
+            endpoints=ctx_endpoints, layer_num_per_pp=ctx_layer_num_per_pp
         )
 
     gen_transfer_workers = []
@@ -175,8 +175,8 @@ def test_transfer_worker_with_parallel(
             len(gen_transfer_workers[pp_rank * gen_tp]._kv_cache_manager.pp_layers)
         )
     for gen_transfer_worker in gen_transfer_workers:
-        gen_transfer_worker.refresh_instance_info(
-            update_endpoints=gen_endpoints, update_layer_num_per_pp=gen_layer_num_per_pp
+        gen_transfer_worker.populate_instance_and_rank_info(
+            endpoints=gen_endpoints, layer_num_per_pp=gen_layer_num_per_pp
         )
 
     sampling_params = SamplingParams()
@@ -282,9 +282,9 @@ def test_transfer_worker_with_parallel(
         for recv_slice_task in recv_slice_tasks:
             recv_slice_task.future.result()
         for sender_session in sender_sessions:
-            assert sender_session.state.status == Status.FINISHED
+            assert sender_session.state.status == SessionStatus.TRANSFERRED
         for receiver_session in receiver_sessions:
-            assert receiver_session.state.status == Status.FINISHED
+            assert receiver_session.state.status == SessionStatus.TRANSFERRED
 
         ctx_block_datas = [
             ctx_kv_cache_manager.get_unique_primary_pool()[ctx_block_id]

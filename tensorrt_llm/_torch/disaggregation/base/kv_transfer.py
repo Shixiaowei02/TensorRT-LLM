@@ -20,13 +20,13 @@ class KVSlice:
     is_last_slice: bool = False
 
 
-class Status(Enum):
-    INIT = "Init"  # Session contains only the required members for construction.
-    READY = "Ready"  # Resources are ready for processing.
-    TRANSFERRING = "Transferring"  # Data is being transffered.
-    FINISHED = "Finished"  # Processing is finished.
-    AUX_DATA_SENT = "AuxDataSent"  # Aux data has been sent.
-    ERR = "Err"  # An error has occurred.
+class SessionStatus(Enum):
+    INIT = "INIT"
+    READY = "READY"
+    TRANSFERRING = "TRANSFERRING"
+    TRANSFERRED = "TRANSFERRED"
+    COMPLETED = "COMPLETED"
+    ERROR = "ERROR"
 
 
 TaskIdType = int
@@ -34,7 +34,7 @@ TaskIdType = int
 
 @dataclass
 class SessionState:
-    status: Status
+    status: SessionStatus
     finished_tasks: List[TaskIdType]
 
 
@@ -59,7 +59,7 @@ class TxSessionBase(ABC):
     def state(self) -> SessionState: ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> Status: ...
+    def poll_task(self, id: TaskIdType) -> SessionStatus: ...
 
     @abstractmethod
     def send(self, slice: KVSlice) -> TaskIdType: ...
@@ -82,7 +82,7 @@ class RxSessionBase(ABC):
     def state(self) -> SessionState: ...
 
     @abstractmethod
-    def poll_task(self, id: TaskIdType) -> Status: ...
+    def poll_task(self, id: TaskIdType) -> SessionStatus: ...
 
     @abstractmethod
     def receive(self, slice: KVSlice) -> TaskIdType: ...
