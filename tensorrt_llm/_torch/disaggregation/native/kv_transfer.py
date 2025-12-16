@@ -7,7 +7,6 @@ from enum import Enum
 from typing import List, Optional
 
 import msgpack
-import zmq
 
 import tensorrt_llm.bindings
 from tensorrt_llm import Mapping, logger
@@ -35,6 +34,7 @@ from tensorrt_llm._torch.disaggregation.native.kv_mapper import (
     PeerRegistrar,
     RankInfo,
 )
+from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import BindingsNixlTransferAgent
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -115,12 +115,24 @@ def _message_is_register_rank_info(message: list[bytes]):
     return message[0] == str(MessageType.REGISTER_RANK_INFO).encode("ascii")
 
 
+def _message_is_task_state(message: list[bytes]):
+    return message[0] == str(MessageType.TASK_STATE).encode("ascii")
+
+
+def _message_is_aux_send_state(message: list[bytes]):
+    return message[0] == str(MessageType.AUX_SEND_STATE).encode("ascii")
+
+
+def _message_is_request_instance_info(message: list[bytes]):
+    return message[0] == str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")
+
+
 class TaskStatus(Enum):
     INIT = "INIT"
-    READY = "READY"
     TRANSFERRING = "TRANSFERRING"
     TRANSFERRED = "TRANSFERRED"
     COMPLETED = "COMPLETED"
+    CANCELED = "CANCELED"
     ERROR = "ERROR"
     AUX_TRANSMITTED = "AUX_TRANSMITTED"
 
@@ -339,24 +351,20 @@ class Sender:
         self._peer_reqs = {}
         self._peer_req_lock = threading.Lock()
 
-        self._zmq_context = zmq.Context()
-        self._socket = self._zmq_context.socket(zmq.ROUTER)
-        self._socket.bind(f"tcp://{get_local_ip()}:*")
-        self._endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+        self._messenger = ZMQMessenger(mode="ROUTER")
+        self._start_listener()
+
         self._socket_cache = {}
         self._kv_tasks = {}  # unique_rid -> list[KVSlice]
         self._aux_tasks = {}  # unique_rid -> AuxSendTask
         self._tx_sessions = {}  # unique_rid -> TxSession
 
-        logger.info(f" Sender init end with endpoint: {self.endpoint}")
-
-        self._sender_thread = threading.Thread(target=self._handle_sender_loop, daemon=True)
-        self._sender_thread.start()
+        logger.info(f" Sender init end with endpoint: {self._messenger.endpoint}")
         self._closed = False
 
     @property
     def endpoint(self):
-        return self._endpoint
+        return self._messenger.endpoint
 
     def init_session_resource(self, tx_session: TxSessionBase):
         self._tx_sessions[tx_session.session_args.params.disagg_id] = weakref.ref(tx_session)
@@ -499,10 +507,10 @@ class Sender:
             self._kv_tasks[unique_rid][slice_id].status = TaskStatus.ERROR
             session.state.status = SessionStatus.ERROR
 
-        socket = self._get_socket(peer_endpoint)
+        messenger = self._get_or_connect_dealer(peer_endpoint)
 
         ## TODO: just last slice need to send task state?
-        socket.send_multipart(
+        messenger.send(
             [
                 str(MessageType.TASK_STATE).encode("ascii"),
                 unique_rid.encode("ascii"),
@@ -550,8 +558,8 @@ class Sender:
             sync_status = "FAILED"
             agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
             self._get_tx_session(agent_args.unique_rid).state.status = SessionStatus.ERROR
-        socket = self._get_socket(agent_args.peer_endpoint)
-        socket.send_multipart(
+        messenger = self._get_or_connect_dealer(agent_args.peer_endpoint)
+        messenger.send(
             [
                 str(MessageType.AUX_SEND_STATE).encode("ascii"),
                 agent_args.unique_rid.encode("ascii"),
@@ -569,21 +577,20 @@ class Sender:
             trans_meta = task.extract_transfer_metadata(info)
             self.submit_task(trans_meta)
 
-    def _handle_sender_loop(self):
-        while True:
-            message = self._socket.recv_multipart()
-            send_id = message[0]
-            recv_message = message[1:]
+    def _start_listener(self):
+        def handle_message(messages: list[bytes]):
+            send_id = messages[0]
+            recv_message = messages[1:]
             if _message_is_termination(recv_message):
-                break
+                return False
             elif _message_is_request_data(recv_message):
                 self._respond_with_kv(send_id, recv_message)
             elif _message_is_register_rank_info(recv_message):
                 self._register_peer_rank(send_id, recv_message)
             else:
-                raise ValueError(
-                    f"transceiver sender loop received unknown message type: {recv_message[0]}"
-                )
+                raise ValueError(f"Sender received unknown message type: {recv_message[0]}")
+
+        self._messenger.start_listener(handle_message)
 
     def _register_peer_rank(self, send_id: bytes, message: list[bytes]):
         ri: RankInfo = RankInfo.from_bytes(message[1])
@@ -617,12 +624,11 @@ class Sender:
             return None
         return self._kv_tasks[unique_rid]
 
-    def _get_socket(self, endpoint: str):
+    def _get_or_connect_dealer(self, endpoint: str):
         if endpoint is None:
             raise ValueError("endpoint is None")
         if endpoint not in self._socket_cache:
-            self._socket_cache[endpoint] = self._zmq_context.socket(zmq.DEALER)
-            self._socket_cache[endpoint].connect(endpoint)
+            self._socket_cache[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._socket_cache[endpoint]
 
     def _save_peer_req_info(self, peer_transfer_req_info: GenReqInfo):
@@ -654,12 +660,11 @@ class Sender:
             if hasattr(self, "_background_thread"):
                 self._background_thread.join(timeout=5)
 
-            # Send termination message to stop _handle_sender_loop
-        term_socket = self._zmq_context.socket(zmq.DEALER)
-        term_socket.connect(self._endpoint)
-        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
-        self._sender_thread.join(timeout=5)
-        term_socket.close()
+        # Send termination message to stop _start_loop
+        stopper = ZMQMessenger(mode="DEALER", endpoint=self._messenger.endpoint)
+        stopper.send([str(MessageType.TERMINATION).encode("ascii")])
+        stopper.stop()
+        self._messenger.stop()
 
     def __del__(self):
         try:
@@ -816,43 +821,32 @@ class Receiver:
         self._receive_cache = {}
         self._receive_cache_lock = threading.Lock()
 
-        self._zmq_context = zmq.Context()
         self._socket_cache = {}
         self._ctx_ep_instance_map = {}
 
-        self._socket = self._zmq_context.socket(zmq.ROUTER)
-        self._socket.bind(f"tcp://{get_local_ip()}:*")
-        self._endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
-        self._receiver_background_thread = threading.Thread(
-            target=self._handle_receiver_loop, daemon=True
-        )
-        self._receiver_background_thread.start()
+        self._messenger = ZMQMessenger(mode="ROUTER")
+        self._start_listener()
 
         self._kv_tasks = {}  # unique_rid -> list[SliceReceiverTask]
 
         self._rx_sessions = {}  # unique_rid -> RxSession
         self._last_slice_counts = {}  # unique_rid -> int
         self._closed = False
-        logger.info(f" Receiver init  with endpoint: {self._endpoint}")
+        logger.info(f" Receiver init with endpoint: {self._messenger.endpoint}")
 
     @property
     def endpoint(self):
-        return self._endpoint
+        return self._messenger.endpoint
 
     def close(self):
-        if self._closed:
+        if not getattr(self, "_closed", False) or self._closed:
             return
         self._closed = True
-        logger.debug("Receiver.close() called")
 
-        # Send termination message to stop _handle_receiver_loop
-        term_socket = self._zmq_context.socket(zmq.DEALER)
-        term_socket.connect(self._endpoint)
-        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
-        self._receiver_background_thread.join(timeout=5)
-        term_socket.close()
-
-        logger.debug("Receiver.close() completed")
+        stopper = ZMQMessenger(mode="DEALER", endpoint=self._messenger.endpoint)
+        stopper.send([str(MessageType.TERMINATION).encode("ascii")])
+        stopper.stop()
+        self._messenger.stop()
 
     def async_receive_kv_slice(
         self, params: DisaggregatedParams, slice: KVSlice, aux_slot: int
@@ -896,7 +890,7 @@ class Receiver:
     def _async_request_data_transfer(self, slice_receiver_task: KVRecvTask):
         params = slice_receiver_task._params
         logger.debug(f"Preparing async data transfer request for disagg_params={params}")
-        context_peer_infos: InstanceInfo = self._get_context_info(params)
+        context_peer_infos: InstanceInfo = self._get_sender_info(params)
         gen_req = slice_receiver_task.create_transfer_req_info()
         if params.ctx_dp_rank is None:
             raise ValueError("ctx_dp_rank is None")
@@ -904,42 +898,38 @@ class Receiver:
         agent_args, target_ranks = slice_receiver_task.extract_transfer_metadata(
             context_peer_infos, ctx_dp_rank
         )
-
         self.submit_receive_task(agent_args)
         for rank in target_ranks:
             self._send_data_request(context_peer_infos.ctx_endpoints[rank], gen_req)
-
         return
 
     def _need_register_peer_in_first_request(self, params: DisaggregatedParams) -> bool:
         return params.ctx_info_endpoint not in self._ctx_ep_instance_map
 
-    def _get_socket(self, endpoint: str):
+    def _get_or_connect_dealer(self, endpoint: str):
+        if endpoint is None:
+            raise ValueError("endpoint is None")
         if endpoint not in self._socket_cache:
-            self._socket_cache[endpoint] = self._zmq_context.socket(zmq.DEALER)
-            self._socket_cache[endpoint].connect(endpoint)
+            self._socket_cache[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._socket_cache[endpoint]
 
-    def _get_context_info(self, params: DisaggregatedParams) -> InstanceInfo:
+    def _get_sender_info(self, params: DisaggregatedParams) -> InstanceInfo:
         if self._need_register_peer_in_first_request(params):
-            socket = self._zmq_context.socket(zmq.DEALER)
-            socket.connect(params.ctx_info_endpoint)
-            message = [str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")]
-            socket.send_multipart(message)
-            message = socket.recv_multipart()
-            ii = InstanceInfo.from_bytes(message[0])
-            logger.debug(f"Fetched InstanceInfo from context service: {ii}")
-            socket.close()
+            messenger = ZMQMessenger(mode="DEALER", endpoint=params.ctx_info_endpoint)
+            messenger.send([str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")])
+            message = messenger.receive()
+            sender_info = InstanceInfo.from_bytes(message[0])
+            messenger.stop()
 
-            for endpoint in ii.ctx_endpoints:
-                socket = self._get_socket(endpoint)
+            for endpoint in sender_info.ctx_endpoints:
+                messenger = self._get_or_connect_dealer(endpoint)
                 msg = []
                 msg.append(str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
                 msg.append(self._mapper.peer_registrar.rank_info.to_bytes())
-                socket.send_multipart(msg)
+                messenger.send(msg)
 
-            self._ctx_ep_instance_map[params.ctx_info_endpoint] = ii
-            return ii
+            self._ctx_ep_instance_map[params.ctx_info_endpoint] = sender_info
+            return sender_info
 
         else:
             return self._ctx_ep_instance_map[params.ctx_info_endpoint]
@@ -950,30 +940,20 @@ class Receiver:
             self._last_slice_counts[recv_meta.unique_rid] = 0
         self._kv_tasks[recv_meta.unique_rid][recv_meta.slice_id].status = TaskStatus.TRANSFERRING
 
-    def _handle_receiver_loop(self):
-        while True:
-            messages = self._socket.recv_multipart()
+    def _start_listener(self):
+        def handle_message(messages: list[bytes]) -> bool:
             send_id = messages[0]
             msg = messages[1:]
-            if self._message_is_termination(msg):
-                break
-            elif self._message_is_task_state(msg):
+            if _message_is_termination(msg):
+                return False
+            elif _message_is_task_state(msg):
                 self._handle_task_state(send_id, msg)
-            elif self._message_is_aux_send_state(msg):
+            elif _message_is_aux_send_state(msg):
                 self._handle_aux_send_state(send_id, msg)
             else:
-                raise ValueError(
-                    f"transceiver receiver loop received unknown message type: {messages[0]}"
-                )
+                raise ValueError(f"Sender received unknown message type: {msg[0]}")
 
-    def _message_is_termination(self, message: list[bytes]):
-        return message[0] == str(MessageType.TERMINATION).encode("ascii")
-
-    def _message_is_task_state(self, message: list[bytes]):
-        return message[0] == str(MessageType.TASK_STATE).encode("ascii")
-
-    def _message_is_aux_send_state(self, message: list[bytes]):
-        return message[0] == str(MessageType.AUX_SEND_STATE).encode("ascii")
+        self._messenger.start_listener(handle_message)
 
     def _handle_task_state(self, send_id: bytes, message: list[bytes]):
         assert len(message) == 5
@@ -1026,11 +1006,11 @@ class Receiver:
         logger.debug(
             f"Sending data request to endpoint '{endpoint}' with request info: {transfer_gen_side_req_info}"
         )
-        socket = self._get_socket(endpoint)
+        messenger = self._get_or_connect_dealer(endpoint)
         msg = []
         msg.append(str(MessageType.REQUEST_DATA).encode("ascii"))
         msg.append(transfer_gen_side_req_info.to_bytes())
-        socket.send_multipart(msg)
+        messenger.send(msg)
 
     def __del__(self):
         try:
@@ -1114,25 +1094,23 @@ class TransferAgentConfig:
 class InstanceInfoServer:
     def __init__(self, instance_info: InstanceInfo, addr: str = None, port: int = None):
         self._instance_info = instance_info
-
-        self._zmq_context = zmq.Context()
-        self._socket = self._zmq_context.socket(zmq.ROUTER)
         if addr is None and port is None:
-            self._socket.bind(f"tcp://{get_local_ip()}:*")
+            endpoint = f"tcp://{get_local_ip()}:*"
         else:
-            self._socket.bind(f"tcp://{addr}:{port}")
-        self._endpoint = self._socket.getsockopt(zmq.LAST_ENDPOINT).decode()
-        self._thread = threading.Thread(target=self._loop_handle_request, daemon=True)
-        self._thread.start()
+            endpoint = f"tcp://{addr}:{port}"
+        self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint)
+        self._start_listener()
         self._closed = False
 
     @property
     def endpoint(self) -> str:
-        return self._endpoint
+        return self._messenger.endpoint
 
+    """
     @endpoint.setter
     def endpoint(self, value) -> None:
-        self._endpoint = value
+        self._messenger.endpoint = value
+    """
 
     def close(self):
         if self._closed:
@@ -1140,35 +1118,28 @@ class InstanceInfoServer:
         self._closed = True
         logger.debug("InstanceInfoServer.close() called")
 
-        # Send termination message to stop _loop_handle_request
-        term_socket = self._zmq_context.socket(zmq.DEALER)
-        term_socket.connect(self._endpoint)
-        term_socket.send_multipart([str(MessageType.TERMINATION).encode("ascii")])
-        self._thread.join(timeout=5)
-        term_socket.close()
+        stopper = ZMQMessenger(mode="DEALER", endpoint=self._messenger.endpoint)
+        stopper.send([str(MessageType.TERMINATION).encode("ascii")])
+        stopper.stop()
+        self._messenger.stop()
 
-    def _loop_handle_request(self):
-        while True:
-            messages = self._socket.recv_multipart()
+    def _start_listener(self):
+        def handle_message(messages: list[bytes]) -> bool:
             send_id = messages[0]
             msg = messages[1:]
-            if self._is_termination(msg):
-                break
-            elif self._is_request_instance_info(msg):
+            if _message_is_termination(msg):
+                return False
+            elif _message_is_request_instance_info(msg):
                 self._handle_request_instance_info(send_id, msg)
             else:
                 raise ValueError(
                     f" instance info server received unknown message type: {messages[0]}"
                 )
 
-    def _is_termination(self, message: list[bytes]):
-        return message[0] == str(MessageType.TERMINATION).encode("ascii")
-
-    def _is_request_instance_info(self, message: list[bytes]):
-        return message[0] == str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")
+        self._messenger.start_listener(handle_message)
 
     def _handle_request_instance_info(self, send_id: bytes, message: list[bytes]):
-        self._socket.send_multipart([send_id, self._instance_info.to_bytes()])
+        self._messenger.send([send_id, self._instance_info.to_bytes()])
 
     def __del__(self):
         try:
