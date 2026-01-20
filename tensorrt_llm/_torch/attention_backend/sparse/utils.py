@@ -2,6 +2,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 from .dsa import DSACacheManager, DSATrtllmAttention
+from .mewtwo import MewtwoCacheManager
 from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
 
@@ -12,6 +13,8 @@ def get_sparse_attn_kv_cache_manager(
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
         return DSACacheManager
+    elif sparse_attn_config.algorithm == "mewtwo":
+        return MewtwoCacheManager
     elif sparse_attn_config.algorithm == "skip_softmax":
         return KVCacheManager
     else:

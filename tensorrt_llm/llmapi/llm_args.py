@@ -349,6 +349,28 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return self.skip_indexer_for_short_seqs
 
 
+class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """
+    Configuration for Mewtwo Sparse Attention.
+    """
+    algorithm: ClassVar[str] = "mewtwo"
+    skip_indexer_for_short_seqs: bool = Field(
+        default=False,
+        description=
+        "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # Mewtwo does not support short/long CUDA graph separation.
+        return False
+
+
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """
     Configuration for skip softmax attention.
@@ -2160,6 +2182,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
+        MewtwoSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
     ],
     Field(discriminator="algorithm"),

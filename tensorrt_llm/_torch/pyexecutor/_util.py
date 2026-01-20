@@ -64,6 +64,8 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     elif is_nemotron_hybrid(config) or is_qwen3_hybrid(config):
         return MambaHybridCacheManager
+    elif kv_cache_config.use_kv_cache_manager_v2:
+        return KVCacheManagerV2
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 
