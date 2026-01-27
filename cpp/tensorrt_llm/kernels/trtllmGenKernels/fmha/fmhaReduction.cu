@@ -32,8 +32,8 @@ namespace kernels
 
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
-__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params, bool sparseMla,
-    int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params,
+    int32_t mSparseMlaType, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -80,10 +80,14 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(Kerne
     int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
     // Consider the causal-mask speculative decoding.
     seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
-    // Consider sparseMlaTopK.
-    if (sparseMla)
+    // Consider sparsel mla kernels.
+    if (mSparseMlaType == 1)
     {
         seqLenKv = min(seqLenKv, params.mSparseMlaTopK);
+    }
+    else if (mSparseMlaType == 2)
+    {
+        seqLenKv = params.ptrSparseMlaTopKLens[seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ];
     }
     // The actual number of CtasKv (TileSizeKv is always 128 for now).
     int32_t numCtasKv{min((seqLenKv + 127) / 128, params.mMaxNumCtasKv)};
@@ -322,8 +326,10 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
     // This should only be enabled when the keepsMmaAbForGeneration MLA kernel (either 1-CTA or 2-CTA)
     // is used.
-    TLLM_CHECK_WITH_INFO(kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512
-            && isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
+    bool const head_dim_supported = (kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512)
+        || (kernelMeta.mHeadDimQk == 512 && kernelMeta.mHeadDimV == 512);
+    TLLM_CHECK_WITH_INFO(
+        head_dim_supported && isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
         "Not implemented");
     // The tileSizeQ and tileSizeKv should be 64 and 128 for those kernels.
     TLLM_CHECK_WITH_INFO(kernelMeta.mTileSizeQ == 64 && kernelMeta.mTileSizeKv == 128, "Not implemented");
@@ -372,7 +378,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
+    void (*kernel)(KernelParams const, int32_t, int32_t, int32_t, int32_t) = nullptr;
     if (headDimPerCtaV == 128)
     {
         SELECT_FMHA_REDUCTION_KERNEL(128);
@@ -388,7 +394,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
     // Launch the kernel.
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-        &config, kernel, params, kernelMeta.mSparseMla, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
+        &config, kernel, params, kernelMeta.mSparseMlaType, numCtasForReduction, numCtasForAllHeads, numHeadDimCtasV));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -970,11 +970,22 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-        params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
-        params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
-        params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-        params.helix_position_offsets, params.absorption_mode);
+    if (params.meta.rope_append)
+    {
+        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
+            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
+            params.helix_position_offsets, params.absorption_mode);
+    }
+    else
+    {
+        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
+            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
+            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
+            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
+            params.helix_position_offsets, params.absorption_mode);
+    }
 }
 
 template <typename T>
@@ -1056,6 +1067,10 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     auto seq_len = params.acc_q_len / params.batch_size;
 
     auto* kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>;
+    if (!params.meta.rope_append)
+    {
+        kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 448, 64, KVCacheBuffer>;
+    }
     cudaLaunchConfig_t config;
     config.gridDim = grid;
     config.blockDim = 256;

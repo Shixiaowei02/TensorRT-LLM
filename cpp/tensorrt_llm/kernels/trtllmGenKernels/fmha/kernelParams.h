@@ -152,6 +152,9 @@ struct KernelParams
     int32_t* ptrReservedBuffer;
     // The softmax stats buffer.
     float2* ptrSoftmaxStats;
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* ptrSparseMlaTopKLens;
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
@@ -771,7 +774,7 @@ struct KernelParams
 
         // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
         // headDimQk).
-        if (options.mSparseMla)
+        if (isSparseMlaEnabled(options.mSparseMlaType))
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -859,6 +862,9 @@ struct KernelParams
         params.ptrScaleSfKv = options.kvSfScalePtr;
         params.ptrScaleSfO = options.oSfScalePtr;
 
+        // The variable sparseMla topK lengths
+        params.ptrSparseMlaTopKLens = options.ptrSparseMlaTopKLens;
+
         // The softmax stats buffer with shape of [numTokensQ x numHeadsQ].
         // The max/sum values are packed into float2.
         params.ptrSoftmaxStats = options.softmaxStatsPtr;
@@ -901,8 +907,8 @@ struct KernelParams
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
-        TLLM_CHECK_WITH_INFO(
-            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
+        TLLM_CHECK_WITH_INFO(!isSparseMlaEnabled(options.mSparseMlaType) || (options.mSparseMlaTopK % 4) == 0,
+            "SparseMlaTopK must be a multiple of 4");
         params.mSparseMlaTopK = options.mSparseMlaTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
         // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

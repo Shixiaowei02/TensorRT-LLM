@@ -80,6 +80,7 @@ class TrtllmAttentionWrapper:
     qk_rope_head_dim: Optional[int]
     qk_nope_head_dim: Optional[int]
     v_head_dim: Optional[int]
+    rope_append: Optional[bool]
     chunked_prefill_buffer_batch_size: Optional[int]
     attention_chunk_size: Optional[int]
     softmax_stats_tensor: Optional[torch.Tensor]
@@ -93,6 +94,7 @@ class TrtllmAttentionWrapper:
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
     helix_position_offsets: Optional[torch.Tensor]
     helix_is_inactive_rank: Optional[torch.Tensor]
+    sparse_mla_topk_lens: Optional[torch.Tensor]
     attention_input_type: Optional[torch.Tensor]
     quant_config: Optional[QuantConfig]
     kv_cache_manager: Optional[KVCacheManager]
@@ -134,6 +136,7 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.qk_rope_head_dim = mla_params.qk_rope_head_dim
             self.v_head_dim = mla_params.v_head_dim
+            self.rope_append = mla_params.rope_append
             self.predicted_tokens_per_seq = mla_params.predicted_tokens_per_seq
         else:
             self.q_lora_rank = None
@@ -141,6 +144,7 @@ class TrtllmAttentionWrapper:
             self.qk_nope_head_dim = None
             self.qk_rope_head_dim = None
             self.v_head_dim = None
+            self.rope_append = None
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
@@ -240,6 +244,7 @@ class TrtllmAttentionWrapper:
         sparse_attn_offsets: Optional[torch.Tensor] = None,
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
+        sparse_mla_topk_lens: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
@@ -289,6 +294,7 @@ class TrtllmAttentionWrapper:
             sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
             sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
             sparse_mla_topk (int): The topk for the sparse MLA, used by DSA attention.
+            sparse_mla_topk_lens (torch.Tensor): The per-token topk lengths for sparse MLA, with shape (num_tokens) on GPU.
             skip_softmax_threshold_scale_factor_prefill (float): The scale factor for the skip softmax threshold in prefill phase.
             skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
@@ -339,6 +345,7 @@ class TrtllmAttentionWrapper:
         self.sparse_attn_offsets = sparse_attn_offsets
         self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         self.sparse_mla_topk = sparse_mla_topk
+        self.sparse_mla_topk_lens = sparse_mla_topk_lens
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
 
@@ -371,7 +378,11 @@ class TrtllmAttentionWrapper:
             out_dtype = q.dtype
         v_head_size = self.head_size
         if self.is_mla_enable:
-            v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
+            if is_gen_only:
+                v_head_size = self.kv_lora_rank if self.rope_append else (
+                    self.kv_lora_rank + self.qk_rope_head_dim)
+            else:
+                v_head_size = self.v_head_dim
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -698,6 +709,7 @@ class TrtllmAttentionWrapper:
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
                 self.v_head_dim,
+                self.rope_append,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
                 helix_tensor_params,
@@ -711,6 +723,7 @@ class TrtllmAttentionWrapper:
                 self.sparse_attn_offsets,
                 self.sparse_attn_indices_block_size,
                 self.sparse_mla_topk,
+                self.sparse_mla_topk_lens,
                 self.skip_softmax_threshold_scale_factor_prefill,
                 self.skip_softmax_threshold_scale_factor_decode,
                 self.skip_softmax_stat,
@@ -1936,6 +1949,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_attn_indices_block_size = 1
         skip_softmax_threshold_scale_factor_prefill = None
         skip_softmax_threshold_scale_factor_decode = None
+        sparse_lens = kwargs.pop("sparse_lens", None)
+        sparse_mla_topk_lens = None
         if self.sparse_attention_config is not None:
             if isinstance(self.sparse_attention_config,
                           SkipSoftmaxAttentionConfig):
@@ -1960,6 +1975,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and not metadata._flash_mla_metadata_valid):
             self._compute_flash_mla_metadata(metadata)
             metadata._flash_mla_metadata_valid = True
+
+        # TODO(yuhangh): need to refactor this part of code.
+        is_variable_sparse_mla = (self.is_mla_enable
+                                  and self.sparse_attention_config is not None
+                                  and self.wrapper.rope_append is False)
+        if is_variable_sparse_mla and sparse_attn_indices is not None:
+            if sparse_lens is None:
+                sparse_lens = (sparse_attn_indices >= 0).sum(dim=-1,
+                                                             dtype=torch.int32)
+            if sparse_lens.dim() != 1:
+                raise ValueError(
+                    "sparse_lens must be a 1D tensor with shape [num_tokens]")
+            sparse_mla_topk_lens = sparse_lens
 
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
@@ -2025,6 +2053,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
                 metadata, 'sparse_mla_topk') else 0,
+            sparse_mla_topk_lens=sparse_mla_topk_lens,
             skip_softmax_threshold_scale_factor_prefill=
             skip_softmax_threshold_scale_factor_prefill,
             skip_softmax_threshold_scale_factor_decode=
@@ -2354,4 +2383,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.wrapper.qk_nope_head_dim,
             self.wrapper.qk_rope_head_dim,
             self.wrapper.v_head_dim,
+            self.wrapper.rope_append,
         )

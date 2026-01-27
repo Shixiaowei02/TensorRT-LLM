@@ -163,7 +163,7 @@ public:
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int mSparseMlaType, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -191,16 +191,16 @@ public:
         // Bit 49 - 52: (log2(tileSizeQ)).
         // Bit 53 - 53: reuseSmemKForV.
         // Bit 54 - 54: uses2CtaMma.
-        // Bit 55 - 55: sparseMla.
-        // Bit 56 - 56: skipsSoftmax.
+        // Bit 55 - 58: mSparseMlaType.
+        // Bit 59 - 59: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
             | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(log2(numTokensPerPage)) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
-            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 56);
+            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(mSparseMlaType) << 55)
+            | (static_cast<uint64_t>(skipsSoftmax) << 59);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -208,7 +208,7 @@ public:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseMla, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseMlaType, kernelMeta.mSkipsSoftmaxWhenPossible);
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -364,14 +364,14 @@ private:
     // Is it MLA generation kernel ?
     inline bool isMlaGenKernel(RunnerParams const& params) const
     {
-        return params.mHeadDimQk == 576 && params.mHeadDimV == 512;
+        return (params.mHeadDimQk == 576 || params.mHeadDimQk == 512) && params.mHeadDimV == 512;
     }
 
     void computeNumCtas(CtaLaunchParams& ctaLaunchParams, RunnerParams const& params, KernelMeta const& kernelMeta,
         SelectKernelParams& selectKernelParams) const
     {
         bool isDsv3MinLatencyMode = params.mBatchSize == 1 && params.mMaxSeqLenQ >= 1 && params.mMaxSeqLenQ <= 16
-            && params.mHeadDimQk == 576 && params.mHeadDimV == 512;
+            && (params.mHeadDimQk == 576 || params.mHeadDimQk == 512) && params.mHeadDimV == 512;
         // Do we need to select a new kernel ?
         selectKernelParams.mSelectNewKernel = false;
 
@@ -429,7 +429,7 @@ private:
             // The maximum attention window (the maximum number of tokensKv that will be attended to).
             int maxAttentionWindow{params.mMaxSeqLenKv};
             // The sparseMla only selects topK tokensKv.
-            if (params.mSparseMla)
+            if (isSparseMlaEnabled(params.mSparseMlaType))
             {
                 maxAttentionWindow = std::min(params.mMaxSeqLenKv, params.mSparseMlaTopK);
             }
@@ -468,8 +468,9 @@ private:
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
             }
-            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) && !params.mSparseMla
-                && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
+            else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
+                && isSparseMlaEnabled(params.mSparseMlaType) && selectKernelParams.mTileSizeKv == 128
+                && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
             {
                 // Use smaller tileSizeKv to fully utilize the SMs.
                 selectKernelParams.mTileSizeKv = 64;
@@ -581,8 +582,7 @@ private:
         int& tileSizeQ = selectKernelParams.mTileSizeQ;
 
         // Check the conditions.
-        if (params.mNumHeadsQPerKv <= 32 || (params.mSparseMla && params.mNumHeadsQPerKv < 128)
-            || useSwapsMmaAbMlaGenKernel(params))
+        if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params))
         {
             kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             // Currently, only tileSizeQ = 8 or 16 are supported.
@@ -599,11 +599,14 @@ private:
             {
                 selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
             }
-            // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128.
-            TLLM_CHECK_WITH_INFO(!params.mSparseMla || params.mNumHeadsQPerKv == 128,
-                "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128, got %d",
+            // The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128 or 64.
+            TLLM_CHECK_WITH_INFO(isSparseMlaEnabled(params.mSparseMlaType) || params.mNumHeadsQPerKv == 128
+                    || params.mNumHeadsQPerKv == 64,
+                "The keepsMmaAbForGeneration sparseMla kernels only support numHeadsQPerKv = 128 or 64, got %d",
                 params.mNumHeadsQPerKv);
             // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
+            // For mNumHeadsQPerKv = 64, we use the 1CTA keepsMmaAbForGeneration kernel and the mHeadDimPerCtaV will be
+            // fine-tuned later.
             if (params.mNumHeadsQPerKv == 128)
             {
                 selectKernelParams.mUses2CtaMma = true;
@@ -838,7 +841,7 @@ private:
         }
 
         // SparseMla kernels use a fixed numTokensPerPage = 1.
-        if (params.mSparseMla)
+        if (isSparseMlaEnabled(params.mSparseMlaType))
         {
             selectKernelParams.mNumTokensPerPage = 1;
         }
@@ -866,8 +869,9 @@ private:
             + ", tileSizeQ=" + std::to_string(selectKernelParams.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv)
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
+            + ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -878,7 +882,8 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-                selectKernelParams.mUses2CtaMma, params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseMlaType),
+                selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 

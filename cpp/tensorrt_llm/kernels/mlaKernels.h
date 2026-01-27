@@ -41,11 +41,12 @@ struct MlaMetaParams
     int32_t v_head_dim = 0;
     int32_t predicted_tokens_per_seq = 1;
     int32_t num_layers = 0;
+    int32_t rope_append = 1;
 
     auto data() const
     {
         return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-            predicted_tokens_per_seq, num_layers);
+            predicted_tokens_per_seq, num_layers, rope_append);
     }
 };
 

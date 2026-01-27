@@ -769,7 +769,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        dim_v_per_head = mMLAParams.kv_lora_rank;
+        dim_v_per_head
+            = mMLAParams.rope_append ? mMLAParams.kv_lora_rank : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
@@ -875,7 +876,9 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
             int num_q_heads = mNumHeads / mCpSize;
             int num_kv_heads = mNumKVHeads;
-            int head_size_v = mMLAParams.kv_lora_rank;
+            int head_size_v = (mUseSparseAttention && !mMLAParams.rope_append)
+                ? mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim
+                : mMLAParams.kv_lora_rank;
 
             int num_sm_parts = getFlashMlaNumSmParts(s_q, num_q_heads, num_kv_heads, head_size_v);
 
@@ -997,6 +1000,7 @@ int AttentionOp::mlaGeneration(
 
     int const num_kv_heads = 1;
     int const head_size = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+    int const head_size_v = (useSparseMLA() && !mMLAParams.rope_append) ? head_size : mMLAParams.kv_lora_rank;
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
 
     // The element size of the KV cache.
@@ -1078,8 +1082,8 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
 
         // MLA uses different head dimensions for Qk and V.
-        tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        tllmRunnerParams.mHeadDimV = mMLAParams.kv_lora_rank;
+        tllmRunnerParams.mHeadDimQk = head_size;
+        tllmRunnerParams.mHeadDimV = head_size_v;
 
         auto const num_q_heads = mNumAttnHeads;
         tllmRunnerParams.mNumHeadsQ = num_q_heads;
@@ -1123,7 +1127,18 @@ int AttentionOp::mlaGeneration(
         // Set the following parameters if sparseMLA is used.
         if (useSparseMLA())
         {
-            tllmRunnerParams.mSparseMla = true;
+            if (head_size_v == head_size)
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::VariableTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_mla_topk_lens;
+                TLLM_CHECK_WITH_INFO(tllmRunnerParams.ptrSparseMlaTopKLens != nullptr,
+                    "Sparse MLA variable topK lengths must be provided when SparseMlaType::VariableTopKLens is used.");
+            }
+            else
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::FixedTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = nullptr;
+            }
             tllmRunnerParams.mSparseMlaTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
@@ -1409,7 +1424,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     {
         dim_q_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         dim_k_per_head = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        dim_v_per_head = mMLAParams.kv_lora_rank;
+        dim_v_per_head
+            = mMLAParams.rope_append ? mMLAParams.kv_lora_rank : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
     }
 
     // Total dimension per token across all heads for Q, K, and V components respectively
@@ -2650,8 +2666,12 @@ int AttentionOp::initialize() noexcept
         TLLM_CHECK_WITH_INFO(!mCrossAttention, "MLA(Deepseek v2) do not support cross attention right now");
         TLLM_CHECK_WITH_INFO(mMaskType != tensorrt_llm::kernels::AttentionMaskType::CUSTOM_MASK,
             "MLA(Deepseek v2) do not support custom mask right now");
-        TLLM_CHECK_WITH_INFO(mMLAParams.qk_rope_head_dim == 64 && mMLAParams.kv_lora_rank == 512,
-            "MLA(Deepseek v2) only support fixed kv_lora_rank(512) and fixed qk_rope_head_dim(64) right now.");
+        bool const mla_dims_supported = mMLAParams.qk_rope_head_dim == 64
+            && ((mMLAParams.rope_append && mMLAParams.kv_lora_rank == 512)
+                || (!mMLAParams.rope_append && mMLAParams.kv_lora_rank == 448));
+        TLLM_CHECK_WITH_INFO(mla_dims_supported,
+            "MLA(Deepseek v2) only supports qk_rope_head_dim=64 with kv_lora_rank=512 (rope_append=true) or "
+            "kv_lora_rank=448 (rope_append=false).");
     }
 
     mDriver = CUDADriverWrapper::getInstance();
@@ -2764,7 +2784,8 @@ int AttentionOp::initialize() noexcept
                 fmhaParams.attentionInputLayout = AttentionInputLayout::Q_PAGED_KV;
                 fmhaParams.numKvHeads = 1;
                 fmhaParams.headSize = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-                fmhaParams.headSizeV = mMLAParams.kv_lora_rank;
+                fmhaParams.headSizeV = mMLAParams.rope_append ? mMLAParams.kv_lora_rank
+                                                              : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
                 fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
                 // Adjust the qScaling for the absorption mode.
                 fmhaParams.qScaling = mQScaling

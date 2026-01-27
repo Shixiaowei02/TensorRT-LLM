@@ -123,7 +123,14 @@ bool FmhaDispatcher::isSupported()
         // Set the kernel type and mask type if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
         {
-            tllmRunnerParams.mSparseMla = true;
+            if (mFixedParams.headSizeV == mFixedParams.headSize)
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::VariableTopKLens;
+            }
+            else
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::FixedTopKLens;
+            }
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
@@ -234,7 +241,18 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set the sparse attention parameters if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
         {
-            tllmRunnerParams.mSparseMla = true;
+            if (mFixedParams.headSizeV == mFixedParams.headSize)
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::VariableTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
+                TLLM_CHECK_WITH_INFO(tllmRunnerParams.ptrSparseMlaTopKLens != nullptr,
+                    "Sparse MLA variable topK lengths must be provided when SparseMlaType::VariableTopKLens is used.");
+            }
+            else
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::FixedTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = nullptr;
+            }
             tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
