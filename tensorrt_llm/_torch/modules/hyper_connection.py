@@ -6,6 +6,8 @@ import tilelang
 import tilelang.language as T
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 from torch.nn.parameter import Parameter
 
@@ -261,6 +263,187 @@ def mhc_post_tilelang(
             T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
 
 
+# Triton kernels for mHC
+@triton.jit
+def mhc_pre_gemm_sqrsum_triton_kernel(
+    x_ptr,
+    fn_ptr,
+    out_ptr,
+    sqrsum_ptr,
+    num_tokens,
+    hc_mult3,
+    hc_hidden_size,
+    BLOCK_H: tl.constexpr,
+):
+    """Triton kernel computing one output element per program."""
+    # Each program computes one element
+    pid = tl.program_id(0)
+    token_idx = pid // hc_mult3
+    n_idx = pid % hc_mult3
+
+    if token_idx >= num_tokens:
+        return
+
+    # Accumulate dot product
+    acc = 0.0
+    sqr_acc = 0.0
+
+    h_idx = 0
+    while h_idx < hc_hidden_size:
+        h_offsets = h_idx + tl.arange(0, BLOCK_H)
+        h_mask = h_offsets < hc_hidden_size
+
+        # Load x values
+        x_offsets = token_idx * hc_hidden_size + h_offsets
+        x_vals = tl.load(x_ptr + x_offsets, mask=h_mask, other=0.0).to(tl.float32)
+
+        # Load fn weights
+        fn_offsets = n_idx * hc_hidden_size + h_offsets
+        fn_vals = tl.load(fn_ptr + fn_offsets, mask=h_mask, other=0.0).to(tl.float32)
+
+        # Accumulate
+        acc += tl.sum(x_vals * fn_vals)
+
+        # Compute sqrsum for first channel only
+        if n_idx == 0:
+            sqr_acc += tl.sum(x_vals * x_vals)
+
+        h_idx += BLOCK_H
+
+    # Store output
+    out_offset = token_idx * hc_mult3 + n_idx
+    tl.store(out_ptr + out_offset, acc)
+
+    # Store sqrsum for first channel only
+    if n_idx == 0:
+        tl.store(sqrsum_ptr + token_idx, sqr_acc)
+
+
+@triton.jit
+def mhc_post_triton_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    d_ptr,
+    x_ptr,
+    num_tokens,
+    hc,
+    hidden,
+    BLOCK_H: tl.constexpr,
+):
+    """Optimized Triton kernel for mHC post mapping.
+    Computes: result = post * x + comb.mT @ residual
+    Each program handles one (token, hc_out) combination.
+    """
+    pid = tl.program_id(0)
+
+    token_idx = pid // hc
+    i_hco = pid % hc
+
+    if token_idx >= num_tokens:
+        return
+
+    # Load c value once for this output channel
+    c_val = tl.load(c_ptr + token_idx * hc + i_hco)
+
+    # Process hidden dimension in blocks
+    for h_block in range(tl.cdiv(hidden, BLOCK_H)):
+        h_start = h_block * BLOCK_H
+        h_offsets = h_start + tl.arange(0, BLOCK_H)
+        h_mask = h_offsets < hidden
+
+        # Load d values for this hidden block
+        d_offsets = token_idx * hidden + h_offsets
+        d_vals = tl.load(d_ptr + d_offsets, mask=h_mask, other=0.0).to(tl.float32)
+
+        # Compute term1: c * d
+        x_val = c_val * d_vals
+
+        # Compute term2: sum over i_hci of a[token, i_hci, i_hco] * b[token, i_hci, h]
+        for i_hci in range(hc):
+            a_offset = token_idx * hc * hc + i_hci * hc + i_hco
+            a_val = tl.load(a_ptr + a_offset)
+
+            b_offsets = token_idx * hc * hidden + i_hci * hidden + h_offsets
+            b_vals = tl.load(b_ptr + b_offsets, mask=h_mask, other=0.0).to(tl.float32)
+
+            x_val += a_val * b_vals
+
+        # Store result
+        x_offsets = token_idx * hc * hidden + i_hco * hidden + h_offsets
+        tl.store(x_ptr + x_offsets, x_val.to(tl.bfloat16), mask=h_mask)
+
+
+def mhc_pre_gemm_sqrsum_triton(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    hc_mult3: int,
+    hc_hidden_size: int,
+):
+    """Triton kernel for fused gemm and sqrsum in mHC pre block."""
+    # x: [num_tokens, hc_hidden_size]
+    # fn: [hc_mult3, hc_hidden_size]
+    # Compute out = x @ fn.T and sqrsum = sum(x^2)
+
+    num_tokens = x.shape[0]
+
+    # Define block size for hidden dimension
+    BLOCK_H = 512
+
+    # Launch one program per output element
+    grid = (num_tokens * hc_mult3,)
+
+    mhc_pre_gemm_sqrsum_triton_kernel[grid](
+        x,
+        fn,
+        out,
+        sqrsum,
+        num_tokens,
+        hc_mult3,
+        hc_hidden_size,
+        BLOCK_H=BLOCK_H,
+    )
+
+
+def mhc_post_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+    x: torch.Tensor,
+    hc: int,
+    hidden: int,
+):
+    """Triton kernel for mHC post mapping."""
+    # a: comb_res_mix [num_tokens, hc, hc]
+    # b: residual [num_tokens, hc, hidden]
+    # c: post_layer_mix [num_tokens, hc]
+    # d: x (layer output) [num_tokens, hidden]
+    # x: output [num_tokens, hc, hidden]
+
+    num_tokens = a.shape[0]
+
+    # Define block size for hidden dimension
+    BLOCK_H = 256  # Larger block for better memory coalescing
+
+    # Launch one program per (token, hc_out) combination
+    grid = (num_tokens * hc,)
+
+    mhc_post_triton_kernel[grid](
+        a,
+        b,
+        c,
+        d,
+        x,
+        num_tokens,
+        hc,
+        hidden,
+        BLOCK_H=BLOCK_H,
+    )
+
+
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
     x = x.softmax(-1) + eps
     x = x / (x.sum(-2, keepdim=True) + eps)
@@ -437,6 +620,61 @@ class mHC(nn.Module):
             comb_mix = comb_mix.view(*outer_shape, self.mult, self.mult)
             layer_input = layer_input.view(*outer_shape, self.hidden_size)
             return post_mix, comb_mix, layer_input
+        elif self.backend == "triton":
+            assert x.dtype == torch.bfloat16
+            assert self.mult == x.shape[-2]
+            assert self.hidden_size == x.shape[-1]
+            hc_mult2 = self.mult * self.mult
+            hc_mult3 = self.mult * 2 + hc_mult2
+
+            hc_hidden_size = self.mult * self.hidden_size
+            assert self.fn.shape[0] == hc_mult3
+            assert self.fn.shape[1] == hc_hidden_size
+            assert self.scale.shape == (3,)
+            assert self.base.shape == (hc_mult3,)
+
+            outer_shape = x.shape[:-2]
+
+            residual_flat = x.view(-1, self.mult, self.hidden_size)
+            num_tokens = residual_flat.shape[0]
+            fn_flat = self.fn
+
+            gemm_out = torch.empty(num_tokens, hc_mult3, dtype=torch.float32, device=x.device)
+            gemm_sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=x.device)
+
+            mhc_pre_gemm_sqrsum_triton(
+                residual_flat.view(num_tokens, self.mult * self.hidden_size),
+                fn_flat,
+                gemm_out,
+                gemm_sqrsum,
+                hc_mult3,
+                self.mult * self.hidden_size,
+            )
+
+            mixes = gemm_out * (gemm_sqrsum.unsqueeze(-1) / hc_hidden_size + self.norm_eps).rsqrt()
+
+            scale = torch.cat(
+                [
+                    self.scale[0].expand(self.mult),
+                    self.scale[1].expand(self.mult),
+                    self.scale[2].expand(self.mult * self.mult),
+                ],
+            )
+            mixes = mixes * scale + self.base
+            pre_mix = mixes[:, : self.mult].sigmoid().unsqueeze(-1) + self.eps
+            post_mix = (
+                mixes[:, self.mult : 2 * self.mult].sigmoid() * self.post_mult_value
+            ).unsqueeze(-1)
+            res_mix = mixes[:, 2 * self.mult :].view(-1, self.mult, self.mult)
+            res_mix = sinkhorn_normalize_ref(
+                res_mix, repeat=self.sinkhorn_iters, eps=self.sinkhorn_eps
+            )
+            layer_input = (residual_flat.float() * pre_mix).sum(-2).bfloat16()
+
+            post_mix = post_mix.view(*outer_shape, self.mult, 1)
+            comb_mix = res_mix.view(*outer_shape, self.mult, self.mult)
+            layer_input = layer_input.view(*outer_shape, self.hidden_size)
+            return post_mix, comb_mix, layer_input
 
     def post_mapping(
         self,
@@ -462,6 +700,29 @@ class mHC(nn.Module):
                 residual.shape[-1],
             )
             return out
+        elif self.backend == "triton":
+            outer_shape = residual.shape[:-2]
+            residual_flat = residual.view(-1, residual.shape[-2], residual.shape[-1])
+            x_flat = x.view(-1, x.shape[-1])
+            comb_flat = comb_res_mix.view(-1, comb_res_mix.shape[-2], comb_res_mix.shape[-1])
+            post_flat = post_layer_mix.view(-1, post_layer_mix.shape[-2])
+
+            hc = residual_flat.shape[-2]
+            hidden = residual_flat.shape[-1]
+
+            out = torch.empty_like(residual_flat)
+
+            mhc_post_triton(
+                comb_flat,
+                residual_flat,
+                post_flat,
+                x_flat,
+                out,
+                hc,
+                hidden,
+            )
+
+            return out.view(*outer_shape, hc, hidden)
 
 
 class HCHead(nn.Module):
@@ -471,7 +732,7 @@ class HCHead(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         norm_eps: float = 1e-6,
-        backend: str = "vanilla",
+        backend: str = "tilelang",
     ):
         super().__init__()
         self.mult = mult
@@ -510,6 +771,25 @@ class HCHead(nn.Module):
             d = torch.empty((gemm_m, gemm_n), dtype=torch.float, device=x.device)
             s = torch.empty((gemm_m,), dtype=torch.float, device=x.device)
             mhc_pre_gemm_sqrsum_tilelang(
+                x_flat,
+                self.fn,
+                d,
+                s,
+                self.mult,
+                self.mult * self.hidden_size,
+            )
+            mixes = d * (s.unsqueeze(-1) / gemm_k + self.norm_eps).rsqrt()
+            pre = torch.sigmoid(mixes * self.scale + self.base) + self.eps
+            y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=2)
+            return y.to(dtype)
+        elif self.backend == "triton":
+            shape, dtype = x.size(), x.dtype
+            x_flat = x.flatten(-2, -1).to(torch.bfloat16)
+            gemm_m = x_flat.shape[0]
+            gemm_n, gemm_k = self.fn.shape
+            d = torch.empty((gemm_m, gemm_n), dtype=torch.float, device=x.device)
+            s = torch.empty((gemm_m,), dtype=torch.float, device=x.device)
+            mhc_pre_gemm_sqrsum_triton(
                 x_flat,
                 self.fn,
                 d,

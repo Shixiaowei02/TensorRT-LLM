@@ -32,7 +32,7 @@ def parse_requirements(filename: os.PathLike):
         deps = []
         for line in requirements:
             if line.startswith("#") or line.startswith("-r") or line.startswith(
-                    "-c"):
+                    "-c") or line.startswith("-f"):
                 continue
 
             # handle -i and --extra-index-url options

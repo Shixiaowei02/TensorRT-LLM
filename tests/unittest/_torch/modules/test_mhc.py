@@ -1,8 +1,14 @@
 # Copied and modified from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_mhc
+import time
+from collections import defaultdict
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.hyper_connection import HCHead, mHC
+
+# Global dictionary to store timing statistics
+timing_stats = defaultdict(lambda: {"total_time": 0.0, "count": 0, "times": []})
 
 
 def generate_pre_data(
@@ -98,7 +104,7 @@ def generate_head_data(
 @pytest.mark.parametrize("n", [512, 1024, 2048, 8192])
 @pytest.mark.parametrize("hidden_size", [1280, 2560, 4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["deepgemm", "tilelang"])
+@pytest.mark.parametrize("backend", ["vanilla", "deepgemm", "tilelang", "triton"])
 def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_pre_data(
         n=n,
@@ -106,6 +112,7 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         hidden_size=hidden_size,
     )
 
+    # Create vanilla reference for comparison
     ref_module = mHC(
         mult=hc_mult,
         hidden_size=hidden_size,
@@ -134,22 +141,39 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
 
-    # Test on pre-mapping
-    post_mix_fused, comb_mix_fused, layer_input_fused = ref_module.pre_mapping(
-        test_data["residual"]
-    )
-    post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(test_data["residual"])
+    # Warm up both vanilla and test modules
+    for _ in range(10):
+        ref_module.pre_mapping(test_data["residual"])
+        test_module.pre_mapping(test_data["residual"])
+    torch.cuda.synchronize()
 
-    # Compare outputs
-    torch.testing.assert_close(post_mix_fused, post_mix_ref)
-    torch.testing.assert_close(comb_mix_fused, comb_mix_ref)
-    torch.testing.assert_close(layer_input_fused, layer_input_ref)
+    # Timing with 100 iterations
+    for _ in range(100):
+        start_time = time.perf_counter()
+        post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(test_data["residual"])
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+
+        # Record timing with shape information
+        test_key = f"pre_mapping_{backend}_{n}_{hidden_size}"
+        timing_stats[test_key]["total_time"] += elapsed
+        timing_stats[test_key]["count"] += 1
+        timing_stats[test_key]["times"].append(elapsed)
+
+    # Compare outputs with vanilla backend
+    if backend != "vanilla":
+        post_mix_vanilla, comb_mix_vanilla, layer_input_vanilla = ref_module.pre_mapping(
+            test_data["residual"]
+        )
+        torch.testing.assert_close(post_mix_vanilla, post_mix_ref)
+        torch.testing.assert_close(comb_mix_vanilla, comb_mix_ref)
+        torch.testing.assert_close(layer_input_vanilla, layer_input_ref)
 
 
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("hidden_size", [1280, 2560, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["deepgemm", "tilelang"])
+@pytest.mark.parametrize("backend", ["vanilla", "deepgemm", "tilelang", "triton"])
 def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_post_data(
         n=n,
@@ -157,22 +181,40 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         hidden_size=hidden_size,
     )
 
+    # Create vanilla reference for comparison
     ref_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend="vanilla")
 
     test_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend=backend)
 
-    # Test on pre-mapping
-    output_ref = ref_module.post_mapping(**test_data)
-    output = test_module.post_mapping(**test_data)
+    # Warm up both vanilla and test modules
+    for _ in range(10):
+        ref_module.post_mapping(**test_data)
+        test_module.post_mapping(**test_data)
+    torch.cuda.synchronize()
 
-    # Compare outputs
-    torch.testing.assert_close(output_ref, output)
+    # Timing with 100 iterations
+    for _ in range(100):
+        start_time = time.perf_counter()
+        output = test_module.post_mapping(**test_data)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+
+        # Record timing with shape information
+        test_key = f"post_mapping_{backend}_{n}_{hidden_size}"
+        timing_stats[test_key]["total_time"] += elapsed
+        timing_stats[test_key]["count"] += 1
+        timing_stats[test_key]["times"].append(elapsed)
+
+    # Compare outputs with vanilla backend
+    if backend != "vanilla":
+        output_ref = ref_module.post_mapping(**test_data)
+        torch.testing.assert_close(output_ref, output)
 
 
 @pytest.mark.parametrize("m", [1024, 4096])
 @pytest.mark.parametrize("hidden_size", [2560, 4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["tilelang"])
+@pytest.mark.parametrize("backend", ["vanilla", "tilelang", "triton"])
 def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_head_data(
         m=m,
@@ -190,12 +232,111 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
 
-    # Test on pre-mapping
-    output_ref = ref_module(test_data["x"])
-    output = test_module(test_data["x"])
+    # Warm up both vanilla and test modules
+    for _ in range(10):
+        ref_module(test_data["x"])
+        test_module(test_data["x"])
+    torch.cuda.synchronize()
 
-    # TileLang backend may have larger numerical differences due to bf16 GEMM
-    torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=1e-3)
+    # Timing with 100 iterations
+    for _ in range(100):
+        start_time = time.perf_counter()
+        output = test_module(test_data["x"])
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+
+        # Record timing with shape information
+        test_key = f"hc_head_{backend}_{m}_{hidden_size}"
+        timing_stats[test_key]["total_time"] += elapsed
+        timing_stats[test_key]["count"] += 1
+        timing_stats[test_key]["times"].append(elapsed)
+
+    # Compare outputs with vanilla backend
+    if backend != "vanilla":
+        output_ref = ref_module(test_data["x"])
+        # TileLang backend may have larger numerical differences due to bf16 GEMM
+        torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=1e-3)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def print_timing_stats():
+    """Fixture to print timing statistics at the end of test session."""
+    yield
+
+    if timing_stats:
+        print("\n" + "=" * 100)
+        print("Backend Performance Statistics (Time in microseconds)")
+        print("=" * 100)
+
+        # Group by test type and shape
+        test_shape_groups = {}
+        for key in timing_stats.keys():
+            parts = key.split("_")
+            # Extract test type (pre_mapping, post_mapping, hc_head) and shape params
+            if "pre_mapping" in key:
+                test_type = "pre_mapping"
+                shape_str = f"{parts[-2]}_{parts[-1]}"
+                shape_label = f"(n={parts[-2]}, hidden={parts[-1]})"
+            elif "post_mapping" in key:
+                test_type = "post_mapping"
+                shape_str = f"{parts[-2]}_{parts[-1]}"
+                shape_label = f"(n={parts[-2]}, hidden={parts[-1]})"
+            elif "hc_head" in key:
+                test_type = "hc_head"
+                shape_str = f"{parts[-2]}_{parts[-1]}"
+                shape_label = f"(m={parts[-2]}, hidden={parts[-1]})"
+            else:
+                continue
+
+            backend = parts[-3]
+
+            group_key = (test_type, shape_str, shape_label)
+            if group_key not in test_shape_groups:
+                test_shape_groups[group_key] = {}
+            test_shape_groups[group_key][backend] = timing_stats[key]
+
+        # Sort by test type, then by shape
+        for test_type, shape_str, shape_label in sorted(test_shape_groups.keys()):
+            print(f"\n{test_type.upper()} {shape_label}:")
+            print("-" * 100)
+
+            backends = test_shape_groups[(test_type, shape_str, shape_label)]
+            for backend in sorted(backends.keys()):
+                stats = backends[backend]
+                avg_time = stats["total_time"] / stats["count"] if stats["count"] > 0 else 0
+                min_time = min(stats["times"]) if stats["times"] else 0
+                max_time = max(stats["times"]) if stats["times"] else 0
+
+                # Convert to microseconds
+                print(
+                    f"  {backend:12s}: "
+                    f"avg={avg_time * 1e6:7.2f}us  "
+                    f"min={min_time * 1e6:7.2f}us  "
+                    f"max={max_time * 1e6:7.2f}us  "
+                    f"total={stats['total_time'] * 1e6:8.2f}us  "
+                    f"runs={stats['count']}"
+                )
+
+            avg_times = {b: s["total_time"] / s["count"] for b, s in backends.items()}
+
+            # Speedup relative to vanilla baseline
+            if len(backends) > 1 and "vanilla" in backends:
+                baseline = avg_times.get("vanilla", 0)
+                if baseline > 0:
+                    print("\n  Relative Performance (speedup vs vanilla):")
+                    for backend in sorted(backends.keys()):
+                        speedup = baseline / avg_times[backend]
+                        print(f"    {backend:12s}: {speedup:.2f}x")
+
+            # Calculate speedup relative to slowest backend
+            if len(backends) > 1:
+                print("\n  Relative Performance (speedup vs slowest):")
+                slowest_time = max(avg_times.values())
+                for backend in sorted(backends.keys()):
+                    speedup = slowest_time / avg_times[backend]
+                    print(f"    {backend:12s}: {speedup:.2f}x")
+
+        print("\n" + "=" * 100)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
 -c constraints.txt
---find-links https://github.com/Barry-Delaney/tilelang_wheels/raw/refs/heads/main/cu131/tilelang-0.1.7.post3-cp38-abi3-linux_x86_64.whl
---find-links https://github.com/Barry-Delaney/tilelang_wheels/raw/refs/heads/main/cu131/tilelang-0.1.7.post3+cu131.git62b8505e-cp38-abi3-linux_aarch64.whl
+-f https://github.com/Barry-Delaney/tilelang_wheels/raw/refs/heads/main/cu131/tilelang-0.1.7.post3-cp38-abi3-linux_x86_64.whl
+-f https://github.com/Barry-Delaney/tilelang_wheels/raw/refs/heads/main/cu131/tilelang-0.1.7.post3+cu131.git62b8505e-cp38-abi3-linux_aarch64.whl
 accelerate>=1.7.0
 build
 colored
