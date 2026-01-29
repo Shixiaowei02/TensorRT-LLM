@@ -1011,21 +1011,45 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         // Convert Q to FP8 in absorption mode.
         if (params.absorption_mode)
         {
-            constexpr int threads_per_block = 288;
-            constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
-            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-            TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+            if (params.meta.rope_append)
+            {
+                constexpr int threads_per_block = 288;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-            quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
-                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
-                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
+            else
+            {
+                constexpr int threads_per_block = 256;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 448, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
         }
         else
         {
@@ -1111,11 +1135,20 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
-    TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
+    TLLM_CHECK_WITH_INFO(lora_size == 512 || lora_size == 448, "lora_size should be equal to %d or %d", 512, 448);
     TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to %d", 64);
-    applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
-        latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
-        nope_size, kv_scale_orig_quant_ptr);
+    if (lora_size == 512)
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
+    else
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 448, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \

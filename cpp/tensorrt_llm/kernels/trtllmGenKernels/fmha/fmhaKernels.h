@@ -831,7 +831,11 @@ private:
         // Enable sliding window or chunked causal if the max kv sequence length exceeds attention window size or
         // chunked attention size.
         // This is supported by causal-mask context kernels and generation-phase kernels.
-        if ((selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal || !isContextKernel(params.mKernelType))
+        // NOTE: Skip mask type change for sparse MLA - it uses CAUSAL mask but handles sparsity through topk
+        // selection.
+        if (!isSparseMlaEnabled(params.mSparseMlaType)
+            && (selectKernelParams.mMaskType == TrtllmGenAttentionMaskType::Causal
+                || !isContextKernel(params.mKernelType))
             && (params.mMaxSeqLenKv > params.mAttentionWindowSize || params.mChunkedAttentionSize != INT_MAX))
         {
             TLLM_CHECK_WITH_INFO(params.mMaxSeqLenKv <= params.mAttentionWindowSize

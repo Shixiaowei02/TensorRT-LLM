@@ -478,12 +478,16 @@ class KVCacheManager(BaseResourceManager):
             assert len(
                 blocks_per_window
             ) == 1, "Only one window size is supported for non-self KV cache"
-            # rewrite the attention window size in blocks_per_window
-            memory_pools = blocks_per_window[self.max_attention_window_vec[0]]
-            blocks_per_window = {self.max_seq_len: memory_pools}
-            logger.info(
-                f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
-            )
+            # For sliding window (window < max_seq_len), keep the window size in blocks_per_window
+            # Only rewrite when not using sliding window (window >= max_seq_len)
+            # TODO(yuhangh): revert this after KVCacheManagerV2 is enabled
+            if self.max_attention_window_vec[0] >= self.max_seq_len:
+                memory_pools = blocks_per_window[
+                    self.max_attention_window_vec[0]]
+                blocks_per_window = {self.max_seq_len: memory_pools}
+                logger.info(
+                    f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
+                )
 
         # Set up temp_attention_window_inputs
         temp_attention_window_inputs = self._set_temp_attention_window_inputs()
