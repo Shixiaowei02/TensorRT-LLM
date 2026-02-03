@@ -701,45 +701,57 @@ def kv_compress_prefill_triton(
 
 
 # ============================================================================
-# Compressed KV Cache Scatter Kernel
+# Unified Compressed KV Cache Scatter Kernel (supports default and blockwise FP8 modes)
 # ============================================================================
 
 
 @triton.jit
 def compressed_kv_scatter_kernel(
-    # Input: compressed KV [total_outputs, head_dim] packed format
+    # Input: compressed KV [total_outputs, head_dim] (any dtype: bf16/fp16/fp8/etc)
     compressed_kv_ptr,
+    # Input: Scale bytes [total_tokens, scale_size] (only used when IS_BLOCKWISE_FP8=True)
+    kv_scale_ptr,
     # Metadata
     num_outputs_ptr,  # [bsz] number of outputs per batch
     cu_kv_comp_ptr,  # [bsz+1] cumulative output offsets
     start_pos_ptr,  # [bsz] position offset (past compressed KV length)
-    # KV cache: [num_blocks, kv_factor, tokens_per_block * head_dim]
+    # KV cache: [num_blocks, kv_factor, tokens_per_block * head_dim] or [num_blocks, block_size, per_token_size]
     kv_cache_ptr,
     # Block offsets: [num_pools, batch_size, 2, max_blocks_per_seq]
     block_offsets_ptr,
     # Dimensions
     tokens_per_block,
     head_dim,
+    scale_size,  # Only used when IS_BLOCKWISE_FP8=True
     # Strides for kv_cache
     stride_cache_blk,
     stride_cache_token,
+    stride_cache_elem,  # Element stride (for default: stride(2), for blockwise FP8: byte stride)
     # Strides for block_offsets
     stride_bo_batch,
     stride_bo_blk,
     # Strides for input
-    stride_in_c,
-    stride_in_h,
-    BLOCK_SIZE: tl.constexpr,
+    stride_in_token,
+    stride_in_elem,
+    # Stride for scale input (only used when IS_BLOCKWISE_FP8=True)
+    stride_scale_token,
+    # Constexpr parameters
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_S: tl.constexpr,
+    IS_BLOCKWISE_FP8: tl.constexpr,
 ):
-    """Scatter compressed KV to paged cache.
+    """Unified scatter kernel for compressed KV to paged cache.
 
-    Expected inputs:
-    - compressed_kv_ptr: [total_outputs, head_dim] packed format.
-    - num_outputs_ptr: [bsz] number of outputs per batch.
-    - cu_kv_comp_ptr: [bsz+1] cumulative output offsets.
-    - start_pos_ptr: [bsz] starting position in compressed cache.
-    - kv_cache_ptr: [num_blocks, kv_factor, tokens_per_block * head_dim].
-    - block_offsets_ptr: [num_pools, bsz, 2, max_blocks_per_seq].
+    When IS_BLOCKWISE_FP8=False (default mode):
+        - Input: [total_outputs, head_dim] any dtype (bf16/fp16/fp8/etc)
+        - Cache: [num_blocks, kv_factor, tokens_per_block * head_dim]
+        - Scatters KV data directly (dtype-agnostic)
+
+    When IS_BLOCKWISE_FP8=True (blockwise FP8 with separate scales):
+        - Input: [total_tokens, head_dim] uint8 (FP8 bytes)
+        - Scale: [total_tokens, scale_size] uint8
+        - Cache: [num_blocks, block_size, per_token_size] where per_token_size = head_dim + scale_size
+        - Scatters both FP8 data and scales
 
     Grid: (batch_size, max_outputs_per_batch)
     """
@@ -763,22 +775,76 @@ def compressed_kv_scatter_kernel(
         block_offsets_ptr + batch_idx * stride_bo_batch + logical_block * stride_bo_blk
     )
 
-    # Input offset (packed format)
-    input_offset = (output_offset + local_output_idx) * stride_in_c
+    # Global token index in input
+    global_token_idx = output_offset + local_output_idx
 
-    # Cache offset: [num_blocks, kv_factor, tokens * head_dim]
-    cache_base = phys_block * stride_cache_blk + token_offset * head_dim * stride_cache_token
+    if IS_BLOCKWISE_FP8:
+        # FP8 mode: cache layout is [num_blocks, block_size, per_token_size]
+        cache_base = phys_block * stride_cache_blk + token_offset * stride_cache_token
 
-    # Load and store
-    h_offsets = tl.arange(0, BLOCK_SIZE)
-    h_mask = h_offsets < head_dim
+        # ===== Scatter FP8 data =====
+        # Process head_dim bytes in chunks of BLOCK_SIZE_H
+        for h_start in range(0, head_dim, BLOCK_SIZE_H):
+            h_offsets = h_start + tl.arange(0, BLOCK_SIZE_H)
+            h_mask = h_offsets < head_dim
 
-    data = tl.load(compressed_kv_ptr + input_offset + h_offsets * stride_in_h, mask=h_mask)
-    tl.store(kv_cache_ptr + cache_base + h_offsets * stride_cache_token, data, mask=h_mask)
+            # Load FP8 bytes
+            fp8_data = tl.load(
+                compressed_kv_ptr + global_token_idx * stride_in_token + h_offsets * stride_in_elem,
+                mask=h_mask,
+                other=0
+            )
+
+            # Store to cache (FP8 data starts at offset 0)
+            tl.store(
+                kv_cache_ptr + cache_base + h_offsets * stride_cache_elem,
+                fp8_data,
+                mask=h_mask
+            )
+
+        # ===== Scatter scale data =====
+        # Scale data follows FP8 data in cache
+        scale_cache_offset = cache_base + head_dim * stride_cache_elem
+
+        for s_start in range(0, scale_size, BLOCK_SIZE_S):
+            s_offsets = s_start + tl.arange(0, BLOCK_SIZE_S)
+            s_mask = s_offsets < scale_size
+
+            # Load scale bytes
+            scale_data = tl.load(
+                kv_scale_ptr + global_token_idx * stride_scale_token + s_offsets,
+                mask=s_mask,
+                other=0
+            )
+
+            # Store to cache
+            tl.store(
+                kv_cache_ptr + scale_cache_offset + s_offsets * stride_cache_elem,
+                scale_data,
+                mask=s_mask
+            )
+    else:
+        # Default mode: cache layout is [num_blocks, kv_factor, tokens * head_dim]
+        cache_base = phys_block * stride_cache_blk + token_offset * head_dim * stride_cache_elem
+
+        # Load and store in chunks of BLOCK_SIZE_H
+        for h_start in range(0, head_dim, BLOCK_SIZE_H):
+            h_offsets = h_start + tl.arange(0, BLOCK_SIZE_H)
+            h_mask = h_offsets < head_dim
+
+            data = tl.load(
+                compressed_kv_ptr + global_token_idx * stride_in_token + h_offsets * stride_in_elem,
+                mask=h_mask
+            )
+            tl.store(
+                kv_cache_ptr + cache_base + h_offsets * stride_cache_elem,
+                data,
+                mask=h_mask
+            )
 
 
 def compressed_kv_scatter(
-    compressed_kv: torch.Tensor,  # [total_outputs, head_dim] packed
+    compressed_kv: torch.Tensor,  # [total_outputs, head_dim] packed, any dtype
     num_comp_tokens: torch.Tensor,  # [bsz] number of compressed tokens per batch
     cu_kv_comp: torch.Tensor,  # [bsz+1] cumulative output offsets
     start_pos: torch.Tensor,  # [bsz] compressed cache position
@@ -786,18 +852,28 @@ def compressed_kv_scatter(
     block_offsets: torch.Tensor,  # [num_pools, batch_size, 2, max_blocks_per_seq]
     tokens_per_block: int,
     head_dim: int,
+    kv_cache_dtype: str = "default",
+    kv_scale: torch.Tensor = None,  # [total_tokens, scale_size] uint8, for fp8_blockwise
 ):
     """Scatter compressed KV to paged cache.
 
+    Supports multiple KV cache formats:
+    - "default": Any dtype (bf16, fp16, etc.) - the kernel handles it automatically
+    - "fp8_blockwise": FP8 data with blockwise scales (requires kv_scale)
+
     Args:
-        compressed_kv: [total_outputs, head_dim] packed format (from prefill or decode)
-        num_outputs: [bsz] number of valid outputs per batch
+        compressed_kv: [total_outputs, head_dim] packed format
+            - For "default": any dtype (bf16, fp16, etc.)
+            - For "fp8_blockwise": uint8 (FP8 bytes)
+        num_comp_tokens: [bsz] number of valid outputs per batch
         cu_kv_comp: [bsz+1] cumulative output offsets
         start_pos: [bsz] starting position in compressed cache
-        kv_cache: [num_blocks, kv_factor, tokens_per_block * head_dim]
+        kv_cache: [num_blocks, kv_factor, tokens_per_block * head_dim], same dtype as input
         block_offsets: [num_pools, batch_size, 2, max_blocks_per_seq]
         tokens_per_block: Tokens per cache block
-        head_dim: Hidden dimension
+        head_dim: Hidden dimension (number of elements/bytes)
+        kv_cache_dtype: "default" or "fp8_blockwise"
+        kv_scale: Scale bytes for fp8_blockwise mode [total_tokens, scale_size]
     """
     if compressed_kv.numel() == 0:
         return
@@ -808,22 +884,61 @@ def compressed_kv_scatter(
     if max_outputs == 0:
         return
 
-    block_size = triton.next_power_of_2(head_dim)
+    block_size_h = min(triton.next_power_of_2(head_dim), 512)
 
-    compressed_kv_scatter_kernel[(batch_size, max_outputs)](
-        compressed_kv,
-        num_comp_tokens,
-        cu_kv_comp,
-        start_pos,
-        kv_cache,
-        block_offsets,
-        tokens_per_block,
-        head_dim,
-        kv_cache.stride(0),
-        kv_cache.stride(2),
-        block_offsets.stride(1),
-        block_offsets.stride(3),
-        compressed_kv.stride(0),
-        compressed_kv.stride(1),
-        BLOCK_SIZE=block_size,
-    )
+    if kv_cache_dtype == "fp8_blockwise":
+        assert kv_scale is not None, "kv_scale required for fp8_blockwise mode"
+        scale_size = kv_scale.shape[1]
+        block_size_s = min(triton.next_power_of_2(scale_size), 64)
+
+        compressed_kv_scatter_kernel[(batch_size, max_outputs)](
+            compressed_kv,
+            kv_scale,
+            num_comp_tokens,
+            cu_kv_comp,
+            start_pos,
+            kv_cache,
+            block_offsets,
+            tokens_per_block,
+            head_dim,
+            scale_size,
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2) if kv_cache.dim() > 2 else 1,
+            block_offsets.stride(1),
+            block_offsets.stride(3),
+            compressed_kv.stride(0),
+            compressed_kv.stride(1) if compressed_kv.dim() > 1 else 1,
+            kv_scale.stride(0),
+            BLOCK_SIZE_H=block_size_h,
+            BLOCK_SIZE_S=block_size_s,
+            IS_BLOCKWISE_FP8=True,
+        )
+    else:
+        # Default mode: dtype-agnostic scatter
+        # Dummy scale tensor (not used in non-FP8 mode)
+        dummy_scale = compressed_kv
+
+        compressed_kv_scatter_kernel[(batch_size, max_outputs)](
+            compressed_kv,
+            dummy_scale,  # Not used when IS_BLOCKWISE_FP8=False
+            num_comp_tokens,
+            cu_kv_comp,
+            start_pos,
+            kv_cache,
+            block_offsets,
+            tokens_per_block,
+            head_dim,
+            0,  # scale_size not used
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_offsets.stride(1),
+            block_offsets.stride(3),
+            compressed_kv.stride(0),
+            compressed_kv.stride(1),
+            1,  # stride_scale_token not used
+            BLOCK_SIZE_H=block_size_h,
+            BLOCK_SIZE_S=16,  # Not used
+            IS_BLOCKWISE_FP8=False,
+        )

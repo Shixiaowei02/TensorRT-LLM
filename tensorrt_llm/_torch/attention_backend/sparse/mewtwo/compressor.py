@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -9,9 +9,17 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compiled_cat
+from tensorrt_llm.quantization.utils import fp8_utils
 
-from .kernel import compressed_kv_scatter, kv_compress_prefill_triton, kv_compress_triton
+from .kernel import (
+    compressed_kv_scatter,
+    kv_compress_prefill_triton,
+    kv_compress_triton,
+)
 from .mewtwo import MewtwoAttentionType, MewtwoTrtllmAttentionMetadata
+
+# KV cache dtype options
+KVCacheDtype = Literal["default", "fp8_blockwise"]
 
 
 class Compressor(nn.Module):
@@ -27,6 +35,8 @@ class Compressor(nn.Module):
         page_size: Size of each page in paged cache (default 32)
         pos_embd_params: Positional embedding parameters
         dtype: Data type
+        kv_cache_dtype: KV cache data type - "default" uses dtype, "fp8_blockwise" uses
+            blockwise FP8 quantization (1x128 block size) like Indexer compressor
     """
 
     def __init__(
@@ -39,6 +49,7 @@ class Compressor(nn.Module):
         pos_embd_params: PositionalEmbeddingParams,
         page_size: int = 32,
         dtype: Optional[torch.dtype] = torch.bfloat16,
+        kv_cache_dtype: KVCacheDtype = "default",
     ):
         super().__init__()
         self.dim = mla_params.hidden_size
@@ -51,6 +62,8 @@ class Compressor(nn.Module):
         self.page_size = page_size
         self.eps = norm_eps
         self.layer_idx = layer_idx
+        self.kv_cache_dtype = kv_cache_dtype
+        self.dtype = dtype
 
         # Linear layers for KV and gate projections
         self.wkv_gate = Linear(
@@ -95,6 +108,7 @@ class Compressor(nn.Module):
         # Get inputs from metadata
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
+        num_ctx_tokens = metadata.num_ctx_tokens
         num_gen_tokens = metadata.num_tokens - metadata.num_ctx_tokens
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, MewtwoAttentionType.COMPRESS
@@ -192,14 +206,83 @@ class Compressor(nn.Module):
         kv_comp = rotate_activation(kv_comp)
 
         # Scatter compressed KV to KV cache
-        compressed_kv_scatter(
-            compressed_kv=kv_comp,
-            num_comp_tokens=num_comp_tokens[:bsz],
-            cu_kv_comp=cu_kv_comp,
-            start_pos=metadata.compressed_start_positions[self.compress_ratio][:bsz],
-            kv_cache=kv_cache,
-            block_offsets=block_table,
-            tokens_per_block=self.page_size,
-            head_dim=self.head_dim,
+        if self.kv_cache_dtype == "fp8_blockwise":
+            # Blockwise FP8 quantization and scatter (like Indexer compressor)
+            return self._update_kv_cache_fp8_blockwise(
+                kv_comp=kv_comp,
+                num_comp_tokens=num_comp_tokens[:bsz],
+                cu_kv_comp=cu_kv_comp,
+                start_pos=metadata.compressed_start_positions[self.compress_ratio][:bsz],
+                kv_cache=kv_cache,
+                block_offsets=block_table,
+                metadata=metadata,
+            )
+        else:
+            # Default: scatter with original dtype
+            compressed_kv_scatter(
+                compressed_kv=kv_comp,
+                num_comp_tokens=num_comp_tokens[:bsz],
+                cu_kv_comp=cu_kv_comp,
+                start_pos=metadata.compressed_start_positions[self.compress_ratio][:bsz],
+                kv_cache=kv_cache,
+                block_offsets=block_table,
+                tokens_per_block=self.page_size,
+                head_dim=self.head_dim,
+            )
+            return kv_comp
+
+    def _update_kv_cache_fp8_blockwise(
+        self,
+        kv_comp: torch.Tensor,
+        num_comp_tokens: torch.Tensor,
+        cu_kv_comp: torch.Tensor,
+        start_pos: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_offsets: torch.Tensor,
+        metadata: MewtwoTrtllmAttentionMetadata,
+    ) -> None:
+        """
+        Update KV cache with blockwise FP8 quantization.
+        
+        Uses Triton kernel for scattering FP8 data and scales, supporting
+        arbitrary head_dim (unlike the CUDA kernel which is limited to hdim=128).
+        
+        Args:
+            kv_comp: Compressed KV tensor, shape [total_comp_tokens, head_dim]
+            num_comp_tokens: Number of compressed tokens per batch
+            cu_kv_comp: Cumulative compressed token counts
+            start_pos: Start positions for each batch in compressed cache
+            kv_cache: KV cache buffer [num_blocks, block_size, per_token_size]
+            block_offsets: Block offsets for each batch
+            metadata: Attention metadata (unused, kept for API compatibility)
+        """
+        num_tokens = kv_comp.shape[0]
+        if num_tokens == 0:
+            return
+
+        head_dim = self.head_dim
+
+        # Quantize to blockwise FP8
+        kv_fp8, kv_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
+            kv_comp, use_ue8m0=False
         )
-        return kv_comp
+
+        # Convert to bytes (flatten before viewing to ensure stride(-1) == 1)
+        kv_fp8_bytes = kv_fp8.contiguous().flatten().view(torch.uint8).view(num_tokens, head_dim)
+        scale_size = kv_scale.shape[1] * 4  # float32 = 4 bytes
+        kv_scale_bytes = kv_scale.contiguous().flatten().view(torch.uint8).view(num_tokens, scale_size)
+
+        # Use Triton kernel which supports arbitrary head_dim
+        compressed_kv_scatter(
+            kv_fp8_bytes,
+            num_comp_tokens,
+            cu_kv_comp,
+            start_pos,
+            kv_cache,
+            block_offsets,
+            self.page_size,
+            head_dim,
+            kv_cache_dtype="fp8_blockwise",
+            kv_scale=kv_scale_bytes,
+        )
+        return kv_fp8, kv_scale 
