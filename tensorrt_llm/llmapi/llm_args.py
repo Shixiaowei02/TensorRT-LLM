@@ -359,6 +359,14 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
+    compress_ratios: List[int] = Field(
+        default=[1, 1, 4, 128, 4, 128, 4],
+        description="The compress ratios of each layer.")
+
+    window_size: int = Field(
+        default=128,
+        description="The window size for slicing window attention part.")
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)

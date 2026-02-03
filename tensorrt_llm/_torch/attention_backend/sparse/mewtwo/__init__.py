@@ -1,3 +1,3 @@
-from .mewtwo import MewtwoCacheManager
+from .cache_manager import MewtwoCacheManager
 
 __all__ = ["MewtwoCacheManager"]
