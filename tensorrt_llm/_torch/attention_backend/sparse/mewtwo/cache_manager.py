@@ -27,6 +27,25 @@ MEWTWO_OVERLAP_COMPRESSOR_RATIO = 4
 
 
 class MewtwoCacheManager(KVCacheManagerV2):
+    # Mapping from [attention type, layer] to the pool id,
+    # shape: [num_attention_types, num_layers]
+    layer_attn_to_pool_id: torch.Tensor
+    # Mapping from [attention type, layer] to the buffer pointer including layer offset,
+    # shape: [num_attention_types, num_layers]
+    layer_attn_to_buffer_ptr: torch.Tensor
+    # Mapping from [attention type, layer] to the pool pointer (base address),
+    # shape: [num_attention_types, num_layers]
+    layer_attn_to_pool_ptr: torch.Tensor
+    # kv_cache_pool_pointers contains pool pointers for each pool, shape: [num_pools, 2]
+    # The second column is always 0.
+    kv_cache_pool_pointers: torch.Tensor
+    # kv_cache_pool_mapping contains pool id and layer offset for each layer's swa attention,
+    # shape: [num_layers, 2]
+    kv_cache_pool_mapping: torch.Tensor
+    # The block size of the (indexer) compressed cache.
+    # For other attention types, block size is tokens_per_block.
+    compressed_block_sizes: List[int]
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -49,7 +68,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
         assert len(sparse_attn_config.compress_ratios) == num_layers, (
             "The length of compress ratios must be equal to the number of layers"
         )
-        assert tokens_per_block >= 128, "Mewtwo requires tokens_per_block >= 128"
+        # use tokens_per_block == 128 to ensure token is contiguous in the compressed cache
+        # TODO(jiaganc): remove this after cache manager supports per layer tokens_per_block
+        assert tokens_per_block == 128, "Mewtwo requires tokens_per_block == 128"
         assert dtype in [DataType.BF16, DataType.FP8], (
             f"Unsupported dtype: {dtype}, only support BF16 and FP8"
         )
@@ -61,6 +82,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self._window_size = sparse_attn_config.window_size
         self._indexer_head_dim = sparse_attn_config.index_head_dim
         self._compressor_dtype = compressor_dtype
+        self.compressed_block_sizes = [
+            tokens_per_block // self._compress_ratios[i] for i in range(num_layers)
+        ]
 
         # indexer kv cache use blockwise FP8 quantization
         self._indexer_dtype = DataType.FP8
@@ -68,6 +92,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self._indexer_quant_block_size = 128
         assert self._indexer_head_dim % self._indexer_quant_block_size == 0, (
             f"indexer_head_dim {self._indexer_head_dim} must be divisible by {self._indexer_quant_block_size}"
+        )
+        self._indexer_scale_size = get_size_in_bytes(
+            self._indexer_head_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
         )
 
         # General initialization
@@ -220,21 +247,18 @@ class MewtwoCacheManager(KVCacheManagerV2):
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         addr = self.impl.get_mem_pool_base_address(layer_id, Role.KEY)
 
-        tokens_per_block = self.tokens_per_block
-        # compress and indexer compress will be compressed by the compress ratio
+        block_size = self.tokens_per_block
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
-            tokens_per_block //= self._compress_ratios[layer_idx]
+            block_size = self.compressed_block_sizes[layer_idx]
 
         attn_dim = self._get_attn_dim(layer_idx, attn_type)
         scale_size = 0
         if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            scale_size = get_size_in_bytes(
-                attn_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
-            )
+            scale_size = self._indexer_scale_size
 
         shape = (
             self.impl.get_page_index_upper_bound(layer_id, Role.KEY),
-            tokens_per_block,
+            block_size,
             attn_dim + scale_size,
         )
 
@@ -439,16 +463,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         scale_size = 0
         # indexer compress has scaling factor
         if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            scale_size = get_size_in_bytes(
-                attn_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
-            )
+            scale_size = self._indexer_scale_size
 
-        size = (get_size_in_bytes(attn_dim, dtype) + scale_size) * self.tokens_per_block
-        # compress and indexer compress will be compressed by the compress ratio
+        block_size = self.tokens_per_block
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
-            size = size // self._compress_ratios[layer_idx]
+            block_size = self.compressed_block_sizes[layer_idx]
 
-        return size
+        return (get_size_in_bytes(attn_dim, dtype) + scale_size) * block_size
 
     def _get_cache_bytes_per_token(self) -> int:
         """
