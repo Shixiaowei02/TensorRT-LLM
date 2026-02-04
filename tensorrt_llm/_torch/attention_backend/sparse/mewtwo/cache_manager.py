@@ -62,6 +62,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self._indexer_head_dim = sparse_attn_config.index_head_dim
         self._compressor_dtype = compressor_dtype
 
+        # indexer kv cache use blockwise FP8 quantization
+        self._indexer_dtype = DataType.FP8
+        self._indexer_scale_dtype = DataType.FLOAT
+        self._indexer_quant_block_size = 128
+        assert self._indexer_head_dim % self._indexer_quant_block_size == 0, (
+            f"indexer_head_dim {self._indexer_head_dim} must be divisible by {self._indexer_quant_block_size}"
+        )
+
         # General initialization
         super().__init__(
             kv_cache_config,
@@ -200,6 +208,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
     def get_buffers(self, layer_idx: int, attn_type: MewtwoAttentionType) -> torch.Tensor:
         """
         Get the buffers for a specific layer and attention type.
+
+        Args:
+            layer_idx: The layer index
+            attn_type: The attention type
+
+        Returns:
+            The buffer tensor (shape: [num_blocks, tokens_per_block, attn_dim])
+            For blockwise FP8 layers, shape is [num_blocks, tokens_per_block, attn_dim + scale_size]
         """
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         addr = self.impl.get_mem_pool_base_address(layer_id, Role.KEY)
@@ -209,10 +225,17 @@ class MewtwoCacheManager(KVCacheManagerV2):
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
             tokens_per_block //= self._compress_ratios[layer_idx]
 
+        attn_dim = self._get_attn_dim(layer_idx, attn_type)
+        scale_size = 0
+        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            scale_size = get_size_in_bytes(
+                attn_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
+            )
+
         shape = (
             self.impl.get_page_index_upper_bound(layer_id, Role.KEY),
             tokens_per_block,
-            self._get_attn_dim(layer_idx, attn_type),
+            attn_dim + scale_size,
         )
 
         dtype = self.dtype
@@ -224,6 +247,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
             MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             dtype = self._compressor_dtype
+        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            dtype = self._indexer_dtype
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
@@ -407,8 +432,18 @@ class MewtwoCacheManager(KVCacheManagerV2):
             MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             dtype = self._compressor_dtype
+        # indexer compress use indexer_dtype
+        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            dtype = self._indexer_dtype
 
-        size = get_size_in_bytes(attn_dim, dtype) * self.tokens_per_block
+        scale_size = 0
+        # indexer compress has scaling factor
+        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            scale_size = get_size_in_bytes(
+                attn_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
+            )
+
+        size = (get_size_in_bytes(attn_dim, dtype) + scale_size) * self.tokens_per_block
         # compress and indexer compress will be compressed by the compress ratio
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
             size = size // self._compress_ratios[layer_idx]

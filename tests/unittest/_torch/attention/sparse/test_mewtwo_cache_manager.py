@@ -14,7 +14,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionCon
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-_RequestCache = Dict[Tuple[int, MewtwoAttentionType], torch.Tensor]
+_RequestCache = Dict[
+    Tuple[int, MewtwoAttentionType],  # (layer index, attention type)
+    Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
+]
 
 
 class TestMewtwoCacheManager:
@@ -25,6 +28,11 @@ class TestMewtwoCacheManager:
     vocab_size = 129280
     sparse_layer_ratio = 4
     overlap_compress_layer_ratio = 4
+
+    # indexer quantization config
+    indexer_dtype = DataType.FP8
+    indexer_scale_dtype = DataType.FLOAT
+    indexer_quant_block_size = 128
 
     # cache manager specific param
     tokens_per_block = 128
@@ -155,6 +163,17 @@ class TestMewtwoCacheManager:
 
         return request
 
+    def _rand_tensor(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if dtype == torch.uint8:
+            return torch.randint(0, 255, shape, dtype=dtype, device=device)
+        else:
+            return torch.randn(shape, dtype=dtype, device=device) * 1000.0
+
     def _create_random_cache(
         self,
         seq_len: int,
@@ -162,8 +181,8 @@ class TestMewtwoCacheManager:
         sparse_attn_config: MewtwoSparseAttentionConfig,
         dtype: torch.dtype,
         compressor_dtype: torch.dtype,
-        device: torch.device = torch.device("cuda"),
-    ) -> Dict[Tuple[int, MewtwoAttentionType], torch.Tensor]:
+        device: torch.device | None = None,
+    ) -> _RequestCache:
         """Helper to create random cache values for all layers and attention types.
 
         Args:
@@ -172,43 +191,91 @@ class TestMewtwoCacheManager:
             sparse_attn_config: Sparse attention configuration
 
         Returns:
-            Dictionary mapping (layer_idx, attn_type) to random tensor values
+            Dictionary mapping (layer_idx, attn_type) to (values, scales) tuples.
+            scales is None for non-quantized attention types.
         """
-        cache: Dict[Tuple[int, MewtwoAttentionType], torch.Tensor] = {}
+        device = device or torch.device("cuda")
+        cache: _RequestCache = {}
 
         for layer, ratio in enumerate(sparse_attn_config.compress_ratios):
             is_overlap = self._is_overlap_compressor(ratio)
 
-            cache[layer, MewtwoAttentionType.SWA] = torch.randn(
-                (seq_len, head_dim), dtype=dtype, device=device
+            cache[layer, MewtwoAttentionType.SWA] = (
+                self._rand_tensor((seq_len, head_dim), dtype, device),
+                None,
             )
 
             if self._is_compress_layer(ratio):
                 compressor_dim = 2 * head_dim if is_overlap else head_dim
-                cache[layer, MewtwoAttentionType.COMPRESS] = torch.randn(
-                    (seq_len // ratio, head_dim), dtype=dtype, device=device
+                cache[layer, MewtwoAttentionType.COMPRESS] = (
+                    self._rand_tensor((seq_len // ratio, head_dim), dtype, device),
+                    None,
                 )
-                cache[layer, MewtwoAttentionType.COMPRESSOR_STATE] = torch.randn(
-                    (seq_len, compressor_dim), dtype=compressor_dtype, device=device
+                cache[layer, MewtwoAttentionType.COMPRESSOR_STATE] = (
+                    self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
+                    None,
                 )
-                cache[layer, MewtwoAttentionType.COMPRESSOR_SCORE] = torch.randn(
-                    (seq_len, compressor_dim), dtype=compressor_dtype, device=device
+                cache[layer, MewtwoAttentionType.COMPRESSOR_SCORE] = (
+                    self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
+                    None,
                 )
 
             if self._is_sparse_layer(ratio):
+                # indexer kv cache is blockwise FP8 quantized
                 indexer_dim = sparse_attn_config.index_head_dim
+                indexer_num_tokens = seq_len // ratio
+                num_scales = indexer_dim // self.indexer_quant_block_size
+                indexer_values = self._rand_tensor(
+                    (indexer_num_tokens, indexer_dim), torch.uint8, device
+                )
+                indexer_scales = self._rand_tensor(
+                    (indexer_num_tokens, num_scales), torch.float32, device
+                )
+                cache[layer, MewtwoAttentionType.INDEXER_COMPRESS] = (
+                    indexer_values,
+                    indexer_scales,
+                )
+
                 indexer_compressor_dim = 2 * indexer_dim if is_overlap else indexer_dim
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESS] = torch.randn(
-                    (seq_len // ratio, indexer_dim), dtype=dtype, device=device
+                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE] = (
+                    self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
+                    None,
                 )
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE] = torch.randn(
-                    (seq_len, indexer_compressor_dim), dtype=compressor_dtype, device=device
-                )
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE] = torch.randn(
-                    (seq_len, indexer_compressor_dim), dtype=compressor_dtype, device=device
+                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE] = (
+                    self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
+                    None,
                 )
 
         return cache
+
+    def _split_blockwise_buffer(self, buffer: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split a blockwise FP8 quantized buffer into value and scale buffers.
+
+        Args:
+            buffer: The blockwise FP8 quantized buffer (shape: [num_blocks, tokens_per_block, bytes_per_token])
+
+        Returns:
+            Tuple of (value_buffer, scale_buffer)
+        """
+        num_blocks, tokens_per_block, bytes_per_token = buffer.shape
+        bytes_per_block = bytes_per_token * tokens_per_block
+
+        # Get value buffer
+        value_shape = (num_blocks, tokens_per_block, self.index_head_dim)
+        value_stride = (bytes_per_block, self.index_head_dim, 1)
+        value_buffer = buffer.as_strided(value_shape, value_stride, 0).view(torch.uint8)
+
+        # Get scale buffer
+        scale_dim = self.index_head_dim // self.indexer_quant_block_size
+        scale_bytes = scale_dim * 4  # float32 = 4 bytes
+        scale_shape = (num_blocks, tokens_per_block, scale_bytes)
+        scale_stride = (bytes_per_block, scale_bytes, 1)
+        scale_offset = self.index_head_dim * tokens_per_block
+        scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(
+            torch.float32
+        )
+
+        return value_buffer, scale_buffer
 
     def _prefill_write_paged_cache(
         self,
@@ -238,7 +305,7 @@ class TestMewtwoCacheManager:
             values = torch.cat(
                 [
                     values,
-                    torch.randn((pad_len, dim_per_token), dtype=values.dtype, device=values.device),
+                    self._rand_tensor((pad_len, dim_per_token), values.dtype, values.device),
                 ],
                 dim=0,
             )
@@ -319,10 +386,10 @@ class TestMewtwoCacheManager:
             req: The request to write cache for
             prompt_len: Prompt length
             cache_manager: The cache manager instance
-            cache_values: Dictionary mapping (layer_idx, attn_type) to tensor values
+            cache_values: Request's cache to write
         """
         compress_ratios = cache_manager._compress_ratios
-        for (layer_idx, attn_type), values in cache_values.items():
+        for (layer_idx, attn_type), (values, scales) in cache_values.items():
             page_indices = cache_manager.get_cache_indices(
                 request_id=req.py_request_id, layer_idx=layer_idx, attn_type=attn_type
             )
@@ -332,11 +399,26 @@ class TestMewtwoCacheManager:
             else:
                 seq_len = prompt_len
 
-            self._prefill_write_paged_cache(
-                buffer=cache_manager.get_buffers(layer_idx, attn_type),
-                block_indices=page_indices,
-                values=values[:seq_len],
-            )
+            buffer = cache_manager.get_buffers(layer_idx, attn_type)
+            if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+                # indexer compress is blockwise FP8 quantized
+                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                self._prefill_write_paged_cache(
+                    buffer=values_buffer,
+                    block_indices=page_indices,
+                    values=values[:seq_len],
+                )
+                self._prefill_write_paged_cache(
+                    buffer=scales_buffer,
+                    block_indices=page_indices,
+                    values=scales[:seq_len],
+                )
+            else:
+                self._prefill_write_paged_cache(
+                    buffer=buffer,
+                    block_indices=page_indices,
+                    values=values[:seq_len],
+                )
 
     def _write_request_decode(
         self,
@@ -351,28 +433,43 @@ class TestMewtwoCacheManager:
             req: The request to write cache for
             token_idx: Index of the new token to write
             cache_manager: The cache manager instance
-            cache_values: Dictionary mapping (layer_idx, attn_type) to tensor values
+            cache_values: Request's cache to write
         """
         compress_ratios = cache_manager._compress_ratios
-        for (layer_idx, attn_type), values in cache_values.items():
+        for (layer_idx, attn_type), (values, scales) in cache_values.items():
             block_indices = cache_manager.get_cache_indices(
                 request_id=req.py_request_id, layer_idx=layer_idx, attn_type=attn_type
             )
 
-            # compute the compressed token index
+            compressed_token_idx = token_idx
             if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
                 if (token_idx + 1) % compress_ratios[layer_idx] != 0:
                     # skip if current token will not trigger compression
                     continue
-                token_idx = token_idx // compress_ratios[layer_idx]
+                compressed_token_idx = token_idx // compress_ratios[layer_idx]
 
-            token_value = values[token_idx]
-            self._decode_write_paged_cache(
-                buffer=cache_manager.get_buffers(layer_idx, attn_type),
-                block_indices=block_indices,
-                token_idx=token_idx,
-                value=token_value,
-            )
+            buffer = cache_manager.get_buffers(layer_idx, attn_type)
+            if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+                values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                self._decode_write_paged_cache(
+                    buffer=values_buffer,
+                    block_indices=block_indices,
+                    token_idx=compressed_token_idx,
+                    value=values[compressed_token_idx],
+                )
+                self._decode_write_paged_cache(
+                    buffer=scales_buffer,
+                    block_indices=block_indices,
+                    token_idx=compressed_token_idx,
+                    value=scales[compressed_token_idx],
+                )
+            else:
+                self._decode_write_paged_cache(
+                    buffer=buffer,
+                    block_indices=block_indices,
+                    token_idx=compressed_token_idx,
+                    value=values[compressed_token_idx],
+                )
 
     def _read_request(
         self,
@@ -390,11 +487,10 @@ class TestMewtwoCacheManager:
             compress_ratios: Compression ratios for each layer
 
         Returns:
-            Dictionary mapping (layer_idx, attn_type) to tensor values read from cache
+            Request's cache
         """
         cache_values: _RequestCache = {}
         for layer, ratio in enumerate(compress_ratios):
-            # list of attentions to read for this layer
             attn_types = [MewtwoAttentionType.SWA]
             if self._is_compress_layer(ratio):
                 attn_types.extend(
@@ -415,7 +511,6 @@ class TestMewtwoCacheManager:
 
             # read cache values for each attention type
             for attn_type in attn_types:
-                # cache_buffer = cache_manager.get_buffers(layer, attn_type)
                 page_indices = cache_manager.get_cache_indices(
                     request_id=req.py_request_id, layer_idx=layer, attn_type=attn_type
                 )
@@ -426,12 +521,33 @@ class TestMewtwoCacheManager:
                     attn_len = seq_len // ratio
                 else:
                     attn_len = seq_len
-                cache_values[layer, attn_type] = self._read_paged_cache(
-                    buffer=cache_manager.get_buffers(layer, attn_type),
-                    block_indices=page_indices,
-                    seq_len=attn_len,
-                    window_size=self._get_window_size(ratio, attn_type),
-                )
+                window_size = self._get_window_size(ratio, attn_type)
+
+                buffer = cache_manager.get_buffers(layer, attn_type)
+                if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+                    values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
+                    values = self._read_paged_cache(
+                        buffer=values_buffer,
+                        block_indices=page_indices,
+                        seq_len=attn_len,
+                        window_size=window_size,
+                    )
+                    scales = self._read_paged_cache(
+                        buffer=scales_buffer,
+                        block_indices=page_indices,
+                        seq_len=attn_len,
+                        window_size=window_size,
+                    )
+                else:
+                    values = self._read_paged_cache(
+                        buffer=buffer,
+                        block_indices=page_indices,
+                        seq_len=attn_len,
+                        window_size=window_size,
+                    )
+                    scales = None
+
+                cache_values[layer, attn_type] = (values, scales)
 
         return cache_values
 
@@ -457,19 +573,49 @@ class TestMewtwoCacheManager:
                 attn_len = seq_len // compress_ratios[layer_idx]
             else:
                 attn_len = seq_len
-            expect_values = expect[layer_idx, attn_type][:attn_len]
 
+            expect_values, expect_scales = expect[layer_idx, attn_type]
+            actual_values, actual_scales = actual[layer_idx, attn_type]
+
+            # Slice to attention length
+            expect_values = expect_values[:attn_len]
+            if expect_scales is not None:
+                expect_scales = expect_scales[:attn_len]
+
+            # Apply window size if applicable
             window_size = self._get_window_size(compress_ratios[layer_idx], attn_type)
             if window_size is not None:
                 expect_values = expect_values[-window_size:]
+                if expect_scales is not None:
+                    expect_scales = expect_scales[-window_size:]
 
+            # Assert values match
             torch.testing.assert_close(
-                actual[layer_idx, attn_type],
+                actual_values,
                 expect_values,
                 rtol=1e-5,
                 atol=1e-5,
-                msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.value}",
+                msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (values)",
             )
+
+            # Assert scales match (both should be None or both should be tensors)
+            if expect_scales is None:
+                assert actual_scales is None, (
+                    f"Expected no scales for layer {layer_idx}, attention type {attn_type.name}, "
+                    f"but got scales with shape {actual_scales.shape}"
+                )
+            else:
+                assert actual_scales is not None, (
+                    f"Expected scales for layer {layer_idx}, attention type {attn_type.name}, "
+                    f"but got None"
+                )
+                torch.testing.assert_close(
+                    actual_scales,
+                    expect_scales,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
+                )
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
