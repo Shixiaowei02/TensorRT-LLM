@@ -31,7 +31,7 @@
     {
       "name": "deepgemm",
       "git_repository": "https://github.com/lfr-0531/DeepGEMM",
-      "git_tag": "26bc7ea4f7db88dc6fd67719f6e070cec87381af",
+      "git_tag": "2ddd500411f5b204c593214f1fdd2b60fc67e56a",
       "git_submodules_recurse": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
