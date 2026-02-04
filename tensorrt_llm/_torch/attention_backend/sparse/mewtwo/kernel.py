@@ -859,11 +859,15 @@ def compressed_kv_scatter(
 
     Supports multiple KV cache formats:
     - "default": Any dtype (bf16, fp16, etc.) - the kernel handles it automatically
+    - "fp8_pertensor": FP8 data with single per-tensor scale (scale stored separately, not in cache)
+        Cache layout: [num_blocks, kv_factor, tokens_per_block * head_dim] with uint8/FP8 data
     - "fp8_blockwise": FP8 data with blockwise scales (requires kv_scale)
+        Cache layout: [num_blocks, block_size, head_dim + scale_size] with interleaved scales
 
     Args:
         compressed_kv: [total_outputs, head_dim] packed format
             - For "default": any dtype (bf16, fp16, etc.)
+            - For "fp8_pertensor": uint8 (FP8 bytes), scale stored separately
             - For "fp8_blockwise": uint8 (FP8 bytes)
         num_comp_tokens: [bsz] number of valid outputs per batch
         cu_kv_comp: [bsz+1] cumulative output offsets
@@ -872,7 +876,7 @@ def compressed_kv_scatter(
         block_offsets: [num_pools, batch_size, 2, max_blocks_per_seq]
         tokens_per_block: Tokens per cache block
         head_dim: Hidden dimension (number of elements/bytes)
-        kv_cache_dtype: "default" or "fp8_blockwise"
+        kv_cache_dtype: "default", "fp8_pertensor", or "fp8_blockwise"
         kv_scale: Scale bytes for fp8_blockwise mode [total_tokens, scale_size]
     """
     if compressed_kv.numel() == 0:
@@ -887,6 +891,7 @@ def compressed_kv_scatter(
     block_size_h = min(triton.next_power_of_2(head_dim), 512)
 
     if kv_cache_dtype == "fp8_blockwise":
+        # Blockwise FP8: interleave FP8 data with per-block scales in cache
         assert kv_scale is not None, "kv_scale required for fp8_blockwise mode"
         scale_size = kv_scale.shape[1]
         block_size_s = min(triton.next_power_of_2(scale_size), 64)
@@ -915,8 +920,9 @@ def compressed_kv_scatter(
             IS_BLOCKWISE_FP8=True,
         )
     else:
-        # Default mode: dtype-agnostic scatter
-        # Dummy scale tensor (not used in non-FP8 mode)
+        # Default / fp8_pertensor mode: scatter data directly without interleaved scales
+        # For fp8_pertensor: FP8 bytes are scattered, single scale is stored separately
+        # For default: any dtype is scattered as-is
         dummy_scale = compressed_kv
 
         compressed_kv_scatter_kernel[(batch_size, max_outputs)](
