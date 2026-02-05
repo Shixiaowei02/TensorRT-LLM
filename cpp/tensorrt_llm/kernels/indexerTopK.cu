@@ -618,8 +618,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(float const* logits, int const* seqLens,
-    int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
-    int const numBlocksToMerge = 0, int const* indices = nullptr)
+    int* outIndices, int stride0, int stride1, int const topK, int next_n, int compressRatio,
+    float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -633,7 +633,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
     // The range of logits within the row.
     int rowStart = 0;
     int seq_len = seqLens[rowIdx / next_n];
-    int rowEnd = seq_len - next_n + (rowIdx % next_n) + 1;
+    int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+    int rowEnd = actual_kv_len / compressRatio;
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -665,7 +666,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
 
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, cudaStream_t const stream)
+    int const stride1, int const next_n, int const topK, int const compressRatio, cudaStream_t const stream)
 {
 
     constexpr int kSortingAlgorithmThreshold = 12288;
@@ -688,8 +689,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else if (numColumns < kSplitWorkThreshold)
     {
@@ -707,8 +708,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else
     {
@@ -727,7 +728,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part1.attrs = attrs;
 
         cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
-            next_n, outLogitsAux, 0, nullptr);
+            next_n, compressRatio, outLogitsAux, 0, nullptr);
 
         constexpr int kNumThreadsPerBlockMerge = 1024;
         auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
@@ -741,7 +742,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part2.attrs = attrs;
 
         cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices,
-            multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
+            multipleBlocksPerRowConfig * topK, 1, topK, next_n, 1, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
 }

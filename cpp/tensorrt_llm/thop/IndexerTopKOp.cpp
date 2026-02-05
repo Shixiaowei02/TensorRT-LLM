@@ -36,9 +36,10 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-void indexer_topk_decode(
-    th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices, int64_t next_n, int64_t index_topk)
+void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
+    int64_t next_n, int64_t index_topk, int64_t compress_ratio)
 {
+    TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
         "logits, seq_lens, and indices must be CUDA tensors");
@@ -82,7 +83,8 @@ void indexer_topk_decode(
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
     tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
         aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-        logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), stream);
+        logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk),
+        static_cast<int32_t>(compress_ratio), stream);
 }
 
 void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts, th::Tensor const& row_ends,
@@ -128,8 +130,8 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048) -> "
-        "()");
+        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
+        "int compress_ratio=1) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
