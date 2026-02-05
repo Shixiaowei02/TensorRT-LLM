@@ -519,7 +519,7 @@ def kv_compress_triton(
     kv_lens: torch.Tensor,
     start_pos: torch.Tensor,
     cu_seq_lens: torch.Tensor,
-    cu_kv_comp: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
     kv_comp: torch.Tensor,
     compressed_mask: torch.Tensor,
     paged_kv: torch.Tensor,
@@ -540,7 +540,7 @@ def kv_compress_triton(
         kv_lens: [bsz] total KV length per batch (past + current tokens)
         start_pos: [bsz] starting position (past KV length). Can be None to auto-compute from kv_lens.
         cu_seq_lens: [bsz+1] cumulative input offsets into kv_score.
-        cu_kv_comp: [bsz+1] cumulative output offsets.
+        cu_new_comp_kv: [bsz+1] cumulative output offsets.
         kv_comp: [total_outputs, head_dim] pre-allocated output buffer
         compressed_mask: [bsz] pre-allocated bool mask buffer
         paged_kv/paged_score: [num_blocks, page_size, state_dim]
@@ -569,7 +569,7 @@ def kv_compress_triton(
         kv_lens,
         start_pos,
         cu_seq_lens,
-        cu_kv_comp,
+        cu_new_comp_kv,
         paged_kv,
         paged_score,
         block_table_kv,
@@ -602,7 +602,7 @@ def kv_compress_prefill_triton(
     kv_lens: torch.Tensor,
     start_pos: torch.Tensor,
     cu_seq_lens: torch.Tensor,
-    cu_kv_comp: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
     kv_comp: torch.Tensor,
     compressed_mask: torch.Tensor,
     paged_kv: torch.Tensor,
@@ -622,7 +622,7 @@ def kv_compress_prefill_triton(
         kv_lens: [bsz] total KV length per batch (past + current tokens)
         start_pos: [bsz] starting position (past KV length). Can be None for pure prefill (start_pos=0).
         cu_seq_lens: [bsz+1] cumulative input offsets into kv_score.
-        cu_kv_comp: [bsz+1] cumulative output offsets.
+        cu_new_comp_kv: [bsz+1] cumulative output offsets.
         kv_comp: [total_outputs, head_dim] pre-allocated output buffer
         compressed_mask: [bsz] pre-allocated bool mask buffer
         paged_kv/paged_score: [num_blocks, page_size, state_dim]
@@ -673,7 +673,7 @@ def kv_compress_prefill_triton(
             kv_lens,
             start_pos,
             cu_seq_lens,
-            cu_kv_comp,
+            cu_new_comp_kv,
             kv_comp,
             compressed_mask,
             paged_kv,
@@ -792,14 +792,12 @@ def compressed_kv_scatter_kernel(
             fp8_data = tl.load(
                 compressed_kv_ptr + global_token_idx * stride_in_token + h_offsets * stride_in_elem,
                 mask=h_mask,
-                other=0
+                other=0,
             )
 
             # Store to cache (FP8 data starts at offset 0)
             tl.store(
-                kv_cache_ptr + cache_base + h_offsets * stride_cache_elem,
-                fp8_data,
-                mask=h_mask
+                kv_cache_ptr + cache_base + h_offsets * stride_cache_elem, fp8_data, mask=h_mask
             )
 
         # ===== Scatter scale data =====
@@ -814,14 +812,14 @@ def compressed_kv_scatter_kernel(
             scale_data = tl.load(
                 kv_scale_ptr + global_token_idx * stride_scale_token + s_offsets,
                 mask=s_mask,
-                other=0
+                other=0,
             )
 
             # Store to cache
             tl.store(
                 kv_cache_ptr + scale_cache_offset + s_offsets * stride_cache_elem,
                 scale_data,
-                mask=s_mask
+                mask=s_mask,
             )
     else:
         # Default mode: cache layout is [num_blocks, kv_factor, tokens * head_dim]
@@ -834,19 +832,15 @@ def compressed_kv_scatter_kernel(
 
             data = tl.load(
                 compressed_kv_ptr + global_token_idx * stride_in_token + h_offsets * stride_in_elem,
-                mask=h_mask
+                mask=h_mask,
             )
-            tl.store(
-                kv_cache_ptr + cache_base + h_offsets * stride_cache_elem,
-                data,
-                mask=h_mask
-            )
+            tl.store(kv_cache_ptr + cache_base + h_offsets * stride_cache_elem, data, mask=h_mask)
 
 
 def compressed_kv_scatter(
     compressed_kv: torch.Tensor,  # [total_outputs, head_dim] packed, any dtype
     num_comp_tokens: torch.Tensor,  # [bsz] number of compressed tokens per batch
-    cu_kv_comp: torch.Tensor,  # [bsz+1] cumulative output offsets
+    cu_new_comp_kv: torch.Tensor,  # [bsz+1] cumulative output offsets
     start_pos: torch.Tensor,  # [bsz] compressed cache position
     kv_cache: torch.Tensor,  # [num_blocks, kv_factor, tokens_per_block * head_dim]
     block_offsets: torch.Tensor,  # [num_pools, batch_size, 2, max_blocks_per_seq]
@@ -870,7 +864,7 @@ def compressed_kv_scatter(
             - For "fp8_pertensor": uint8 (FP8 bytes), scale stored separately
             - For "fp8_blockwise": uint8 (FP8 bytes)
         num_comp_tokens: [bsz] number of valid outputs per batch
-        cu_kv_comp: [bsz+1] cumulative output offsets
+        cu_new_comp_kv: [bsz+1] cumulative output offsets
         start_pos: [bsz] starting position in compressed cache
         kv_cache: [num_blocks, kv_factor, tokens_per_block * head_dim], same dtype as input
         block_offsets: [num_pools, batch_size, 2, max_blocks_per_seq]
@@ -900,7 +894,7 @@ def compressed_kv_scatter(
             compressed_kv,
             kv_scale,
             num_comp_tokens,
-            cu_kv_comp,
+            cu_new_comp_kv,
             start_pos,
             kv_cache,
             block_offsets,
@@ -929,7 +923,7 @@ def compressed_kv_scatter(
             compressed_kv,
             dummy_scale,  # Not used when IS_BLOCKWISE_FP8=False
             num_comp_tokens,
-            cu_kv_comp,
+            cu_new_comp_kv,
             start_pos,
             kv_cache,
             block_offsets,

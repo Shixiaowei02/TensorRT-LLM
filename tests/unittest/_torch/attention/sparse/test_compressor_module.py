@@ -60,10 +60,11 @@ class DummyAttentionMetadata:
         kv_cache_manager: DummyKVCacheManager,
         block_tables: dict,
         cu_seq_lens: dict,
-        cu_kv_comp: dict,
+        cu_new_comp_kv: dict,
         compressed_position_ids: dict,
         compressed_kv_lens: dict,
-        compressed_start_positions: dict,
+        past_kv_lens: dict,
+        num_compressed_tokens: dict,
         slot_mapping_fp8: torch.Tensor = None,
         slot_mapping_scale: torch.Tensor = None,
     ):
@@ -73,13 +74,14 @@ class DummyAttentionMetadata:
         self.num_tokens = num_tokens
         self.kv_cache_manager = kv_cache_manager
         self.block_tables = block_tables
-        self.cu_seq_lens = cu_seq_lens
-        self.cu_kv_comp = cu_kv_comp
-        self.compressed_position_ids = compressed_position_ids
-        self.compressed_kv_lens = compressed_kv_lens
-        self.compressed_start_positions = compressed_start_positions
+        self.cu_seq_lens_cuda = cu_seq_lens
+        self.cu_new_comp_kv_cuda = cu_new_comp_kv
+        self.compressed_position_ids_cuda = compressed_position_ids
+        self.compressed_kv_lens_cuda = compressed_kv_lens
+        self.past_kv_lens_cuda = past_kv_lens
         self.slot_mapping_fp8 = slot_mapping_fp8
         self.slot_mapping_scale = slot_mapping_scale
+        self.num_compressed_tokens = num_compressed_tokens
 
 
 # ============================================================================
@@ -501,7 +503,8 @@ def assert_fp8_cache_match(
     diff_indices = torch.nonzero(diff_mask.view(-1))[:5]
     for idx in diff_indices:
         flat_idx = idx.item()
-        msg += f"\n  Byte {flat_idx}: kernel={kernel_cache.view(-1)[flat_idx].item()}, golden={golden_cache.view(-1)[flat_idx].item()}"
+        msg += f"\n  Byte {flat_idx}: kernel={kernel_cache.view(-1)[flat_idx].item()}, "
+        msg += f"golden={golden_cache.view(-1)[flat_idx].item()}"
 
     raise AssertionError(msg)
 
@@ -722,10 +725,14 @@ class CompressorWrapper:
                 int(seq_lens_reordered[num_contexts:].sum().item()) if num_generations > 0 else 0
             )
             seq_lens = seq_lens_reordered
-            start_pos_for_kv = start_pos_reordered
+            past_kv_lens = start_pos_reordered
 
             # Store reorder_indices for block table selection later
             batch_indices_for_blocks = reorder_indices
+
+            # Get number of compressed tokens
+            num_ctx_compressed_tokens = (seq_lens[:num_contexts] // ratio).sum().item()
+            num_gen_compressed_tokens = num_generations
         else:
             # Original single-mode logic
             bsz, seqlen, _ = x.size()
@@ -738,7 +745,9 @@ class CompressorWrapper:
                 num_ctx_tokens = 0
                 num_gen_tokens = bsz
                 seq_lens = torch.ones(bsz, dtype=torch.int32, device=DEVICE)
-                start_pos_for_kv = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
+                past_kv_lens = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
+                num_ctx_compressed_tokens = 0
+                num_gen_compressed_tokens = bsz
             else:
                 # Prefill mode
                 num_contexts = bsz
@@ -746,35 +755,33 @@ class CompressorWrapper:
                 num_ctx_tokens = bsz * seqlen
                 num_gen_tokens = 0
                 seq_lens = torch.full((bsz,), seqlen, dtype=torch.int32, device=DEVICE)
-                start_pos_for_kv = torch.zeros(bsz, dtype=torch.int32, device=DEVICE)
+                past_kv_lens = torch.zeros(bsz, dtype=torch.int32, device=DEVICE)
+                num_ctx_compressed_tokens = (seq_lens // ratio).sum().item()
+                num_gen_compressed_tokens = 0
 
             # No reordering needed in simple mode
             batch_indices_for_blocks = None
 
         cu_seq_lens = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
         cu_seq_lens[1:] = seq_lens.cumsum(0)
+        num_compressed_tokens = num_ctx_compressed_tokens + num_gen_compressed_tokens
 
         # Compute KV lengths (past + current) per sequence
-        kv_lens = start_pos_for_kv + seq_lens
+        kv_lens = past_kv_lens + seq_lens
 
         # Compute number of compressed outputs per batch
         # For prefill (start_pos=0): compress every ratio tokens
         # For decode (start_pos>0): compress only if we complete a chunk
-        is_prefill = start_pos_for_kv == 0
+        is_prefill = past_kv_lens == 0
         num_comp_prefill = seq_lens // ratio
-        should_compress_decode = ((start_pos_for_kv + seq_lens) % ratio == 0).to(torch.int32)
+        should_compress_decode = ((past_kv_lens + seq_lens) % ratio == 0).to(torch.int32)
         num_comp = torch.where(is_prefill, num_comp_prefill, should_compress_decode)
 
-        cu_kv_comp = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
-        cu_kv_comp[1:] = num_comp.cumsum(0)
-
-        # Compute compressed start positions per sequence
-        compressed_start_pos = start_pos_for_kv // ratio
+        cu_new_comp_kv = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
+        cu_new_comp_kv[1:] = num_comp.cumsum(0)
 
         # Create position IDs for compressed outputs
-        total_outputs = cu_kv_comp[-1].item()
-        num_position_ids = max(total_outputs, 1)
-        position_ids = torch.zeros(num_position_ids, dtype=torch.int64, device=DEVICE)
+        position_ids = torch.zeros(num_compressed_tokens, dtype=torch.int64, device=DEVICE)
         offset = 0
         for b in range(bsz):
             n_out = num_comp[b].item()
@@ -785,7 +792,7 @@ class CompressorWrapper:
             else:
                 # Decode: position is start_pos
                 for i in range(n_out):
-                    position_ids[offset + i] = start_pos_for_kv[b].item()
+                    position_ids[offset + i] = past_kv_lens[b].item()
             offset += n_out
 
         # Build dummy KV cache manager
@@ -814,11 +821,11 @@ class CompressorWrapper:
         }
 
         # Build dicts keyed by compress_ratio
-        cu_seq_lens_dict = {ratio: cu_seq_lens}
-        cu_kv_comp_dict = {ratio: cu_kv_comp}
+        cu_new_comp_kv_dict = {ratio: cu_new_comp_kv}
         compressed_position_ids_dict = {ratio: position_ids}
         compressed_kv_lens_dict = {ratio: kv_lens}
-        compressed_start_positions_dict = {ratio: compressed_start_pos}
+        past_kv_lens_dict = {ratio: past_kv_lens // ratio}
+        num_compressed_tokens_dict = {ratio: num_compressed_tokens}
 
         # Build dummy attention metadata
         metadata = DummyAttentionMetadata(
@@ -828,11 +835,12 @@ class CompressorWrapper:
             num_tokens=num_ctx_tokens + num_gen_tokens,
             kv_cache_manager=dummy_kv_cache_manager,
             block_tables=block_tables,
-            cu_seq_lens=cu_seq_lens_dict,
-            cu_kv_comp=cu_kv_comp_dict,
+            cu_seq_lens=cu_seq_lens,
+            cu_new_comp_kv=cu_new_comp_kv_dict,
             compressed_position_ids=compressed_position_ids_dict,
             compressed_kv_lens=compressed_kv_lens_dict,
-            compressed_start_positions=compressed_start_positions_dict,
+            past_kv_lens=past_kv_lens_dict,
+            num_compressed_tokens=num_compressed_tokens_dict,
         )
 
         # Call the compressor forward
@@ -844,15 +852,15 @@ class CompressorWrapper:
 
         # For default mode, reshape output to [bsz, num_compressed, head_dim]
         kv_comp = result
-        total_outputs = cu_kv_comp[-1].item()
+        total_outputs = cu_new_comp_kv[-1].item()
         if total_outputs == 0:
             return None
 
         # Split packed output back to per-batch
         outputs = []
         for b in range(bsz):
-            start = cu_kv_comp[b].item()
-            end = cu_kv_comp[b + 1].item()
+            start = cu_new_comp_kv[b].item()
+            end = cu_new_comp_kv[b + 1].item()
             if end > start:
                 outputs.append(kv_comp[start:end])
             else:

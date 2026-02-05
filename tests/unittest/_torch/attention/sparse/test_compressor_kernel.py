@@ -19,7 +19,7 @@ from tensorrt_llm._torch.attention_backend.sparse.mewtwo.kernel import (
 
 
 def prepare_compress_output(
-    cu_kv_comp: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
     batch_size: int,
     head_dim: int,
     device: torch.device,
@@ -28,7 +28,7 @@ def prepare_compress_output(
     """Pre-allocate output tensors for compression kernels.
 
     Args:
-        cu_kv_comp: [bsz+1] cumulative output offsets
+        cu_new_comp_kv: [bsz+1] cumulative output offsets
         batch_size: Number of batches
         head_dim: Dimension of KV head
         device: Target device
@@ -38,7 +38,7 @@ def prepare_compress_output(
         kv_comp: [total_outputs, head_dim] output buffer
         compressed_mask: [batch_size] bool mask buffer
     """
-    total_outputs = cu_kv_comp[-1].item()
+    total_outputs = cu_new_comp_kv[-1].item()
     kv_comp = torch.empty(total_outputs, head_dim, device=device, dtype=dtype)
     compressed_mask = torch.empty(batch_size, device=device, dtype=torch.bool)
     return kv_comp, compressed_mask
@@ -1047,9 +1047,9 @@ def test_compressed_kv_scatter(
 ):
     """Test compressed KV scatter kernel."""
     num_outputs = torch.tensor(num_outputs_list, device="cuda", dtype=torch.int32)
-    cu_kv_comp = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-    cu_kv_comp[1:] = torch.cumsum(num_outputs, dim=0)
-    total_outputs = cu_kv_comp[-1].item()
+    cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
+    cu_new_comp_kv[1:] = torch.cumsum(num_outputs, dim=0)
+    total_outputs = cu_new_comp_kv[-1].item()
     compressed_kv = torch.randn(total_outputs, head_dim, device="cuda")
     start_pos = torch.tensor(start_positions, device="cuda", dtype=torch.int32)
 
@@ -1061,7 +1061,7 @@ def test_compressed_kv_scatter(
     compressed_kv_scatter(
         compressed_kv,
         num_outputs,
-        cu_kv_comp,
+        cu_new_comp_kv,
         start_pos,
         kv_cache,
         block_offsets,
@@ -1075,7 +1075,7 @@ def test_compressed_kv_scatter(
             logical_block = cache_pos // tokens_per_block
             token_offset = cache_pos % tokens_per_block
             phys_block = block_offsets[0, b, 0, logical_block].item()
-            expected = compressed_kv[cu_kv_comp[b].item() + i]
+            expected = compressed_kv[cu_new_comp_kv[b].item() + i]
             actual = kv_cache[
                 phys_block, 0, token_offset * head_dim : (token_offset + 1) * head_dim
             ]
@@ -1088,65 +1088,66 @@ def test_compressed_kv_scatter(
 # FP8 Blockwise Scatter Tests
 # ============================================================================
 
+
 @pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize("batch_size,tokens_per_req", [(1, 32), (3, 32)])
 def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
     """
     Compare Triton FP8 scatter kernel vs CUDA kernel (torch.ops.trtllm.indexer_k_cache_scatter_op).
-    
+
     The CUDA kernel only supports head_dim=128, so for larger head_dim we compare
     against the Python reference. For head_dim=128, we use the CUDA kernel as golden.
     """
     from tensorrt_llm.quantization.utils import fp8_utils
-    
+
     torch.manual_seed(123)
-    
+
     block_size = 64
     num_tokens = batch_size * tokens_per_req
     max_seq_len = 512
-    
+
     # Compute scale size (1x128 blockwise quantization)
     num_scale_blocks = (head_dim + 127) // 128
     scale_size = num_scale_blocks * 4
     per_token_size = head_dim + scale_size
-    
+
     # Allocate cache with enough blocks
     max_blocks = (max_seq_len + block_size - 1) // block_size
     num_blocks = batch_size * max_blocks
-    
+
     # Cache for Triton kernel
     kv_cache_triton = torch.zeros(
         num_blocks, block_size, per_token_size, device="cuda", dtype=torch.uint8
     )
     # Cache for golden (CUDA kernel or Python reference)
     kv_cache_golden = torch.zeros_like(kv_cache_triton)
-    
+
     # Block offsets: [num_pools, batch_size, 2, max_blocks]
     block_offsets = torch.zeros(1, batch_size, 2, max_blocks, device="cuda", dtype=torch.int32)
     for b in range(batch_size):
         for blk in range(max_blocks):
             block_offsets[0, b, :, blk] = b * max_blocks + blk
-    
+
     # Generate test data
     k_original = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
-    
+
     # Prepare byte-level data
     # Note: Need to flatten before viewing as bytes to ensure stride(-1) == 1
     k_fp8_bytes = k_fp8.contiguous().flatten().view(torch.uint8).view(num_tokens, head_dim)
     k_scale_bytes = k_scale.contiguous().flatten().view(torch.uint8).view(num_tokens, scale_size)
-    
+
     # Metadata
     num_comp_tokens = torch.full((batch_size,), tokens_per_req, device="cuda", dtype=torch.int32)
-    cu_kv_comp = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-    cu_kv_comp[1:] = num_comp_tokens.cumsum(0)
+    cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
+    cu_new_comp_kv[1:] = num_comp_tokens.cumsum(0)
     start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
-    
+
     # ========== Triton Kernel ==========
     compressed_kv_scatter(
         k_fp8_bytes,
         num_comp_tokens,
-        cu_kv_comp,
+        cu_new_comp_kv,
         start_pos,
         kv_cache_triton,
         block_offsets,
@@ -1156,14 +1157,14 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
         kv_scale=k_scale_bytes,
     )
     torch.cuda.synchronize()
-    
+
     # ========== Golden: CUDA kernel for head_dim=128, Python for others ==========
     if head_dim == 128:
         # Use CUDA kernel as golden (it only supports head_dim=128)
         # Need to compute flat slot mappings for the CUDA kernel
         slot_mapping_fp8 = torch.zeros(num_tokens, device="cuda", dtype=torch.int64)
         slot_mapping_scale = torch.zeros(num_tokens, device="cuda", dtype=torch.int64)
-        
+
         global_token_idx = 0
         for b in range(batch_size):
             for local_idx in range(tokens_per_req):
@@ -1171,24 +1172,26 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
                 logical_block = cache_pos // block_size
                 token_offset = cache_pos % block_size
                 phys_block = int(block_offsets[0, b, 0, logical_block].item())
-                
+
                 # Flat byte index for FP8 data
-                fp8_offset = phys_block * block_size * per_token_size + token_offset * per_token_size
+                fp8_offset = (
+                    phys_block * block_size * per_token_size + token_offset * per_token_size
+                )
                 # Flat byte index for scale data
                 scale_offset = fp8_offset + head_dim
-                
+
                 slot_mapping_fp8[global_token_idx] = fp8_offset
                 slot_mapping_scale[global_token_idx] = scale_offset
                 global_token_idx += 1
-        
+
         # Reshape cache for CUDA kernel: [num_blocks, block_size, 1, per_token_size]
         kv_cache_golden_4d = kv_cache_golden.view(num_blocks, block_size, 1, per_token_size)
-        
+
         torch.ops.trtllm.indexer_k_cache_scatter_op(
             k_fp8_bytes, k_scale_bytes, kv_cache_golden_4d, slot_mapping_fp8, slot_mapping_scale
         )
         torch.cuda.synchronize()
-        
+
         # Flatten back for comparison
         kv_cache_golden = kv_cache_golden_4d.view(num_blocks, block_size, per_token_size)
     else:
@@ -1200,14 +1203,16 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
                 logical_block = cache_pos // block_size
                 token_offset = cache_pos % block_size
                 phys_block = int(block_offsets[0, b, 0, logical_block].item())
-                
+
                 # Write FP8 data
                 kv_cache_golden[phys_block, token_offset, :head_dim] = k_fp8_bytes[global_token_idx]
                 # Write scale data
-                kv_cache_golden[phys_block, token_offset, head_dim:head_dim + scale_size] = k_scale_bytes[global_token_idx]
-                
+                kv_cache_golden[phys_block, token_offset, head_dim : head_dim + scale_size] = (
+                    k_scale_bytes[global_token_idx]
+                )
+
                 global_token_idx += 1
-    
+
     # ========== Validation ==========
     if torch.equal(kv_cache_triton, kv_cache_golden):
         print(f"PASS: head_dim={head_dim}, batch={batch_size}, tokens={num_tokens}")
@@ -1216,7 +1221,7 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
         diff_mask = kv_cache_triton != kv_cache_golden
         num_diffs = diff_mask.sum().item()
         total_bytes = kv_cache_triton.numel()
-        
+
         # Show first few differences
         diff_indices = torch.nonzero(diff_mask.view(-1))[:5]
         for idx in diff_indices:
@@ -1225,7 +1230,7 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
                 f"  Byte {flat_idx}: Triton={kv_cache_triton.view(-1)[flat_idx].item()}, "
                 f"Golden={kv_cache_golden.view(-1)[flat_idx].item()}"
             )
-        
+
         raise AssertionError(
-            f"Triton kernel differs from golden: {num_diffs}/{total_bytes} bytes ({100*num_diffs/total_bytes:.4f}%)"
+            f"Triton kernel differs from golden: {num_diffs}/{total_bytes} bytes ({100 * num_diffs / total_bytes:.4f}%)"
         )

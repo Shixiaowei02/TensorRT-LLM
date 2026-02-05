@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -12,7 +12,9 @@ from tensorrt_llm._torch.utils import maybe_compiled_cat
 from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import compressed_kv_scatter, kv_compress_prefill_triton, kv_compress_triton
-from .mewtwo import MewtwoAttentionType, MewtwoTrtllmAttentionMetadata
+
+if TYPE_CHECKING:
+    from .mewtwo import MewtwoTrtllmAttentionMetadata
 
 # KV cache dtype options:
 #   "default"      - bf16/fp16, no quantization
@@ -90,7 +92,7 @@ class Compressor(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        metadata: MewtwoTrtllmAttentionMetadata,
+        metadata: "MewtwoTrtllmAttentionMetadata",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], None]:
         """Forward pass for paged KV compression.
 
@@ -103,6 +105,9 @@ class Compressor(nn.Module):
             - "fp8_blockwise" mode: (kv_fp8, kv_scale) tuple
             - "fp8_pertensor" mode: (kv_fp8, scale) tuple
         """
+        # Import at runtime to avoid circular dependency
+        from .mewtwo import MewtwoAttentionType
+
         # Extract metadata
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
@@ -130,17 +135,17 @@ class Compressor(nn.Module):
         block_table_score_state = metadata.block_tables[score_type]
 
         # Get compression metadata
-        cu_kv_comp = metadata.cu_kv_comp[self.compress_ratio]
-        kv_lens = metadata.compressed_kv_lens[self.compress_ratio]
-        num_comp_tokens = cu_kv_comp[1:] - cu_kv_comp[:-1]
+        cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
+        kv_lens = metadata.compressed_kv_lens_cuda[self.compress_ratio]
+        total_num_comp_tokens = metadata.num_compressed_tokens[self.compress_ratio]
+        # TODO: Move this to metadata preparation
+        num_comp_tokens = cu_new_comp_kv[1:] - cu_new_comp_kv[:-1]
 
         # Project input to KV and score
         kv_score = self.wkv_gate(x.float())
 
-        # Allocate output buffer (TODO: fix CUDA graph compatibility)
-        kv_comp = torch.empty(
-            max(cu_kv_comp[-1].item(), 1), self.head_dim, device=x.device, dtype=x.dtype
-        )
+        # Allocate output buffer
+        kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
         compressed_mask = torch.empty(bsz, device=x.device, dtype=torch.bool)
 
         # Run compression kernels
@@ -150,8 +155,8 @@ class Compressor(nn.Module):
                 ape=self.ape,
                 kv_lens=kv_lens[:num_contexts],
                 start_pos=None,
-                cu_seq_lens=metadata.cu_seq_lens[self.compress_ratio],
-                cu_kv_comp=cu_kv_comp[: num_contexts + 1],
+                cu_seq_lens=metadata.cu_seq_lens_cuda,
+                cu_new_comp_kv=cu_new_comp_kv[: num_contexts + 1],
                 kv_comp=kv_comp,
                 compressed_mask=compressed_mask[:num_contexts],
                 paged_kv=paged_kv_state,
@@ -171,8 +176,8 @@ class Compressor(nn.Module):
                 ape=self.ape,
                 kv_lens=kv_lens[num_contexts:],
                 start_pos=None,
-                cu_seq_lens=metadata.cu_seq_lens[self.compress_ratio],
-                cu_kv_comp=cu_kv_comp[num_contexts:],
+                cu_seq_lens=metadata.cu_seq_lens_cuda,
+                cu_new_comp_kv=cu_new_comp_kv[num_contexts:],
                 kv_comp=kv_comp,
                 compressed_mask=compressed_mask[num_contexts:],
                 paged_kv=paged_kv_state,
@@ -186,32 +191,40 @@ class Compressor(nn.Module):
                 next_n=num_gen_tokens // num_generations,
             )
 
+        # If there are no compressed tokens, there should be no generation requests.
+        # Directly return the compressed tokens.
+        if total_num_comp_tokens == 0:
+            if self.kv_cache_dtype == "fp8_blockwise":
+                return None, None
+            else:
+                return kv_comp
+
         # Post-processing: RMSNorm -> RoPE -> Hadamard rotation
         kv_comp = self.norm(kv_comp)
         kv_comp_nope, kv_comp_pe = kv_comp.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
         kv_comp_pe = self.rotary_emb(
-            metadata.compressed_position_ids[self.compress_ratio], [kv_comp_pe]
+            metadata.compressed_position_ids_cuda[self.compress_ratio], [kv_comp_pe]
         )
         kv_comp = maybe_compiled_cat([kv_comp_nope, kv_comp_pe[0]], dim=-1)
         kv_comp = rotate_activation(kv_comp)
 
         # Scatter to cache with appropriate quantization
-        start_pos = metadata.compressed_start_positions[self.compress_ratio][:bsz]
+        start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
         num_comp_tokens_bsz = num_comp_tokens[:bsz]
 
         if self.kv_cache_dtype == "fp8_blockwise":
             return self._scatter_fp8_blockwise(
-                kv_comp, num_comp_tokens_bsz, cu_kv_comp, start_pos, kv_cache, block_table
+                kv_comp, num_comp_tokens_bsz, cu_new_comp_kv, start_pos, kv_cache, block_table
             )
         elif self.kv_cache_dtype == "fp8_pertensor":
             return self._scatter_fp8_pertensor(
-                kv_comp, num_comp_tokens_bsz, cu_kv_comp, start_pos, kv_cache, block_table
+                kv_comp, num_comp_tokens_bsz, cu_new_comp_kv, start_pos, kv_cache, block_table
             )
         else:
             compressed_kv_scatter(
                 kv_comp,
                 num_comp_tokens_bsz,
-                cu_kv_comp,
+                cu_new_comp_kv,
                 start_pos,
                 kv_cache,
                 block_table,
@@ -224,7 +237,7 @@ class Compressor(nn.Module):
         self,
         kv_comp: torch.Tensor,
         num_comp_tokens: torch.Tensor,
-        cu_kv_comp: torch.Tensor,
+        cu_new_comp_kv: torch.Tensor,
         start_pos: torch.Tensor,
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
@@ -249,7 +262,7 @@ class Compressor(nn.Module):
         compressed_kv_scatter(
             kv_fp8_bytes,
             num_comp_tokens,
-            cu_kv_comp,
+            cu_new_comp_kv,
             start_pos,
             kv_cache,
             block_offsets,
@@ -264,7 +277,7 @@ class Compressor(nn.Module):
         self,
         kv_comp: torch.Tensor,
         num_comp_tokens: torch.Tensor,
-        cu_kv_comp: torch.Tensor,
+        cu_new_comp_kv: torch.Tensor,
         start_pos: torch.Tensor,
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
@@ -293,7 +306,7 @@ class Compressor(nn.Module):
         compressed_kv_scatter(
             kv_fp8.view(torch.uint8),
             num_comp_tokens,
-            cu_kv_comp,
+            cu_new_comp_kv,
             start_pos,
             kv_cache,
             block_offsets,

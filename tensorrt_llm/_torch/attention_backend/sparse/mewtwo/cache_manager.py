@@ -508,3 +508,22 @@ class MewtwoCacheManager(KVCacheManagerV2):
             return is_sparse
         elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
             return is_sparse
+
+    def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
+        """
+        Get the buffers for the indexer k cache for a specific layer.
+        """
+        return self.get_buffers(layer_idx, MewtwoAttentionType.INDEXER_COMPRESS).unsqueeze(2)
+
+    def get_batch_indexer_k_cache_indices(self, request_ids: List[int]) -> List[List[int]]:
+        """
+        Get the indices for the indexer k cache for a specific batch of requests.
+        """
+        cache_indices_list = []
+        for i, request_id in enumerate(request_ids):
+            # In Mewtwo module, there is no indexer in the first two layers, so we use 2 as the layer index
+            cache_indices = self.get_cache_indices(
+                request_id, 2, MewtwoAttentionType.INDEXER_COMPRESS
+            )
+            cache_indices_list.append(cache_indices)
+        return cache_indices_list
