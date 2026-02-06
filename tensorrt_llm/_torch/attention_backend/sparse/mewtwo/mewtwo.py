@@ -10,17 +10,66 @@ from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_para
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float
+from ..kernel import mewtwo_local_to_global_indices
 from .compressor import Compressor
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 
+def build_window_local_indices(
+    token_positions: torch.Tensor,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build SWA local indices for all tokens.
+    """
+    positions = token_positions.unsqueeze(1)  # [num_tokens, 1]
+    offsets = torch.arange(window_size, dtype=torch.int32, device=device)
+
+    # matrix[i, j] = max(0, pos[i] - window_size + 1) + j
+    swa_start = (positions - window_size + 1).clamp(min=0)
+    swa_indices = swa_start + offsets
+
+    swa_indices = torch.where(swa_indices > positions, -1, swa_indices)
+    return swa_indices.to(torch.int32)
+
+
+def build_compressed_local_indices(
+    token_positions: torch.Tensor,
+    compress_ratio: int,
+    max_compressed_indices: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build compressed local indices for compress_ratio=128.
+    For each token, indices are arange(0, (pos+1) // compress_ratio).
+    """
+    num_tokens = token_positions.shape[0]
+    # Number of valid compressed indices per token
+    num_valid = (token_positions + 1) // compress_ratio  # [num_tokens]
+
+    # Create output filled with -1
+    indices = torch.full((num_tokens, max_compressed_indices), -1, dtype=torch.int32, device=device)
+
+    # Generate sequential indices: 0, 1, 2, ..., max_compressed_indices-1
+    col_indices = torch.arange(max_compressed_indices, dtype=torch.int32, device=device)
+
+    # Mask: valid where col_idx < num_valid[row]
+    valid_mask = col_indices.unsqueeze(0) < num_valid.unsqueeze(1)
+
+    # Fill valid positions with sequential indices
+    indices = torch.where(valid_mask, col_indices.unsqueeze(0).expand(num_tokens, -1), indices)
+
+    return indices
+
+
 class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
     # The number of total compressed tokens for each compress ratio
-    num_compressed_tokens: Dict[int, int]
+    num_compressed_tokens: Dict[int, int] = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -126,6 +175,171 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.empty_topk_indices_buffer.fill_(-1)
 
+        # SWA local indices
+        self.swa_local_indices_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens, self.sparse_attention_config.window_size),
+            cache_name="swa_local_indices_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+        # Compute max_compressed_indices for CUDA graph compatibility
+        self.max_compressed_indices = {
+            1: 0,  # No compressed indices
+            4: self.sparse_mla_topk,  # index_topk from indexer
+            128: math.ceil(self.max_seq_len / 128),  # All compressed tokens
+        }
+
+        # Compressed local indices for compress_ratio=128
+        # Note: ratio=4 uses dynamic topk_indices from indexer, so we only pre-allocate for ratio=128
+        self.compressed_local_indices_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens, self.max_compressed_indices[128]),
+            cache_name="compressed_local_indices_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+        # Block tables for cache buffers
+        self.cache_buffer_block_offsets = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
+                cache_name=f"cache_buffer_block_offsets_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+        self.host_cache_buffer_block_offsets = {
+            compress_ratio: torch.empty_like(
+                self.cache_buffer_block_offsets[compress_ratio], device="cpu", pin_memory=True
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+
+        # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
+        # Shape: [max_num_tokens] per compress_ratio
+        self.sparse_mla_topk_lens = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name=f"sparse_mla_topk_lens_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+
+    def prepare_for_cache_block_offsets(self):
+        """
+        Prepare block offsets for cache buffers.
+        """
+        # Build cache buffer block offsets for all compress_ratios
+        for compress_ratio in self.compress_ratio_set:
+            for i in range(self.num_seqs):
+                request_id = self.request_ids[i]
+                if compress_ratio == 1:
+                    layer_idx = 0
+                    attn_type = MewtwoAttentionType.SWA
+                else:
+                    attn_type = MewtwoAttentionType.INDEXER_COMPRESS
+                    if compress_ratio == 4:
+                        layer_idx = 2
+                    else:
+                        layer_idx = 3
+                cache_buffer_blocks = self.kv_cache_manager.get_cache_indices(
+                    request_id, layer_idx=layer_idx, attn_type=attn_type
+                )
+                self.host_cache_buffer_block_offsets[compress_ratio][
+                    i, : len(cache_buffer_blocks)
+                ].copy_(torch.tensor(cache_buffer_blocks, dtype=torch.int32, device="cpu"))
+            self.cache_buffer_block_offsets[compress_ratio][: self.num_seqs].copy_(
+                self.host_cache_buffer_block_offsets[compress_ratio][: self.num_seqs],
+                non_blocking=True,
+            )
+
+    def prepare_for_mewtwo_indices(self):
+        """Prepare SWA local indices, compressed indices for ratio=128, and sparse_mla_topk_lens."""
+        window_size = self.sparse_attention_config.window_size
+        num_requests = self.num_seqs
+        device = self.swa_local_indices_cuda.device
+
+        # Build token positions tensor
+        cached_token_lens = torch.tensor(
+            self.kv_cache_params.num_cached_tokens_per_seq[:num_requests],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Vectorized: create positions for all tokens
+        token_positions = torch.zeros(self.num_tokens, dtype=torch.int32, device=device)
+        token_idx = 0
+        for req_idx in range(num_requests):
+            seq_len = self.seq_lens[req_idx]
+            base_pos = cached_token_lens[req_idx]
+            token_positions[token_idx : token_idx + seq_len] = base_pos + torch.arange(
+                seq_len, dtype=torch.int32, device=device
+            )
+            token_idx += seq_len
+
+        # Build SWA local indices using helper function
+        swa_indices = build_window_local_indices(
+            token_positions[: self.num_tokens], window_size, device
+        )
+        self.swa_local_indices_cuda[: self.num_tokens].copy_(swa_indices)
+
+        # Build compressed local indices for compress_ratio=128
+        # Note: ratio=4 uses dynamic topk_indices from indexer, not pre-allocated
+        compressed_indices = build_compressed_local_indices(
+            token_positions[: self.num_tokens],
+            compress_ratio=128,
+            max_compressed_indices=self.max_compressed_indices[128],
+            device=device,
+        )
+        self.compressed_local_indices_cuda[: self.num_tokens].copy_(compressed_indices)
+
+        # Build sparse_mla_topk_lens: count of actual attached tokens per token
+        self.prepare_sparse_mla_topk_lens(token_positions[: self.num_tokens])
+
+    def prepare_sparse_mla_topk_lens(self, token_positions: torch.Tensor):
+        """
+        Prepare sparse_mla_topk_lens: actual number of attached tokens per token.
+
+        For each compress_ratio:
+        - compress_ratio=1: min(kv_len, window_size)
+        - compress_ratio=4: min(kv_len, window_size) + min(kv_len // 4, sparse_mla_topk)
+        - compress_ratio=128: min(kv_len, window_size) + kv_len // 128
+        """
+        window_size = self.sparse_attention_config.window_size
+
+        # kv_len for each token = pos + 1
+        kv_lens = token_positions + 1  # [num_tokens]
+
+        swa_count = torch.minimum(kv_lens, torch.full_like(kv_lens, window_size))
+
+        for compress_ratio in self.compress_ratio_set:
+            if compress_ratio == 1:
+                # SWA only
+                total_count = swa_count
+            elif compress_ratio == 4:
+                # SWA + indexer topk
+                compressed_count = torch.minimum(
+                    kv_lens // compress_ratio, torch.full_like(kv_lens, self.sparse_mla_topk)
+                )
+                total_count = swa_count + compressed_count
+            elif compress_ratio == 128:
+                # SWA + all compressed tokens
+                compressed_count = kv_lens // compress_ratio
+                total_count = swa_count + compressed_count
+            else:
+                raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
+
+            self.sparse_mla_topk_lens[compress_ratio][: self.num_tokens].copy_(
+                total_count.to(torch.int32)
+            )
+
     def prepare(self):
         super().super().prepare()
 
@@ -143,6 +357,12 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
+
+        # For block offsets
+        self.prepare_for_cache_block_offsets()
+
+        # For mewtwo indices
+        self.prepare_for_mewtwo_indices()
 
         # Prepare metadata for indexer
         MewtwoIndexer.prepare(metadata=self)
@@ -192,7 +412,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             position_ids = []
             for i in range(self.num_contexts):
                 past_kv_lens = self.past_kv_lens[compress_ratio][i].item()
-                kv_lens = self.compressed_kv_lens[i].item()
+                kv_lens = self.compressed_kv_lens[compress_ratio][i].item()
                 position_ids.extend(list(range(past_kv_lens, kv_lens)))
             for i in range(self.num_generations):
                 # Use a constant number of new compressed KV tokens for each generation request
@@ -342,9 +562,9 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             **kwargs,
         )
 
-        compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
+        self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
 
-        if compress_ratio == 4:
+        if self.compress_ratio == 4:
             self.indexer = MewtwoIndexer(
                 quant_config,
                 pos_embd_params,
@@ -356,12 +576,12 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 aux_stream,
             )
 
-        if compress_ratio > 1:
+        if self.compress_ratio > 1:
             rms_norm_eps = 1e-6
             self.compressor = Compressor(
                 mla_params,
                 layer_idx,
-                compress_ratio,
+                self.compress_ratio,
                 rms_norm_eps,
                 skip_create_weights_in_init,
                 pos_embd_params,
@@ -372,20 +592,88 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: MewtwoTrtllmAttentionMetadata,
         hidden_states: Optional[torch.Tensor] = None,
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
+        topk_indices: Optional[
+            torch.Tensor
+        ] = None,  # compressed indices from indexer (for compress_ratio=4)
         is_generation: bool = True,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Transform the local topk indices to global topk indices in paged kv cache
-        topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices,
-            metadata,
-            self.get_local_layer_idx(metadata),
-            is_generation,
-            compress_ratio=self.compress_ratio,
-        )
-        return topk_indices_global, None
+        """Convert local indices (SWA + compressed) to global pool indices."""
+        layer_idx = self.layer_idx
+        kv_cache_manager = metadata.kv_cache_manager
+
+        # Get buffer pointers directly from kv_cache_manager
+        swa_pool_ptr = kv_cache_manager.layer_attn_to_pool_ptr[
+            MewtwoAttentionType.SWA.value, layer_idx
+        ]
+        swa_buffer_ptr = kv_cache_manager.layer_attn_to_buffer_ptr[
+            MewtwoAttentionType.SWA.value, layer_idx
+        ]
+
+        # Token stride
+        token_stride = kv_cache_manager.get_token_bytes(layer_idx, MewtwoAttentionType.SWA)
+
+        # Select indices/tables based on phase
+        if is_generation:
+            start_idx = metadata.num_ctx_tokens
+            end_idx = metadata.num_tokens
+            req_start = metadata.num_contexts
+            req_end = metadata.num_seqs
+            req_offset = metadata.num_contexts
+        else:
+            start_idx = 0
+            end_idx = metadata.num_ctx_tokens
+            req_start = 0
+            req_end = metadata.num_contexts
+            req_offset = 0
+
+        req_id = (metadata.req_idx_per_token[start_idx:end_idx] - req_offset).to(torch.int32)
+        swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
+        block_table_swa = metadata.cache_buffer_block_offsets[1][req_start:req_end]
+
+        # Handle compressed based on compress_ratio
+        if self.compress_ratio == 1:
+            # SWA only
+            global_indices = mewtwo_local_to_global_indices(
+                req_id=req_id,
+                block_table_swa=block_table_swa,
+                swa_local_indices=swa_local_indices,
+                swa_pool_ptr=swa_pool_ptr,
+                swa_buffer_ptr=swa_buffer_ptr,
+                tokens_per_block=kv_cache_manager.tokens_per_block,
+                token_stride=token_stride,
+                compress_ratio=1,
+            )
+        else:
+            # SWA + compressed indices
+            compressed_buffer_ptr = kv_cache_manager.layer_attn_to_buffer_ptr[
+                MewtwoAttentionType.COMPRESS.value, layer_idx
+            ]
+            block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio][
+                req_start:req_end
+            ]
+            if self.compress_ratio == 4:
+                assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
+                compressed_local_indices = topk_indices
+            else:
+                compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
+            global_indices = mewtwo_local_to_global_indices(
+                req_id=req_id,
+                block_table_swa=block_table_swa,
+                swa_local_indices=swa_local_indices,
+                swa_pool_ptr=swa_pool_ptr,
+                swa_buffer_ptr=swa_buffer_ptr,
+                tokens_per_block=kv_cache_manager.tokens_per_block,
+                token_stride=token_stride,
+                block_table_compressed=block_table_compressed,
+                compressed_local_indices=compressed_local_indices,
+                compressed_buffer_ptr=compressed_buffer_ptr,
+                compress_ratio=self.compress_ratio,
+                num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+            )
+
+        return global_indices, None

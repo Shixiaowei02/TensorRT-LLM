@@ -367,6 +367,9 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
         default=128,
         description="The window size for slicing window attention part.")
 
+    index_topk: Optional[int] = Field(default=512,
+                                      description="The topk for the indexer.")
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)

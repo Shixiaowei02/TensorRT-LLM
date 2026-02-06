@@ -297,6 +297,43 @@ class MewtwoCacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         return self.kv_cache_map[request_id].get_page_indices(pool_id).tolist()
 
+    def get_token_bytes(self, layer_idx: int, attn_type: MewtwoAttentionType) -> int:
+        """
+        Get the token bytes for a specific layer and attention type.
+
+        Args:
+            layer_idx: The layer index
+            attn_type: The attention type
+
+        Returns:
+            The token bytes, shape (1,)
+        """
+
+        if not self._layer_has_attention(layer_idx, attn_type):
+            raise ValueError(f"Layer {layer_idx} does not have attention type {attn_type}")
+
+        attn_dim = self._get_attn_dim(layer_idx, attn_type)
+
+        dtype = self.dtype
+        # (indexer) compressor state and score use compressor_dtype
+        if attn_type in [
+            MewtwoAttentionType.COMPRESSOR_STATE,
+            MewtwoAttentionType.COMPRESSOR_SCORE,
+            MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
+            MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+        ]:
+            dtype = self._compressor_dtype
+        # indexer compress use indexer_dtype
+        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            dtype = self._indexer_dtype
+
+        scale_size = 0
+        # indexer compress has scaling factor
+        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            scale_size = self._indexer_scale_size
+
+        return get_size_in_bytes(attn_dim, dtype) + scale_size
+
     def _create_cache_manager(
         self,
         tokens_per_block: int,
@@ -442,34 +479,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         Returns:
             Size in bytes for this pool
         """
-        if not self._layer_has_attention(layer_idx, attn_type):
-            raise ValueError(f"Layer {layer_idx} does not have attention type {attn_type}")
-
-        attn_dim = self._get_attn_dim(layer_idx, attn_type)
-
-        dtype = self.dtype
-        # (indexer) compressor state and score use compressor_dtype
-        if attn_type in [
-            MewtwoAttentionType.COMPRESSOR_STATE,
-            MewtwoAttentionType.COMPRESSOR_SCORE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
-        ]:
-            dtype = self._compressor_dtype
-        # indexer compress use indexer_dtype
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            dtype = self._indexer_dtype
-
-        scale_size = 0
-        # indexer compress has scaling factor
-        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            scale_size = self._indexer_scale_size
+        token_bytes = self.get_token_bytes(layer_idx, attn_type)
 
         block_size = self.tokens_per_block
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
             block_size = self.compressed_block_sizes[layer_idx]
 
-        return (get_size_in_bytes(attn_dim, dtype) + scale_size) * block_size
+        return token_bytes * block_size
 
     def _get_cache_bytes_per_token(self) -> int:
         """
