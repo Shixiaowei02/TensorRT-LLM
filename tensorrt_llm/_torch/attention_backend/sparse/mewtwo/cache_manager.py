@@ -72,9 +72,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
             f"Unsupported compressor dtype: {compressor_dtype}, only support FP32 and FP8"
         )
 
+        self.index_head_dim = sparse_attn_config.index_head_dim
         self._compress_ratios = sparse_attn_config.compress_ratios
         self._window_size = sparse_attn_config.window_size
-        self._indexer_head_dim = sparse_attn_config.index_head_dim
         self._compressor_dtype = compressor_dtype
         self.compressed_block_sizes = [
             tokens_per_block // self._compress_ratios[i] for i in range(num_layers)
@@ -83,12 +83,12 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # indexer kv cache use blockwise FP8 quantization
         self._indexer_dtype = DataType.FP8
         self._indexer_scale_dtype = DataType.FLOAT
-        self._indexer_quant_block_size = 128
-        assert self._indexer_head_dim % self._indexer_quant_block_size == 0, (
-            f"indexer_head_dim {self._indexer_head_dim} must be divisible by {self._indexer_quant_block_size}"
+        self.quant_block_size = 128
+        assert self.index_head_dim % self.quant_block_size == 0, (
+            f"indexer_head_dim {self.index_head_dim} must be divisible by {self.quant_block_size}"
         )
         self._indexer_scale_size = get_size_in_bytes(
-            self._indexer_head_dim // self._indexer_quant_block_size, self._indexer_scale_dtype
+            self.index_head_dim // self.quant_block_size, self._indexer_scale_dtype
         )
 
         # General initialization
@@ -115,6 +115,12 @@ class MewtwoCacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
         )
 
+        # Cache the first sparse layer index for use in get_batch_indexer_k_cache_indices
+        self._first_sparse_layer_idx = next(
+            (layer for layer in self.pp_layers if self._is_sparse_layer(layer)),
+            None,
+        )
+
         # Used by the KVCacheManagerV2
         self.num_pools = len(self.impl.layer_grouping)
         self.layer_to_pool_mapping_dict = {
@@ -139,12 +145,11 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # to be in the same pool and have the same scale.
         self._assert_layer_pool_scale()
 
-        swa_pool_id = self.impl.get_layer_group_id(
-            self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA]
-        )
         swa_pool_ptr = self.impl.get_mem_pool_base_address(
-            self.impl.layer_grouping[swa_pool_id][0], Role.KEY
+            self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY
         )
+        self.swa_pool_ptr = swa_pool_ptr
+
         swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
 
         def _get_layer_offset(layer_idx: int) -> int:
@@ -235,7 +240,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         base_indices = self.kv_cache_map[request_id].get_base_page_indices(pool_id).tolist()
         scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
-        return [idx * scale for idx in base_indices]
+        return [idx * scale for idx in base_indices if idx != -1]
 
     def get_token_bytes(self, layer_idx: int, attn_type: MewtwoAttentionType) -> int:
         """
@@ -286,12 +291,10 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # Calculate the quota for KV cache
         quota = float("inf")
         if kv_cache_config.max_tokens is not None:
-            quota = int(
-                ceil_div(
-                    kv_cache_config.max_tokens * self._get_cache_bytes_per_token(),
-                    kv_cache_config.max_util_for_resume,
-                )
+            max_tokens = int(
+                ceil_div(kv_cache_config.max_tokens, kv_cache_config.max_util_for_resume) * 1.2
             )
+            quota = int(max_tokens * self._get_cache_bytes_per_token())
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 logger.warning(
                     f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens}"
@@ -476,11 +479,11 @@ class MewtwoCacheManager(KVCacheManagerV2):
         elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
             return state_factor * self.head_dim
         elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            return self._indexer_head_dim
+            return self.index_head_dim
         elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
-            return state_factor * self._indexer_head_dim
+            return state_factor * self.index_head_dim
         elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
-            return state_factor * self._indexer_head_dim
+            return state_factor * self.index_head_dim
 
     def _get_attn_bytes_per_block(
         self,
@@ -582,7 +585,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             # all compress ratios have SWA attention and they are in the same pool
             self._compress_ratios[0],
         )
-        dst_tensor[0, :num_seqs, :] = offsets
+        dst_tensor[0, :num_seqs, 0] = offsets
 
     def get_batch_attn_offset(
         self,
@@ -618,4 +621,5 @@ class MewtwoCacheManager(KVCacheManagerV2):
         pool_id = self._attn_ratio_to_pool_id[attn_type][compress_ratio]
         scale = self._attn_ratio_to_scale[attn_type][compress_ratio]
         offsets = self.host_kv_cache_block_offsets[pool_id, copy_idx, 0] * scale
+        offsets[offsets == -scale] = -1
         return offsets

@@ -1949,8 +1949,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_attn_indices_block_size = 1
         skip_softmax_threshold_scale_factor_prefill = None
         skip_softmax_threshold_scale_factor_decode = None
-        sparse_lens = kwargs.pop("sparse_lens", None)
-        sparse_mla_topk_lens = None
+        self.sparse_mla_topk_lens = metadata.sparse_mla_topk_lens[
+            self.compress_ratio] if hasattr(metadata,
+                                            'sparse_mla_topk_lens') else None
+        self.sparse_mla_topk = metadata.sparse_mla_topk if hasattr(
+            metadata, 'sparse_mla_topk') else 0  # May be updated later
         if self.sparse_attention_config is not None:
             if isinstance(self.sparse_attention_config,
                           SkipSoftmaxAttentionConfig):
@@ -2051,9 +2054,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices=sparse_attn_indices,
             sparse_attn_offsets=sparse_attn_offsets,
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
-            sparse_mla_topk=metadata.sparse_mla_topk if hasattr(
-                metadata, 'sparse_mla_topk') else 0,
-            sparse_mla_topk_lens=sparse_mla_topk_lens,
+            sparse_mla_topk=self.sparse_mla_topk,
+            sparse_mla_topk_lens=self.sparse_mla_topk_lens,
             skip_softmax_threshold_scale_factor_prefill=
             skip_softmax_threshold_scale_factor_prefill,
             skip_softmax_threshold_scale_factor_decode=

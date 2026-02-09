@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -72,8 +72,11 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     num_compressed_tokens: Dict[int, int] = {}
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        sparse_config = kwargs.get("sparse_attention_config")
+        self.compress_ratio = sparse_config.compress_ratios
         self.compress_ratio_set = set(self.compress_ratio)
+        self.num_compressed_tokens = {}
+        super().__init__(*args, **kwargs)
 
     def __post_init__(self):
         super().__post_init__()
@@ -184,11 +187,15 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        # Compute max_compressed_indices for CUDA graph compatibility
+        # Compute max_compressed_indices for CUDA graph compatibility.
+        # For ratio=4, the indexer selects index_topk compressed tokens.
+        # For ratio=128, use max_seq_len / 128 rounded up to next power of 2
+        raw_128 = math.ceil(self.max_seq_len / 128)
+        po2_128 = 1 << (raw_128 - 1).bit_length() if raw_128 > 0 else 1
         self.max_compressed_indices = {
             1: 0,  # No compressed indices
             4: self.sparse_mla_topk,  # index_topk from indexer
-            128: math.ceil(self.max_seq_len / 128),  # All compressed tokens
+            128: po2_128,  # All compressed tokens, rounded to power of 2
         }
 
         # Compressed local indices for compress_ratio=128
@@ -240,15 +247,12 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for compress_ratio in self.compress_ratio_set:
             for i in range(self.num_seqs):
                 request_id = self.request_ids[i]
+                # Get the layer index for the compress ratio
+                layer_idx = self.compress_ratio.index(compress_ratio)
                 if compress_ratio == 1:
-                    layer_idx = 0
                     attn_type = MewtwoAttentionType.SWA
                 else:
-                    attn_type = MewtwoAttentionType.INDEXER_COMPRESS
-                    if compress_ratio == 4:
-                        layer_idx = 2
-                    else:
-                        layer_idx = 3
+                    attn_type = MewtwoAttentionType.COMPRESS
                 cache_buffer_blocks = self.kv_cache_manager.get_cache_indices(
                     request_id, layer_idx=layer_idx, attn_type=attn_type
                 )
@@ -341,7 +345,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
     def prepare(self):
-        super().super().prepare()
+        TrtllmAttentionMetadata.prepare(self)
 
         cached_token_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq,
@@ -351,6 +355,21 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         kv_lens = cached_token_lens + self.seq_lens_kv
         num_requests = self.num_contexts + self.num_generations
         num_gen_tokens = self.num_tokens - self.num_ctx_tokens
+
+        # Cache buffer data pointers
+        self.swa_buffer_ptrs = {
+            layer_idx: self.kv_cache_manager.get_buffers(
+                layer_idx, MewtwoAttentionType.SWA
+            ).data_ptr()
+            for layer_idx in range(self.kv_cache_manager.num_local_layers)
+        }
+        self.compressed_buffer_ptrs = {
+            layer_idx: self.kv_cache_manager.get_buffers(
+                layer_idx, MewtwoAttentionType.COMPRESS
+            ).data_ptr()
+            for layer_idx in range(self.kv_cache_manager.num_local_layers)
+            if self.kv_cache_manager._is_compress_layer(layer_idx)
+        }
 
         # For indices conversion
         self.prepare_for_indices_conversion()
@@ -376,7 +395,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Prepare num_compressed_tokens, cu_new_comp_kv_cuda/cu_new_comp_kv and,
         # compressed_kv_lens_cuda/compressed_kv_lens
-        num_gen_tokens_per_seq = num_gen_tokens // self.num_generations
+        num_gen_tokens_per_seq = (
+            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+        )
         for compress_ratio in self.compress_ratio_set:
             num_comp_kv_lens = kv_lens[:num_requests] // compress_ratio
             past_comp_kv_lens = cached_token_lens // compress_ratio
@@ -606,9 +627,9 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
 
-        # Get buffer pointers directly from kv_cache_manager
-        swa_pool_ptr = kv_cache_manager.kv_cache_pool_pointers[0, 0].item()
-        swa_buffer_ptr = kv_cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
+        # Get cached buffer pointers
+        swa_pool_ptr = kv_cache_manager.swa_pool_ptr
+        swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
 
         # Token stride
         token_stride = kv_cache_manager.get_token_bytes(layer_idx, MewtwoAttentionType.SWA)
@@ -646,9 +667,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             )
         else:
             # SWA + compressed indices
-            compressed_buffer_ptr = kv_cache_manager.get_buffers(
-                layer_idx, MewtwoAttentionType.COMPRESS
-            ).data_ptr()
+            compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio][
                 req_start:req_end
             ]
@@ -672,4 +691,16 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             )
 
+        # Update sparse_mla_topk to match the global_indices buffer width
+        self.sparse_mla_topk = global_indices.shape[1]
+
         return global_indices, None
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: MewtwoTrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        return None, None

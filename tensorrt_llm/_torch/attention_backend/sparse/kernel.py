@@ -2274,13 +2274,12 @@ def mewtwo_local_to_global_indices(
     block_table_swa_c = block_table_swa.contiguous()
     swa_local_indices_c = swa_local_indices.contiguous()
 
-    # Create output tensor (int64 to handle large offsets)
+    # Create output tensor
     # TODO(yuhangh): Pre-initialized to -1 could be removed due to sparse_mla_topk_lens,
     # which indicate the number of valid indices for each token.
-    out = torch.full((num_tokens, total_output_indices),
-                     -1,
-                     dtype=torch.int64,
-                     device=req_id.device)
+    out = torch.empty((num_tokens, total_output_indices),
+                      dtype=torch.int32,
+                      device=req_id.device).fill_(-1)
 
     # Grid: one program per token
     grid = (num_tokens, )
