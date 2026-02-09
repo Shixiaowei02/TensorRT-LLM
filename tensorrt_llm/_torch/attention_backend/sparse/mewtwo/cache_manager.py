@@ -429,9 +429,16 @@ class MewtwoCacheManager(KVCacheManagerV2):
                     f"Layer {layer_idx} with compress ratio {compress_ratio}, "
                     f"its attention type {attn_type.name} has scale {scale}, "
                     f"but another layer with the same compress ratio and attention type has scale {other_scale}."
+                    "Mewtwo expects they share the same scale."
                 )
             else:
                 attn_ratio_to_scale[attn_type][compress_ratio] = scale
+
+        # check if all swa attentions are in the same pool and have the same scale
+        swa_pool_ids = set(attn_ratio_to_pool_id[MewtwoAttentionType.SWA].values())
+        swa_scales = set(attn_ratio_to_scale[MewtwoAttentionType.SWA].values())
+        assert len(swa_pool_ids) == 1, "All swa attentions must be in the same pool"
+        assert len(swa_scales) == 1, "All swa attentions must have the same scale"
 
         self._attn_ratio_to_pool_id = attn_ratio_to_pool_id
         self._attn_ratio_to_scale = attn_ratio_to_scale
