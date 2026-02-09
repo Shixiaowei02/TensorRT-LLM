@@ -33,7 +33,6 @@ class Compressor(nn.Module):
         norm_eps: RMSNorm epsilon
         skip_create_weights_in_init: Whether to skip weight initialization
         pos_embd_params: Positional embedding parameters for RoPE
-        page_size: Tokens per page in paged cache
         dtype: Data type for computation
         kv_cache_dtype: Cache quantization mode ("default", "fp8_pertensor", "fp8_blockwise")
     """
@@ -46,7 +45,6 @@ class Compressor(nn.Module):
         norm_eps: float,
         skip_create_weights_in_init: bool,
         pos_embd_params: PositionalEmbeddingParams,
-        page_size: int = 32,
         dtype: Optional[torch.dtype] = torch.bfloat16,
         kv_cache_dtype: KVCacheDtype = "default",
         is_indexer: bool = False,
@@ -64,7 +62,6 @@ class Compressor(nn.Module):
         self.state_dim = 2 * self.head_dim if self.overlap else self.head_dim
 
         # Cache config
-        self.page_size = page_size
         self.layer_idx = layer_idx
         self.kv_cache_dtype = kv_cache_dtype
         self.is_indexer = is_indexer
@@ -134,6 +131,12 @@ class Compressor(nn.Module):
         block_table_kv_state = metadata.block_tables[state_type]
         block_table_score_state = metadata.block_tables[score_type]
 
+        # Get tokens_per_block from cache manager
+        # state_tokens_per_block: for state/score caches (used in compress kernels)
+        # compress_tokens_per_block: for compressed KV cache (used in scatter)
+        state_tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        compress_tokens_per_block = metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx]
+
         # Get compression metadata
         cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
         kv_lens = metadata.compressed_kv_lens_cuda[self.compress_ratio]
@@ -166,7 +169,7 @@ class Compressor(nn.Module):
                 compress_ratio=self.compress_ratio,
                 head_dim=self.head_dim,
                 overlap=self.overlap,
-                page_size=self.page_size,
+                page_size=state_tokens_per_block,
             )
 
         if num_generations > 0:
@@ -187,7 +190,7 @@ class Compressor(nn.Module):
                 compress_ratio=self.compress_ratio,
                 head_dim=self.head_dim,
                 overlap=self.overlap,
-                page_size=self.page_size,
+                page_size=state_tokens_per_block,
                 next_n=num_gen_tokens // num_generations,
             )
 
@@ -202,6 +205,7 @@ class Compressor(nn.Module):
         # Post-processing: RMSNorm -> RoPE -> Hadamard rotation
         kv_comp = self.norm(kv_comp)
         kv_comp_nope, kv_comp_pe = kv_comp.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
+
         kv_comp_pe = self.rotary_emb(
             metadata.compressed_position_ids_cuda[self.compress_ratio], [kv_comp_pe]
         )
@@ -214,11 +218,23 @@ class Compressor(nn.Module):
 
         if self.kv_cache_dtype == "fp8_blockwise":
             return self._scatter_fp8_blockwise(
-                kv_comp, num_comp_tokens_bsz, cu_new_comp_kv, start_pos, kv_cache, block_table
+                kv_comp,
+                num_comp_tokens_bsz,
+                cu_new_comp_kv,
+                start_pos,
+                kv_cache,
+                block_table,
+                compress_tokens_per_block,
             )
         elif self.kv_cache_dtype == "fp8_pertensor":
             return self._scatter_fp8_pertensor(
-                kv_comp, num_comp_tokens_bsz, cu_new_comp_kv, start_pos, kv_cache, block_table
+                kv_comp,
+                num_comp_tokens_bsz,
+                cu_new_comp_kv,
+                start_pos,
+                kv_cache,
+                block_table,
+                compress_tokens_per_block,
             )
         else:
             compressed_kv_scatter(
@@ -228,7 +244,7 @@ class Compressor(nn.Module):
                 start_pos,
                 kv_cache,
                 block_table,
-                self.page_size,
+                compress_tokens_per_block,
                 self.head_dim,
             )
             return kv_comp
@@ -241,6 +257,7 @@ class Compressor(nn.Module):
         start_pos: torch.Tensor,
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
+        tokens_per_block: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Quantize to blockwise FP8 and scatter to cache.
 
@@ -254,19 +271,22 @@ class Compressor(nn.Module):
         # Quantize with per-128-element scales
         kv_fp8, kv_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(kv_comp, use_ue8m0=False)
 
-        # Convert to bytes for scatter kernel
-        kv_fp8_bytes = kv_fp8.contiguous().view(torch.uint8).view(num_tokens, self.head_dim)
-        scale_bytes = kv_scale.shape[1] * 4  # float32 per scale block
-        kv_scale_bytes = kv_scale.contiguous().view(torch.uint8).view(num_tokens, scale_bytes)
+        # kv_fp8: [num_tokens, head_dim] in float8_e4m3fn - pass directly
+        # kv_scale: [num_tokens, num_scale_blocks] in float32 - convert to bytes for interleaved storage
+        scale_bytes = kv_scale.shape[1] * 4  # 4 bytes per float32 scale
+        # Flatten first to ensure contiguous memory layout with stride=1, then view as bytes
+        kv_scale_bytes = (
+            kv_scale.flatten().contiguous().view(torch.uint8).view(num_tokens, scale_bytes)
+        )
 
         compressed_kv_scatter(
-            kv_fp8_bytes,
+            kv_fp8.contiguous().view(num_tokens, self.head_dim),
             num_comp_tokens,
             cu_new_comp_kv,
             start_pos,
             kv_cache,
             block_offsets,
-            self.page_size,
+            tokens_per_block,
             self.head_dim,
             kv_cache_dtype="fp8_blockwise",
             kv_scale=kv_scale_bytes,
@@ -281,6 +301,7 @@ class Compressor(nn.Module):
         start_pos: torch.Tensor,
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
+        tokens_per_block: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Quantize to per-tensor FP8 and scatter to cache.
 
@@ -310,7 +331,7 @@ class Compressor(nn.Module):
             start_pos,
             kv_cache,
             block_offsets,
-            self.page_size,
+            tokens_per_block,
             self.head_dim,
             kv_cache_dtype="fp8_pertensor",
         )

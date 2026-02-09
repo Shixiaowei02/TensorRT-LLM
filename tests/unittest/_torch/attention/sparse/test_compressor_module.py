@@ -5,7 +5,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -19,33 +19,20 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RotaryScalingType,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import rotate_activation
+from tensorrt_llm._torch.attention_backend.sparse.mewtwo import MewtwoCacheManager
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoAttentionType
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import DataType, SamplingConfig
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.mapping import Mapping
 
 # ============================================================================
-# Dummy Metadata and KVCacheManager for Testing
+# Dummy Metadata for Testing
 # ============================================================================
-
-
-class DummyKVCacheManager:
-    """Dummy KVCacheManager that returns pre-allocated buffers for testing."""
-
-    def __init__(
-        self,
-        kv_cache: torch.Tensor,
-        paged_kv_state: torch.Tensor,
-        paged_score_state: torch.Tensor,
-    ):
-        self._buffers = {
-            MewtwoAttentionType.COMPRESS: kv_cache,
-            MewtwoAttentionType.COMPRESSOR_STATE: paged_kv_state,
-            MewtwoAttentionType.COMPRESSOR_SCORE: paged_score_state,
-        }
-
-    def get_buffers(self, layer_idx: int, attention_type: MewtwoAttentionType) -> torch.Tensor:
-        """Return pre-allocated buffer for the given attention type."""
-        return self._buffers[attention_type]
 
 
 class DummyAttentionMetadata:
@@ -57,7 +44,7 @@ class DummyAttentionMetadata:
         num_generations: int,
         num_ctx_tokens: int,
         num_tokens: int,
-        kv_cache_manager: DummyKVCacheManager,
+        kv_cache_manager: MewtwoCacheManager,
         block_tables: dict,
         cu_seq_lens: dict,
         cu_new_comp_kv: dict,
@@ -276,7 +263,8 @@ class RefCompressor(nn.Module):
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 DIM, HEAD_DIM, ROPE_DIM = 4096, 512, 64
-MAX_BATCH, MAX_SEQ, PAGE_SIZE = 16, 4096, 32
+INDEX_HEAD_DIM = 128  # Fixed head_dim for indexer (INDEXER_COMPRESS)
+MAX_BATCH, MAX_SEQ, PAGE_SIZE = 16, 4096, 128
 ORI_SEQ_LEN = 65536
 ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW = 40000.0, 4, 32, 1
 
@@ -393,14 +381,24 @@ def read_paged_cache_tokens(
     num_tokens: int,
     tokens_per_block: int,
 ) -> torch.Tensor:
-    """Materialize paged compressed cache for a batch into a contiguous view."""
+    """Materialize paged compressed cache for a batch into a contiguous view.
+
+    Args:
+        kv_cache: Cache buffer with shape [num_blocks, tokens_per_block, head_dim]
+        block_offsets: Block offset table with shape [num_seqs, max_blocks]
+        batch_idx: Index of the batch to read
+        num_tokens: Number of tokens to read
+        tokens_per_block: Tokens per cache block
+
+    Returns:
+        Tensor containing the read values with shape [num_tokens, head_dim]
+    """
     blocks_needed = (num_tokens + tokens_per_block - 1) // tokens_per_block
-    blocks = []
-    for blk in range(blocks_needed):
-        block_id = int(block_offsets[0, batch_idx, 0, blk].item())
-        block = kv_cache[block_id, 0].view(tokens_per_block, HEAD_DIM)
-        blocks.append(block)
-    return torch.cat(blocks, dim=0)[:num_tokens]
+    # Extract block indices for this batch
+    block_indices = block_offsets[batch_idx, :blocks_needed].tolist()
+    # Read all blocks at once and reshape
+    _, _, dim_per_token = kv_cache.shape
+    return kv_cache[block_indices].reshape(-1, dim_per_token)[:num_tokens]
 
 
 def build_fp8_golden_cache(
@@ -412,6 +410,7 @@ def build_fp8_golden_cache(
     num_compressed: int,
     tokens_per_block: int,
     kv_cache_dtype: str,
+    head_dim: int = HEAD_DIM,
 ) -> torch.Tensor:
     """Build Python golden reference cache from compressor's FP8 output.
 
@@ -420,14 +419,15 @@ def build_fp8_golden_cache(
     validated separately via assert_fp8_similar.
 
     Args:
-        kv_fp8: Compressor's FP8 output [total_tokens, HEAD_DIM]
+        kv_fp8: Compressor's FP8 output [total_tokens, head_dim]
         kv_scale: Compressor's scale output
         cache_shape: Shape of the cache tensor
-        block_offsets: Block offset table
+        block_offsets: Block offset table [num_seqs, max_blocks]
         batch: Batch size
         num_compressed: Compressed tokens per batch
         tokens_per_block: Tokens per cache block
         kv_cache_dtype: "fp8_blockwise" or "fp8_pertensor"
+        head_dim: Head dimension (default HEAD_DIM=512, use INDEX_HEAD_DIM=128 for indexer)
 
     Returns:
         golden_cache: Expected cache tensor for comparison
@@ -436,40 +436,52 @@ def build_fp8_golden_cache(
     golden_cache = torch.zeros(cache_shape, device=kv_fp8.device, dtype=torch.uint8)
 
     # Convert FP8 to bytes
-    kv_fp8_bytes = kv_fp8.contiguous().view(torch.uint8).view(total_comp_tokens, HEAD_DIM)
+    kv_fp8_bytes = kv_fp8.contiguous().view(torch.uint8).view(total_comp_tokens, head_dim)
 
     if kv_cache_dtype == "fp8_blockwise":
-        # Blockwise: cache layout is [num_blocks, tokens_per_block, HEAD_DIM + scale_size]
-        num_scale_blocks = (HEAD_DIM + 127) // 128
+        # Blockwise: non-interleaved layout per block:
+        # [k0, k1, ..., kN, scale0, scale1, ..., scaleN]
+        num_scale_blocks = (head_dim + 127) // 128
         scale_size = num_scale_blocks * 4
-        kv_scale_bytes = kv_scale.contiguous().view(torch.uint8).view(total_comp_tokens, scale_size)
+        kv_scale_bytes = (
+            kv_scale.flatten().contiguous().view(torch.uint8).view(total_comp_tokens, scale_size)
+        )
 
-        # Scatter into cache
+        # Flatten to 2D [num_blocks, block_stride] for flat byte indexing
+        num_blocks = cache_shape[0]
+        golden_flat = golden_cache.view(num_blocks, -1)
+
+        # Scatter into cache using non-interleaved offsets
         global_token = 0
         for b in range(batch):
             for i in range(num_compressed):
                 block_idx = i // tokens_per_block
                 pos_in_block = i % tokens_per_block
-                block_id = int(block_offsets[0, b, 0, block_idx].item())
+                block_id = int(block_offsets[b, block_idx].item())
 
-                golden_cache[block_id, pos_in_block, :HEAD_DIM] = kv_fp8_bytes[global_token]
-                golden_cache[block_id, pos_in_block, HEAD_DIM : HEAD_DIM + scale_size] = (
-                    kv_scale_bytes[global_token]
-                )
-                global_token += 1
-    else:
-        # Per-tensor: cache layout is [num_blocks, 1, tokens_per_block * HEAD_DIM]
-        global_token = 0
-        for b in range(batch):
-            for i in range(num_compressed):
-                block_idx = i // tokens_per_block
-                pos_in_block = i % tokens_per_block
-                block_id = int(block_offsets[0, b, 0, block_idx].item())
-
-                cache_offset = pos_in_block * HEAD_DIM
-                golden_cache[block_id, 0, cache_offset : cache_offset + HEAD_DIM] = kv_fp8_bytes[
+                # FP8 data in first section of block
+                fp8_start = pos_in_block * head_dim
+                golden_flat[block_id, fp8_start : fp8_start + head_dim] = kv_fp8_bytes[global_token]
+                # Scale data in second section of block
+                scale_start = tokens_per_block * head_dim + pos_in_block * scale_size
+                golden_flat[block_id, scale_start : scale_start + scale_size] = kv_scale_bytes[
                     global_token
                 ]
+                global_token += 1
+
+        # Reshape back to original shape
+        golden_cache = golden_flat.view(cache_shape)
+    else:
+        # Per-tensor: cache layout is [num_blocks, tokens_per_block, head_dim]
+        # Same as blockwise but without scale bytes
+        global_token = 0
+        for b in range(batch):
+            for i in range(num_compressed):
+                block_idx = i // tokens_per_block
+                pos_in_block = i % tokens_per_block
+                block_id = int(block_offsets[b, block_idx].item())
+
+                golden_cache[block_id, pos_in_block, :head_dim] = kv_fp8_bytes[global_token]
                 global_token += 1
 
     return golden_cache
@@ -480,14 +492,19 @@ def assert_fp8_cache_match(
     golden_cache: torch.Tensor,
     kv_cache_dtype: str,
     name: str = "FP8 Cache",
+    head_dim: int = HEAD_DIM,
 ):
     """Assert kernel cache matches Python golden reference."""
-    if torch.equal(kernel_cache, golden_cache):
+    # Convert both to uint8 bytes for comparison (kernel_cache may be Float8_e4m3fn)
+    kernel_bytes = kernel_cache.view(torch.uint8)
+    golden_bytes = golden_cache.view(torch.uint8)
+
+    if torch.equal(kernel_bytes, golden_bytes):
         return  # Perfect match
 
-    diff_mask = kernel_cache != golden_cache
+    diff_mask = kernel_bytes != golden_bytes
     num_diffs = diff_mask.sum().item()
-    total_bytes = kernel_cache.numel()
+    total_bytes = kernel_bytes.numel()
 
     # Build detailed error message
     msg = (
@@ -495,8 +512,16 @@ def assert_fp8_cache_match(
     )
 
     if kv_cache_dtype == "fp8_blockwise":
-        fp8_diffs = (kernel_cache[:, :, :HEAD_DIM] != golden_cache[:, :, :HEAD_DIM]).sum().item()
-        scale_diffs = (kernel_cache[:, :, HEAD_DIM:] != golden_cache[:, :, HEAD_DIM:]).sum().item()
+        # Reshape to original layout for detailed analysis
+        kernel_reshaped = kernel_bytes.view(kernel_cache.shape)
+        golden_reshaped = golden_bytes.view(golden_cache.shape)
+        fp8_diffs = (
+            (kernel_reshaped[:, :, :head_dim] != golden_reshaped[:, :, :head_dim]).sum().item()
+        )
+        scale_diffs = (
+            (kernel_reshaped[:, :, head_dim:] != golden_reshaped[:, :, head_dim:]).sum().item()
+        )
+
         msg += f" [FP8: {fp8_diffs}, Scale: {scale_diffs}]"
 
     # Show first few differences
@@ -542,24 +567,32 @@ def run_ref_segmented_forward(
 class CompressorWrapper:
     """Wrapper around Compressor to manage caches and provide a simpler test interface."""
 
+    # Class-level constants for MewtwoCacheManager
+    WINDOW_SIZE = 128
+    VOCAB_SIZE = 129280
+
     def __init__(
         self,
         compress_ratio: int = 4,
         rotate: bool = False,
         layer_idx: int = 0,
         kv_cache_dtype: str = "default",
+        is_indexer: bool = False,
     ):
         self.compress_ratio = compress_ratio
         self.overlap = compress_ratio == 4
         self.layer_idx = layer_idx
         self.kv_cache_dtype = kv_cache_dtype
+        self.is_indexer = is_indexer
         coff = 2 if self.overlap else 1
 
         # Create MLAParams
+        # For indexer mode, use INDEX_HEAD_DIM instead of HEAD_DIM
+        target_head_dim = INDEX_HEAD_DIM if is_indexer else HEAD_DIM
         mla_params = MLAParams(
             hidden_size=DIM,
             qk_rope_head_dim=ROPE_DIM,
-            qk_nope_head_dim=HEAD_DIM - ROPE_DIM,
+            qk_nope_head_dim=target_head_dim - ROPE_DIM,
         )
 
         # Create RoPE - use no scaling to match precompute_freqs_cis behavior
@@ -591,75 +624,216 @@ class CompressorWrapper:
             norm_eps=1e-6,
             skip_create_weights_in_init=False,
             pos_embd_params=pos_embd_params,
-            page_size=PAGE_SIZE,
             dtype=DTYPE,
             kv_cache_dtype=kv_cache_dtype,
+            is_indexer=is_indexer,
         ).to(DEVICE)
 
-        # Allocate paged state caches
-        total_pos = MAX_SEQ + (compress_ratio if self.overlap else 0)
-        max_blocks = (total_pos + PAGE_SIZE - 1) // PAGE_SIZE
-        num_blocks = MAX_BATCH * max_blocks
+        # Create MewtwoCacheManager
+        self.cache_manager = self._create_mewtwo_cache_manager(compress_ratio)
+        # COMPRESS cache has tokens_per_block from cache manager's compressed_block_sizes
+        self.tokens_per_block = self.cache_manager.compressed_block_sizes[self.layer_idx]
 
-        self.paged_kv = torch.zeros(
-            num_blocks, PAGE_SIZE, coff * HEAD_DIM, device=DEVICE, dtype=torch.float32
-        )
-        self.paged_score = torch.full_like(self.paged_kv, float("-inf"))
-        self.block_table_kv = torch.arange(num_blocks, device=DEVICE, dtype=torch.int32).view(
-            MAX_BATCH, max_blocks
-        )
-        self.block_table_score = self.block_table_kv.clone()
+        # Track active requests for the cache manager
+        self.active_requests: Dict[int, LlmRequest] = {}
+        self.next_request_id = 0
 
-        # Allocate compressed KV cache
-        self.tokens_per_block = PAGE_SIZE
+        # Store reference to kv_cache for test compatibility (read from cache manager)
+        self._update_kv_cache_reference()
+
+        # Create block_offsets for test compatibility (will be updated per forward)
         max_compressed = MAX_SEQ // compress_ratio
         max_comp_blocks = (max_compressed + self.tokens_per_block - 1) // self.tokens_per_block
-        num_comp_blocks = MAX_BATCH * max_comp_blocks
-
-        if kv_cache_dtype == "fp8_blockwise":
-            # FP8 blockwise: [num_blocks, block_size, head_dim + scale_size]
-            num_scale_blocks = (HEAD_DIM + 127) // 128
-            scale_size = num_scale_blocks * 4  # float32 per scale block
-            per_token_size = HEAD_DIM + scale_size
-            self.kv_cache = torch.zeros(
-                num_comp_blocks,
-                self.tokens_per_block,
-                per_token_size,
-                device=DEVICE,
-                dtype=torch.uint8,
-            )
-        elif kv_cache_dtype == "fp8_pertensor":
-            # FP8 per-tensor: [num_blocks, 1, tokens_per_block * head_dim]
-            self.kv_cache = torch.zeros(
-                num_comp_blocks,
-                1,
-                self.tokens_per_block * HEAD_DIM,
-                device=DEVICE,
-                dtype=torch.uint8,
-            )
-        else:
-            # Default: bf16/fp16
-            self.kv_cache = torch.zeros(
-                num_comp_blocks, 1, self.tokens_per_block * HEAD_DIM, device=DEVICE, dtype=DTYPE
-            )
-
         self.block_offsets = torch.zeros(
-            1, MAX_BATCH, 2, max_comp_blocks, device=DEVICE, dtype=torch.int32
+            MAX_BATCH, max_comp_blocks, device=DEVICE, dtype=torch.int32
         )
-        for b in range(MAX_BATCH):
-            for blk in range(max_comp_blocks):
-                self.block_offsets[0, b, :, blk] = b * max_comp_blocks + blk
 
-        # Per-batch state tracking
-        self.kv_state = torch.zeros(
-            MAX_BATCH, coff * compress_ratio, coff * HEAD_DIM, dtype=torch.float32, device=DEVICE
+    def cleanup(self):
+        """Free all active requests and shut down the cache manager.
+
+        Must be called before the wrapper is discarded, otherwise the cache
+        manager's destructor will fail with ResourceBusyError and GPU memory
+        will leak across tests.
+        """
+        if not hasattr(self, "cache_manager"):
+            return
+        for req in self.active_requests.values():
+            self.cache_manager.free_resources(req)
+        self.active_requests.clear()
+        self.cache_manager.shutdown()
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+    def _create_mewtwo_cache_manager(self, compress_ratio: int) -> MewtwoCacheManager:
+        """Create a MewtwoCacheManager for testing."""
+        # Single layer with the given compress ratio
+        compress_ratios = [compress_ratio]
+
+        # Create sparse attention config
+        sparse_attn_config = MewtwoSparseAttentionConfig(
+            index_head_dim=INDEX_HEAD_DIM,
+            window_size=self.WINDOW_SIZE,
+            compress_ratios=compress_ratios,
         )
-        self.score_state = torch.full(
-            (MAX_BATCH, coff * compress_ratio, coff * HEAD_DIM),
-            float("-inf"),
-            dtype=torch.float32,
-            device=DEVICE,
+
+        # Create KV cache config
+        max_num_tokens = MAX_SEQ * MAX_BATCH
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=max_num_tokens,
+            event_buffer_max_size=0,
         )
+
+        # Create mapping (single GPU, no parallelism)
+        mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+
+        if self.kv_cache_dtype in ["fp8_pertensor", "fp8_blockwise"]:
+            cache_dtype = DataType.FP8
+        else:
+            cache_dtype = DataType.BF16
+
+        # Create cache manager
+        cache_manager = MewtwoCacheManager(
+            kv_cache_config=kv_cache_config,
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=len(compress_ratios),
+            num_kv_heads=1,
+            head_dim=HEAD_DIM,
+            tokens_per_block=PAGE_SIZE,
+            max_seq_len=MAX_SEQ,
+            max_batch_size=MAX_BATCH,
+            mapping=mapping,
+            dtype=cache_dtype,
+            compressor_dtype=DataType.FLOAT,  # State caches always use FP32
+            vocab_size=self.VOCAB_SIZE,
+            max_num_tokens=max_num_tokens,
+            sparse_attn_config=sparse_attn_config,
+        )
+
+        return cache_manager
+
+    def _update_kv_cache_reference(self):
+        """Update the kv_cache reference from cache manager for test compatibility."""
+        compress_type = (
+            MewtwoAttentionType.INDEXER_COMPRESS
+            if self.is_indexer
+            else MewtwoAttentionType.COMPRESS
+        )
+        self.kv_cache = self.cache_manager.get_buffers(self.layer_idx, compress_type)
+
+    def _create_request(self, request_id: int, prompt_len: int) -> LlmRequest:
+        """Helper to create a test LlmRequest (following test_mewtwo_cache_manager pattern).
+
+        Args:
+            request_id: Unique request identifier
+            prompt_len: Prompt length (number of tokens)
+
+        Returns:
+            LlmRequest instance
+        """
+        input_tokens = list(range(prompt_len))
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1024,
+            input_tokens=input_tokens,
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        return request
+
+    def _prepare_requests_for_batch(
+        self,
+        bsz: int,
+        seq_lens: torch.Tensor,
+        start_pos: torch.Tensor,
+        is_prefill: torch.Tensor,
+        batch_indices: torch.Tensor = None,
+    ) -> Tuple[List[LlmRequest], ScheduledRequests]:
+        """Prepare requests for a batch using prepare_resources pattern from test_mewtwo_cache_manager.
+
+        Args:
+            batch_indices: Optional tensor mapping batch positions to external batch indices.
+                          If provided, requests are stored/retrieved using these indices.
+                          If None, sequential indices (0, 1, 2...) are used.
+
+        Returns:
+            Tuple of (requests list, scheduled_batch) for later update_resources call
+        """
+        requests = []
+        context_requests = []
+        generation_requests = []
+
+        # Use batch_indices if provided, otherwise use sequential indices
+        if batch_indices is not None:
+            ext_indices = [int(batch_indices[b].item()) for b in range(bsz)]
+        else:
+            ext_indices = list(range(bsz))
+
+        # Separate prefill and generation indices
+        prefill_indices = []
+        gen_indices = []
+        for b in range(bsz):
+            if is_prefill[b]:
+                prefill_indices.append(b)
+            else:
+                gen_indices.append(b)
+
+        # Handle prefill requests - create LlmRequest directly (following test_mewtwo_cache_manager pattern)
+        for b in prefill_indices:
+            seq_len = int(seq_lens[b].item())
+            req = self._create_request(self.next_request_id, seq_len)
+            ext_idx = ext_indices[b]
+            self.active_requests[ext_idx] = req
+            context_requests.append(req)
+            self.next_request_id += 1
+
+        # Handle generation requests - reuse existing requests or create new ones
+        for b in gen_indices:
+            ext_idx = ext_indices[b]
+            req = self.active_requests.get(ext_idx)
+            if req is None:
+                # Need to create a new request for generation (prefill was done in previous call)
+                pos = int(start_pos[b].item())
+                req = self._create_request(self.next_request_id, pos)
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.context_current_position = pos
+                req.add_new_token(pos, 0)  # Simulate having processed tokens
+                self.active_requests[ext_idx] = req
+                self.next_request_id += 1
+            else:
+                # Existing request from previous prefill - mark as generation
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            generation_requests.append(req)
+
+        # Build final request list in batch order
+        for b in range(bsz):
+            ext_idx = ext_indices[b]
+            requests.append(self.active_requests[ext_idx])
+
+        # Build scheduled batch and call prepare_resources (following test_mewtwo_cache_manager pattern)
+        scheduled_batch = ScheduledRequests()
+        scheduled_batch.context_requests = context_requests
+        scheduled_batch.generation_requests = generation_requests
+        self.cache_manager.prepare_resources(scheduled_batch)
+
+        return requests, scheduled_batch
+
+    def _get_block_table_for_request(
+        self,
+        req: LlmRequest,
+        attn_type: MewtwoAttentionType,
+    ) -> torch.Tensor:
+        """Get block table for a request and attention type."""
+        page_indices = self.cache_manager.get_cache_indices(
+            request_id=req.py_request_id,
+            layer_idx=self.layer_idx,
+            attn_type=attn_type,
+        )
+        return torch.tensor(page_indices, dtype=torch.int32, device=DEVICE)
 
     def forward(
         self,
@@ -727,8 +901,9 @@ class CompressorWrapper:
             seq_lens = seq_lens_reordered
             past_kv_lens = start_pos_reordered
 
-            # Store reorder_indices for block table selection later
-            batch_indices_for_blocks = reorder_indices
+            # Use reorder_indices for request mapping (maps reordered position to original batch index)
+            batch_indices_for_requests = reorder_indices
+            start_pos_for_kv = past_kv_lens
 
             # Get number of compressed tokens
             num_ctx_compressed_tokens = (seq_lens[:num_contexts] // ratio).sum().item()
@@ -759,8 +934,15 @@ class CompressorWrapper:
                 num_ctx_compressed_tokens = (seq_lens // ratio).sum().item()
                 num_gen_compressed_tokens = 0
 
-            # No reordering needed in simple mode
-            batch_indices_for_blocks = None
+            # Use batch_indices for request mapping if provided
+            batch_indices_for_requests = batch_indices
+            start_pos_for_kv = past_kv_lens
+
+        # Prepare requests for the cache manager
+        is_prefill = start_pos_for_kv == 0
+        requests, scheduled_batch = self._prepare_requests_for_batch(
+            bsz, seq_lens, start_pos_for_kv, is_prefill, batch_indices_for_requests
+        )
 
         cu_seq_lens = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
         cu_seq_lens[1:] = seq_lens.cumsum(0)
@@ -772,7 +954,6 @@ class CompressorWrapper:
         # Compute number of compressed outputs per batch
         # For prefill (start_pos=0): compress every ratio tokens
         # For decode (start_pos>0): compress only if we complete a chunk
-        is_prefill = past_kv_lens == 0
         num_comp_prefill = seq_lens // ratio
         should_compress_decode = ((past_kv_lens + seq_lens) % ratio == 0).to(torch.int32)
         num_comp = torch.where(is_prefill, num_comp_prefill, should_compress_decode)
@@ -795,31 +976,57 @@ class CompressorWrapper:
                     position_ids[offset + i] = past_kv_lens[b].item()
             offset += n_out
 
-        # Build dummy KV cache manager
-        dummy_kv_cache_manager = DummyKVCacheManager(
-            kv_cache=self.kv_cache,
-            paged_kv_state=self.paged_kv,
-            paged_score_state=self.paged_score,
-        )
-
-        # Build block_tables dict keyed by MewtwoAttentionType
-        # Use batch_indices if provided, or batch_indices_for_blocks from reordering
-        if batch_indices is not None:
-            block_table_kv_selected = self.block_table_kv[batch_indices]
-            block_table_score_selected = self.block_table_score[batch_indices]
-        elif batch_indices_for_blocks is not None:
-            block_table_kv_selected = self.block_table_kv[batch_indices_for_blocks]
-            block_table_score_selected = self.block_table_score[batch_indices_for_blocks]
+        # Determine attention types based on is_indexer
+        if self.is_indexer:
+            compress_type = MewtwoAttentionType.INDEXER_COMPRESS
+            state_type = MewtwoAttentionType.INDEXER_COMPRESSOR_STATE
+            score_type = MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE
         else:
-            block_table_kv_selected = self.block_table_kv[:bsz]
-            block_table_score_selected = self.block_table_score[:bsz]
+            compress_type = MewtwoAttentionType.COMPRESS
+            state_type = MewtwoAttentionType.COMPRESSOR_STATE
+            score_type = MewtwoAttentionType.COMPRESSOR_SCORE
+
+        # Build block_tables dict keyed by MewtwoAttentionType using cache manager
+        block_table_compress_list = []
+        block_table_kv_state_list = []
+        block_table_score_state_list = []
+
+        for b, req in enumerate(requests):
+            block_table_compress_list.append(self._get_block_table_for_request(req, compress_type))
+            block_table_kv_state_list.append(self._get_block_table_for_request(req, state_type))
+            block_table_score_state_list.append(self._get_block_table_for_request(req, score_type))
+
+        # Pad and stack block tables to handle variable-length block indices
+        max_blocks_compress = max(bt.size(0) for bt in block_table_compress_list)
+        block_table_compress = torch.zeros(
+            bsz, max_blocks_compress, dtype=torch.int32, device=DEVICE
+        )
+        for b in range(bsz):
+            bt = block_table_compress_list[b]
+            block_table_compress[b, : bt.size(0)] = bt
+
+        max_blocks_state = max(bt.size(0) for bt in block_table_kv_state_list)
+        block_table_kv_state = torch.zeros(bsz, max_blocks_state, dtype=torch.int32, device=DEVICE)
+        block_table_score_state = torch.zeros(
+            bsz, max_blocks_state, dtype=torch.int32, device=DEVICE
+        )
+        for b in range(bsz):
+            bt_kv = block_table_kv_state_list[b]
+            bt_score = block_table_score_state_list[b]
+            block_table_kv_state[b, : bt_kv.size(0)] = bt_kv
+            block_table_score_state[b, : bt_score.size(0)] = bt_score
+
+        # Update block_offsets for test compatibility
+        self.block_offsets = block_table_compress
 
         block_tables = {
-            MewtwoAttentionType.COMPRESS: self.block_offsets,
-            MewtwoAttentionType.COMPRESSOR_STATE: block_table_kv_selected,
-            MewtwoAttentionType.COMPRESSOR_SCORE: block_table_score_selected,
+            compress_type: block_table_compress,
+            state_type: block_table_kv_state,
+            score_type: block_table_score_state,
         }
 
+        # Both prefill and decode kernels use absolute token positions for the
+        # state cache, so pass the absolute kv_lens directly.
         # Build dicts keyed by compress_ratio
         cu_new_comp_kv_dict = {ratio: cu_new_comp_kv}
         compressed_position_ids_dict = {ratio: position_ids}
@@ -827,13 +1034,13 @@ class CompressorWrapper:
         past_kv_lens_dict = {ratio: past_kv_lens // ratio}
         num_compressed_tokens_dict = {ratio: num_compressed_tokens}
 
-        # Build dummy attention metadata
+        # Build attention metadata using MewtwoCacheManager
         metadata = DummyAttentionMetadata(
             num_contexts=num_contexts,
             num_generations=num_generations,
             num_ctx_tokens=num_ctx_tokens,
             num_tokens=num_ctx_tokens + num_gen_tokens,
-            kv_cache_manager=dummy_kv_cache_manager,
+            kv_cache_manager=self.cache_manager,
             block_tables=block_tables,
             cu_seq_lens=cu_seq_lens,
             cu_new_comp_kv=cu_new_comp_kv_dict,
@@ -843,8 +1050,21 @@ class CompressorWrapper:
             num_compressed_tokens=num_compressed_tokens_dict,
         )
 
+        # Update kv_cache reference for test compatibility
+        self._update_kv_cache_reference()
+
         # Call the compressor forward
         result = self.compressor(x=x_flat, metadata=metadata)
+
+        # Update request state and call update_resources after processing
+        for b, req in enumerate(requests):
+            if is_prefill[b]:
+                req.context_current_position = int(seq_lens[b].item())
+            # Call add_new_token for BOTH prefill and generation requests
+            # Token count should be total sequence length after processing (start_pos + seq_len)
+            token_count = int((start_pos_for_kv[b] + seq_lens[b]).item())
+            req.add_new_token(token_count, 0)
+        self.cache_manager.update_resources(scheduled_batch)
 
         # For FP8 modes, return tuple directly (kv_fp8, kv_scale)
         if isinstance(result, tuple):
@@ -878,9 +1098,18 @@ class CompressorWrapper:
             return torch.cat(non_none_outputs, dim=0).unsqueeze(0)
 
     def reset_state(self):
-        """Reset paged caches for new sequence."""
-        self.paged_kv.zero_()
-        self.paged_score.fill_(float("-inf"))
+        """Reset cache manager state for new sequences."""
+        # Shutdown existing cache manager to release resources properly
+        if hasattr(self, "cache_manager") and self.cache_manager is not None:
+            self.cache_manager.shutdown()
+
+        # Clear active requests and reset request ID counter
+        self.active_requests.clear()
+        self.next_request_id = 0
+
+        # Recreate the cache manager to reset all caches
+        self.cache_manager = self._create_mewtwo_cache_manager(self.compress_ratio)
+        self._update_kv_cache_reference()
 
 
 def setup_compressors(
@@ -902,22 +1131,31 @@ def setup_compressors(
     args = ModelArgs()
     overlap = compress_ratio == 4
 
+    # For fp8_blockwise with ratio=4, use INDEXER_COMPRESS type which has scale space allocated
+    # INDEXER_COMPRESS is only registered for sparse layers and uses INDEX_HEAD_DIM=128
+    is_indexer = kv_cache_dtype == "fp8_blockwise"
+
+    # Use appropriate head_dim based on is_indexer
+    target_head_dim = INDEX_HEAD_DIM if is_indexer else HEAD_DIM
+
     # Reference compressor (bf16)
-    ref = RefCompressor(args, compress_ratio, HEAD_DIM, rotate).to(DEVICE)
+    ref = RefCompressor(args, compress_ratio, target_head_dim, rotate).to(DEVICE)
     ref.ape.data.normal_(0, 0.02)
     ref.wkv.weight.data.normal_(0, 0.02)
     ref.wgate.weight.data.normal_(0, 0.02)
     ref.kv_cache = torch.zeros(
-        MAX_BATCH, MAX_SEQ // compress_ratio, HEAD_DIM, device=DEVICE, dtype=DTYPE
+        MAX_BATCH, MAX_SEQ // compress_ratio, target_head_dim, device=DEVICE, dtype=DTYPE
     )
 
     # Compressor wrapper with specified kv_cache_dtype
-    comp = CompressorWrapper(compress_ratio, rotate, kv_cache_dtype=kv_cache_dtype)
+    comp = CompressorWrapper(
+        compress_ratio, rotate, kv_cache_dtype=kv_cache_dtype, is_indexer=is_indexer
+    )
 
     # Copy weights from ref to compressor
     coff = 2 if overlap else 1
-    comp.compressor.wkv_gate.weight.data[: coff * HEAD_DIM] = ref.wkv.weight.data.clone()
-    comp.compressor.wkv_gate.weight.data[coff * HEAD_DIM :] = ref.wgate.weight.data.clone()
+    comp.compressor.wkv_gate.weight.data[: coff * target_head_dim] = ref.wkv.weight.data.clone()
+    comp.compressor.wkv_gate.weight.data[coff * target_head_dim :] = ref.wgate.weight.data.clone()
     comp.compressor.ape.data.copy_(ref.ape.data)
     comp.compressor.norm.weight.data.copy_(ref.norm.weight.data)
 
@@ -926,9 +1164,16 @@ def setup_compressors(
 
 @pytest.fixture(autouse=True)
 def seed():
-    """Seed RNG for reproducibility."""
+    """Seed RNG for reproducibility and ensure GPU cleanup between tests."""
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
+    yield
+    # Force garbage collection so CompressorWrapper.__del__ → cleanup() runs
+    # before the next test allocates new cache managers.
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -1137,13 +1382,17 @@ def test_mixed_batch():
     [
         (1, 128, 4),
         (2, 64, 4),
+        (4, 256, 4),
         (16, 256, 4),
-        (1, 256, 128),
-        (16, 512, 128),  # ratio=128 coverage
+        (16, 512, 4),
     ],
 )
 def test_fp8_blockwise_compressor(batch, seqlen, ratio):
-    """Test FP8 blockwise Compressor against RefCompressor (bf16 reference)."""
+    """Test FP8 blockwise Compressor against RefCompressor (bf16 reference).
+
+    FP8 blockwise uses INDEXER_COMPRESS cache type which has INDEX_HEAD_DIM=128.
+    This test validates FP8 quantization and cache scatter for the indexer path.
+    """
     num_compressed = seqlen // ratio
 
     ref, comp = setup_compressors(ratio, rotate=True, kv_cache_dtype="fp8_blockwise")
@@ -1159,18 +1408,22 @@ def test_fp8_blockwise_compressor(batch, seqlen, ratio):
     assert isinstance(out_comp, tuple), f"Expected tuple, got {type(out_comp)}"
     kv_fp8, kv_scale = out_comp
 
-    # Verify shapes
+    # Verify shapes - INDEXER_COMPRESS uses INDEX_HEAD_DIM=128
     total_comp_tokens = batch * num_compressed
-    num_scale_blocks = (HEAD_DIM + 127) // 128
-    assert kv_fp8.shape == (total_comp_tokens, HEAD_DIM)
-    assert kv_scale.shape == (total_comp_tokens, num_scale_blocks)
+    num_scale_blocks = (INDEX_HEAD_DIM + 127) // 128
+    assert kv_fp8.shape == (total_comp_tokens, INDEX_HEAD_DIM), (
+        f"Expected shape {(total_comp_tokens, INDEX_HEAD_DIM)}, got {kv_fp8.shape}"
+    )
+    assert kv_scale.shape == (total_comp_tokens, num_scale_blocks), (
+        f"Expected scale shape {(total_comp_tokens, num_scale_blocks)}, got {kv_scale.shape}"
+    )
 
     # Verify scales are positive and valid
     assert (kv_scale > 0).all(), "All scales should be positive"
 
-    # Compare dequantized FP8 with RefCompressor output
+    # Compare dequantized FP8 with RefCompressor output (both use INDEX_HEAD_DIM=128)
     assert_fp8_similar(
-        out_comp, out_ref.view(-1, HEAD_DIM), "fp8_blockwise", "FP8 vs RefCompressor"
+        out_comp, out_ref.view(-1, INDEX_HEAD_DIM), "fp8_blockwise", "FP8 vs RefCompressor"
     )
 
     # Verify cache scatter
@@ -1183,8 +1436,15 @@ def test_fp8_blockwise_compressor(batch, seqlen, ratio):
         num_compressed,
         comp.tokens_per_block,
         "fp8_blockwise",
+        head_dim=INDEX_HEAD_DIM,
     )
-    assert_fp8_cache_match(comp.kv_cache, golden_cache, "fp8_blockwise", "Blockwise cache layout")
+    assert_fp8_cache_match(
+        comp.kv_cache,
+        golden_cache,
+        "fp8_blockwise",
+        "Blockwise cache layout",
+        head_dim=INDEX_HEAD_DIM,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1229,7 +1489,7 @@ def test_fp8_pertensor_compressor(batch, seqlen, ratio):
         f"Per-tensor scale should be fixed at 1.0, got {kv_scale.item():.6f}"
     )
 
-    # Verify cache scatter
+    # Verify cache scatter (cache is FP8 dtype, same as compressor output)
     golden_cache = build_fp8_golden_cache(
         kv_fp8,
         kv_scale,

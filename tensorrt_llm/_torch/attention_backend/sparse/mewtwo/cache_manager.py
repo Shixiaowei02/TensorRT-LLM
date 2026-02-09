@@ -497,7 +497,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         return (
             sum(
                 self._get_attn_bytes_per_block(attn, layer)
-                for layer, attn in zip(self.pp_layers, MewtwoAttentionType)
+                for layer in self.pp_layers for attn in MewtwoAttentionType
                 if self._layer_has_attention(layer, attn)
             )
             // self.tokens_per_block
