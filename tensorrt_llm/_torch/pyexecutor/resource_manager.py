@@ -2649,8 +2649,9 @@ class KVCacheManagerV2(BaseResourceManager):
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
             for pool_idx in range(self.num_pools):
-                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
-                    pool_idx, index * self.max_beam_width + i, 0]
+                buffer = self.host_kv_cache_block_offsets[pool_idx, index *
+                                                          self.max_beam_width +
+                                                          i, 0]
                 kv_cache.set_base_page_index_buf(i, pool_idx,
                                                  memoryview(buffer.numpy()))
         return kv_cache

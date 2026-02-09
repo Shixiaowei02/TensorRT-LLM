@@ -607,12 +607,8 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         kv_cache_manager = metadata.kv_cache_manager
 
         # Get buffer pointers directly from kv_cache_manager
-        swa_pool_ptr = kv_cache_manager.layer_attn_to_pool_ptr[
-            MewtwoAttentionType.SWA.value, layer_idx
-        ]
-        swa_buffer_ptr = kv_cache_manager.layer_attn_to_buffer_ptr[
-            MewtwoAttentionType.SWA.value, layer_idx
-        ]
+        swa_pool_ptr = kv_cache_manager.kv_cache_pool_pointers[0, 0].item()
+        swa_buffer_ptr = kv_cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
 
         # Token stride
         token_stride = kv_cache_manager.get_token_bytes(layer_idx, MewtwoAttentionType.SWA)
@@ -650,9 +646,9 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             )
         else:
             # SWA + compressed indices
-            compressed_buffer_ptr = kv_cache_manager.layer_attn_to_buffer_ptr[
-                MewtwoAttentionType.COMPRESS.value, layer_idx
-            ]
+            compressed_buffer_ptr = kv_cache_manager.get_buffers(
+                layer_idx, MewtwoAttentionType.COMPRESS
+            ).data_ptr()
             block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio][
                 req_start:req_end
             ]

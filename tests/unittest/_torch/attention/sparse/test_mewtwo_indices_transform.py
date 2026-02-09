@@ -154,12 +154,8 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     cache_manager.prepare_resources(scheduled_batch)
 
     # Get pointers and offsets
-    swa_pool_ptr = cache_manager.layer_attn_to_pool_ptr[
-        MewtwoAttentionType.SWA.value, layer_idx
-    ].item()
-    swa_buffer_ptr = cache_manager.layer_attn_to_buffer_ptr[
-        MewtwoAttentionType.SWA.value, layer_idx
-    ].item()
+    swa_pool_ptr = cache_manager.kv_cache_pool_pointers[0, 0].item()
+    swa_buffer_ptr = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
 
     # Single token stride for all buffers
     token_stride = cache_manager.get_token_bytes(0, MewtwoAttentionType.SWA)
@@ -169,9 +165,9 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     compressed_attn_type = scenario.compressed_attn_type
 
     if has_compressed:
-        compressed_buffer_ptr = cache_manager.layer_attn_to_buffer_ptr[
-            compressed_attn_type.value, layer_idx
-        ].item()
+        compressed_buffer_ptr = cache_manager.get_buffers(
+            layer_idx, compressed_attn_type
+        ).data_ptr()
         compressed_offset = (compressed_buffer_ptr - swa_pool_ptr) // token_stride
         tokens_per_block_compressed = scenario.tokens_per_block // scenario.compress_ratio
     else:

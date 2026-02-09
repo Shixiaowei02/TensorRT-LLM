@@ -36,7 +36,7 @@ class TestMewtwoCacheManager:
 
     # cache manager specific param
     tokens_per_block = 128
-    max_batch_size = 16
+    max_batch_size = 256
     max_seq_len = 1024
 
     def _is_compress_layer(self, compress_ratio: int) -> bool:
@@ -390,9 +390,14 @@ class TestMewtwoCacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            page_indices = cache_manager.get_cache_indices(
-                request_id=req.py_request_id, layer_idx=layer_idx, attn_type=attn_type
-            )
+            page_indices = cache_manager.get_batch_attn_offset(
+                [req.py_request_id],
+                beam_width=1,
+                num_contexts=1,
+                num_seqs=1,
+                attn_type=attn_type,
+                compress_ratio=compress_ratios[layer_idx],
+            ).squeeze(0)
 
             if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
                 seq_len = prompt_len // compress_ratios[layer_idx]
@@ -437,9 +442,14 @@ class TestMewtwoCacheManager:
         """
         compress_ratios = cache_manager._compress_ratios
         for (layer_idx, attn_type), (values, scales) in cache_values.items():
-            block_indices = cache_manager.get_cache_indices(
-                request_id=req.py_request_id, layer_idx=layer_idx, attn_type=attn_type
-            )
+            block_indices = cache_manager.get_batch_attn_offset(
+                [req.py_request_id],
+                beam_width=1,
+                num_contexts=1,
+                num_seqs=1,
+                attn_type=attn_type,
+                compress_ratio=compress_ratios[layer_idx],
+            ).squeeze(0)
 
             compressed_token_idx = token_idx
             if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
@@ -511,9 +521,14 @@ class TestMewtwoCacheManager:
 
             # read cache values for each attention type
             for attn_type in attn_types:
-                page_indices = cache_manager.get_cache_indices(
-                    request_id=req.py_request_id, layer_idx=layer, attn_type=attn_type
-                )
+                page_indices = cache_manager.get_batch_attn_offset(
+                    [req.py_request_id],
+                    beam_width=1,
+                    num_contexts=1,
+                    num_seqs=1,
+                    attn_type=attn_type,
+                    compress_ratio=ratio,
+                ).squeeze(0)
                 if attn_type in [
                     MewtwoAttentionType.COMPRESS,
                     MewtwoAttentionType.INDEXER_COMPRESS,
@@ -725,221 +740,6 @@ class TestMewtwoCacheManager:
 
         # Clean up
         cache_manager.shutdown()
-
-    @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
-    def test_layer_attn_to_pool_id(
-        self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
-    ):
-        # Create cache manager and sparse attention config
-        num_layers = len(compress_ratios)
-        cache_manager, _ = self._create_mewtwo_cache_manager(
-            tokens_per_block=self.tokens_per_block,
-            compress_ratios=compress_ratios,
-            dtype=dtype,
-            compressor_dtype=compressor_dtype,
-        )
-
-        layer_attn_to_pool_id = cache_manager.layer_attn_to_pool_id
-        assert layer_attn_to_pool_id.shape == (len(MewtwoAttentionType), num_layers)
-
-        for layer in range(num_layers):
-            attn_to_pool_id = layer_attn_to_pool_id[:, layer]
-            assert attn_to_pool_id[MewtwoAttentionType.SWA.value] != -1, (
-                f"layer {layer} should have SWA attention"
-            )
-
-            if self._is_compress_layer(compress_ratios[layer]):
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESS.value] != -1, (
-                    f"layer {layer} should have COMPRESS attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESSOR_STATE.value] != -1, (
-                    f"layer {layer} should have COMPRESSOR_STATE attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESSOR_SCORE.value] != -1, (
-                    f"layer {layer} should have COMPRESSOR_SCORE attention"
-                )
-            else:
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESS.value] == -1, (
-                    f"layer {layer} should not have COMPRESS attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESSOR_STATE.value] == -1, (
-                    f"layer {layer} should not have COMPRESSOR_STATE attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.COMPRESSOR_SCORE.value] == -1, (
-                    f"layer {layer} should not have COMPRESSOR_SCORE attention"
-                )
-
-            if self._is_sparse_layer(compress_ratios[layer]):
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESS.value] != -1, (
-                    f"layer {layer} should have INDEXER_COMPRESS attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] != -1, (
-                    f"layer {layer} should have INDEXER_COMPRESSOR_STATE attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] != -1, (
-                    f"layer {layer} should have INDEXER_COMPRESSOR_SCORE attention"
-                )
-            else:
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESS.value] == -1, (
-                    f"layer {layer} should not have INDEXER_COMPRESS attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] == -1, (
-                    f"layer {layer} should not have INDEXER_COMPRESSOR_STATE attention"
-                )
-                assert attn_to_pool_id[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] == -1, (
-                    f"layer {layer} should not have INDEXER_COMPRESSOR_SCORE attention"
-                )
-
-    @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
-    def test_layer_attn_to_buffer_ptr(
-        self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
-    ):
-        # Create cache manager and sparse attention config
-        num_layers = len(compress_ratios)
-        cache_manager, _ = self._create_mewtwo_cache_manager(
-            tokens_per_block=self.tokens_per_block,
-            compress_ratios=compress_ratios,
-            dtype=dtype,
-            compressor_dtype=compressor_dtype,
-        )
-
-        layer_attn_to_buffer_ptr = cache_manager.layer_attn_to_buffer_ptr
-        assert layer_attn_to_buffer_ptr.shape == (len(MewtwoAttentionType), num_layers)
-
-        for layer in range(num_layers):
-            attn_to_buffer_ptr = layer_attn_to_buffer_ptr[:, layer]
-            assert attn_to_buffer_ptr[MewtwoAttentionType.SWA.value] != 0, (
-                f"layer {layer} should have SWA buffer pointer"
-            )
-
-            if self._is_compress_layer(compress_ratios[layer]):
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESS.value] != 0, (
-                    f"layer {layer} should have COMPRESS buffer pointer"
-                )
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESSOR_STATE.value] != 0, (
-                    f"layer {layer} should have COMPRESSOR_STATE buffer pointer"
-                )
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESSOR_SCORE.value] != 0, (
-                    f"layer {layer} should have COMPRESSOR_SCORE buffer pointer"
-                )
-            else:
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESS.value] == 0, (
-                    f"layer {layer} should not have COMPRESS buffer pointer"
-                )
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESSOR_STATE.value] == 0, (
-                    f"layer {layer} should not have COMPRESSOR_STATE buffer pointer"
-                )
-                assert attn_to_buffer_ptr[MewtwoAttentionType.COMPRESSOR_SCORE.value] == 0, (
-                    f"layer {layer} should not have COMPRESSOR_SCORE buffer pointer"
-                )
-
-            if self._is_sparse_layer(compress_ratios[layer]):
-                assert attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESS.value] != 0, (
-                    f"layer {layer} should have INDEXER_COMPRESS buffer pointer"
-                )
-                assert (
-                    attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] != 0
-                ), f"layer {layer} should have INDEXER_COMPRESSOR_STATE buffer pointer"
-                assert (
-                    attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] != 0
-                ), f"layer {layer} should have INDEXER_COMPRESSOR_SCORE buffer pointer"
-            else:
-                assert attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESS.value] == 0, (
-                    f"layer {layer} should not have INDEXER_COMPRESS buffer pointer"
-                )
-                assert (
-                    attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] == 0
-                ), f"layer {layer} should not have INDEXER_COMPRESSOR_STATE buffer pointer"
-                assert (
-                    attn_to_buffer_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] == 0
-                ), f"layer {layer} should not have INDEXER_COMPRESSOR_SCORE buffer pointer"
-
-    @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
-    def test_layer_attn_to_pool_ptr(
-        self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
-    ):
-        # Create cache manager and sparse attention config
-        num_layers = len(compress_ratios)
-        cache_manager, _ = self._create_mewtwo_cache_manager(
-            tokens_per_block=self.tokens_per_block,
-            compress_ratios=compress_ratios,
-            dtype=dtype,
-            compressor_dtype=compressor_dtype,
-        )
-
-        layer_attn_to_pool_ptr = cache_manager.layer_attn_to_pool_ptr
-        assert layer_attn_to_pool_ptr.shape == (len(MewtwoAttentionType), num_layers)
-
-        for layer in range(num_layers):
-            attn_to_pool_ptr = layer_attn_to_pool_ptr[:, layer]
-            assert attn_to_pool_ptr[MewtwoAttentionType.SWA.value] != 0, (
-                f"layer {layer} should have SWA pool pointer"
-            )
-            if self._is_compress_layer(compress_ratios[layer]):
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESS.value] != 0, (
-                    f"layer {layer} should have COMPRESS pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESSOR_STATE.value] != 0, (
-                    f"layer {layer} should have COMPRESSOR_STATE pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESSOR_SCORE.value] != 0, (
-                    f"layer {layer} should have COMPRESSOR_SCORE pool pointer"
-                )
-            else:
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESS.value] == 0, (
-                    f"layer {layer} should not have COMPRESS pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESSOR_STATE.value] == 0, (
-                    f"layer {layer} should not have COMPRESSOR_STATE pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.COMPRESSOR_SCORE.value] == 0, (
-                    f"layer {layer} should not have COMPRESSOR_SCORE pool pointer"
-                )
-
-            if self._is_sparse_layer(compress_ratios[layer]):
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESS.value] != 0, (
-                    f"layer {layer} should have INDEXER_COMPRESS pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] != 0, (
-                    f"layer {layer} should have INDEXER_COMPRESSOR_STATE pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] != 0, (
-                    f"layer {layer} should have INDEXER_COMPRESSOR_SCORE pool pointer"
-                )
-            else:
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESS.value] == 0, (
-                    f"layer {layer} should not have INDEXER_COMPRESS pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_STATE.value] == 0, (
-                    f"layer {layer} should not have INDEXER_COMPRESSOR_STATE pool pointer"
-                )
-                assert attn_to_pool_ptr[MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE.value] == 0, (
-                    f"layer {layer} should not have INDEXER_COMPRESSOR_SCORE pool pointer"
-                )
-
-    @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
-    def test_kv_cache_pool_pointers(
-        self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
-    ):
-        # Create cache manager and sparse attention config
-        cache_manager, _ = self._create_mewtwo_cache_manager(
-            tokens_per_block=self.tokens_per_block,
-            compress_ratios=compress_ratios,
-            dtype=dtype,
-            compressor_dtype=compressor_dtype,
-        )
-
-        kv_cache_pool_pointers = cache_manager.kv_cache_pool_pointers
-        assert kv_cache_pool_pointers.shape == (cache_manager.num_pools, 2)
-
-        # all pool pointers should be non-zero
-        assert torch.all(kv_cache_pool_pointers[:, 0] != 0), "all pool pointers should be non-zero"
-        # Mewtwo doesn't have value cache, so the second column should be 0
-        assert torch.all(kv_cache_pool_pointers[:, 1] == 0), "the second column should be 0"
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
     @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
