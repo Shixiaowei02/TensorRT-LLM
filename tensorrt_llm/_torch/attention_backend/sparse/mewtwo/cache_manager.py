@@ -240,7 +240,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         base_indices = self.kv_cache_map[request_id].get_base_page_indices(pool_id).tolist()
         scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
-        return [idx * scale for idx in base_indices if idx != -1]
+        return [idx * scale if idx != -1 else -1 for idx in base_indices]
 
     def get_token_bytes(self, layer_idx: int, attn_type: MewtwoAttentionType) -> int:
         """
@@ -551,7 +551,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
         """
         Get the buffers for the indexer k cache for a specific layer.
         """
-        return self.get_buffers(layer_idx, MewtwoAttentionType.INDEXER_COMPRESS).unsqueeze(2)
+        buffer = self.get_buffers(layer_idx, MewtwoAttentionType.INDEXER_COMPRESS).unsqueeze(2)
+        return buffer.view(torch.uint8)
 
     def get_batch_indexer_k_cache_indices(self, request_ids: List[int]) -> List[List[int]]:
         """
@@ -585,7 +586,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             # all compress ratios have SWA attention and they are in the same pool
             self._compress_ratios[0],
         )
-        dst_tensor[0, :num_seqs, 0] = offsets
+        dst_tensor[0, :num_seqs, :, :] = offsets[:, None, :]
 
     def get_batch_attn_offset(
         self,

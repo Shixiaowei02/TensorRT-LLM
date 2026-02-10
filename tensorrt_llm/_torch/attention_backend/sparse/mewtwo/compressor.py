@@ -127,9 +127,9 @@ class Compressor(nn.Module):
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
         # Get block tables
-        block_table = metadata.block_tables[compress_type]
-        block_table_kv_state = metadata.block_tables[state_type]
-        block_table_score_state = metadata.block_tables[score_type]
+        block_table = metadata.block_tables[(self.compress_ratio, compress_type)]
+        block_table_kv_state = metadata.block_tables[(self.compress_ratio, state_type)]
+        block_table_score_state = metadata.block_tables[(self.compress_ratio, score_type)]
 
         # Get tokens_per_block from cache manager
         # state_tokens_per_block: for state/score caches (used in compress kernels)
@@ -139,7 +139,7 @@ class Compressor(nn.Module):
 
         # Get compression metadata
         cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
-        kv_lens = metadata.compressed_kv_lens_cuda[self.compress_ratio]
+        kv_lens = metadata.kv_lens_cuda_runtime
         total_num_comp_tokens = metadata.num_compressed_tokens[self.compress_ratio]
         # TODO: Move this to metadata preparation
         num_comp_tokens = cu_new_comp_kv[1:] - cu_new_comp_kv[:-1]
@@ -207,7 +207,8 @@ class Compressor(nn.Module):
         kv_comp_nope, kv_comp_pe = kv_comp.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
 
         kv_comp_pe = self.rotary_emb(
-            metadata.compressed_position_ids_cuda[self.compress_ratio], [kv_comp_pe]
+            metadata.compressed_position_ids_cuda[self.compress_ratio][: kv_comp_pe.shape[0]],
+            [kv_comp_pe],
         )
         kv_comp = maybe_compiled_cat([kv_comp_nope, kv_comp_pe[0]], dim=-1)
         kv_comp = rotate_activation(kv_comp)
@@ -274,10 +275,10 @@ class Compressor(nn.Module):
         # kv_fp8: [num_tokens, head_dim] in float8_e4m3fn - pass directly
         # kv_scale: [num_tokens, num_scale_blocks] in float32 - convert to bytes for interleaved storage
         scale_bytes = kv_scale.shape[1] * 4  # 4 bytes per float32 scale
-        # Flatten first to ensure contiguous memory layout with stride=1, then view as bytes
-        kv_scale_bytes = (
-            kv_scale.flatten().contiguous().view(torch.uint8).view(num_tokens, scale_bytes)
-        )
+        # Reshape to ensure contiguous memory, then view as bytes and reshape back
+        kv_scale_c = torch.empty_like(kv_scale, memory_format=torch.contiguous_format)
+        kv_scale_c.copy_(kv_scale)
+        kv_scale_bytes = kv_scale_c.view(torch.uint8)
 
         compressed_kv_scatter(
             kv_fp8.contiguous().view(num_tokens, self.head_dim),

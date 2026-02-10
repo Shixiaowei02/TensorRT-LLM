@@ -1623,7 +1623,10 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
-        hidden_size = self.o_proj.in_features
+        if self.is_mewtwo:
+            hidden_size = self.num_heads_tp_cp * self.v_head_dim
+        else:
+            hidden_size = self.o_proj.in_features
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
@@ -2046,6 +2049,7 @@ class MLA(nn.Module):
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
                 topk_indices=topk_indices[:num_ctx_tokens, :],
+                position_ids=position_ids[:num_ctx_tokens],
             )
 
         if num_generations > 0:
@@ -2065,6 +2069,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
+                position_ids=position_ids[num_ctx_tokens:num_tokens],
             )
 
     def forward_context_default(
@@ -2145,6 +2150,7 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -2185,6 +2191,7 @@ class MLA(nn.Module):
                                                    k_pe,
                                                    attn_metadata,
                                                    output,
+                                                   position_ids=position_ids,
                                                    latent_cache=latent_cache,
                                                    topk_indices=topk_indices)
         else:
@@ -2203,6 +2210,7 @@ class MLA(nn.Module):
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -2212,6 +2220,7 @@ class MLA(nn.Module):
                                                       k_pe,
                                                       attn_metadata,
                                                       output,
+                                                      position_ids=position_ids,
                                                       latent_cache=latent_cache,
                                                       topk_indices=topk_indices)
         else:
@@ -2712,7 +2721,7 @@ class MLA(nn.Module):
             [-1, self.num_heads_tp_cp, v_head_dim])
 
         if self.is_mewtwo:
-            output = self._mewtwo_o_proj(attn_out_latent, position_ids)
+            output.copy_(attn_out_latent.view([num_tokens, -1]))
         else:
             attn_output = output.view(
                 [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
@@ -2831,7 +2840,7 @@ class MLA(nn.Module):
             [-1, self.num_heads_tp_cp, v_head_dim])
 
         if self.is_mewtwo:
-            output = self._mewtwo_o_proj(attn_out_latent, position_ids)
+            output.copy_(attn_out_latent.view([num_tokens, -1]))
         else:
             attn_output = output.view(
                 [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
@@ -3052,11 +3061,12 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
-                                                  attn_metadata,
-                                                  all_reduce_params,
-                                                  self.mapping, self.mapping_o,
-                                                  self.layer_idx)
+        if self.is_mewtwo:
+            attn_output = self._mewtwo_o_proj(attn_output, position_ids)
+        else:
+            attn_output = _helix_cp_output_projection(
+                self.o_proj, attn_output, attn_metadata, all_reduce_params,
+                self.mapping, self.mapping_o, self.layer_idx)
         return attn_output
 
     def resmooth_parameters(self,

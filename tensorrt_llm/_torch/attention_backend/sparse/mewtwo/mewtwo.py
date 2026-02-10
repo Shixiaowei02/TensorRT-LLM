@@ -65,22 +65,54 @@ def build_compressed_local_indices(
     return indices
 
 
+class MewtwoAttentionType(Enum):
+    SWA = 0
+    COMPRESS = 1
+    COMPRESSOR_STATE = 2
+    COMPRESSOR_SCORE = 3
+    INDEXER_COMPRESS = 4
+    INDEXER_COMPRESSOR_STATE = 5
+    INDEXER_COMPRESSOR_SCORE = 6
+
+
 class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
+    # The set of (compress ratio, attention type) for the layers
+    attention_type_set: Set[Tuple[int, MewtwoAttentionType]]
     # The number of total compressed tokens for each compress ratio
     num_compressed_tokens: Dict[int, int] = {}
 
     def __init__(self, *args, **kwargs):
-        sparse_config = kwargs.get("sparse_attention_config")
-        self.compress_ratio = sparse_config.compress_ratios
-        self.compress_ratio_set = set(self.compress_ratio)
-        self.num_compressed_tokens = {}
         super().__init__(*args, **kwargs)
 
     def __post_init__(self):
         super().__post_init__()
         capture_graph = self.is_cuda_graph
+        self.compress_ratio_set = set(self.compress_ratios)
+
+        attention_types = []
+        for compress_ratio in self.compress_ratio_set:
+            if compress_ratio == 1:
+                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
+            elif compress_ratio == 4:
+                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESS))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_SCORE))
+                attention_types.append((compress_ratio, MewtwoAttentionType.INDEXER_COMPRESS))
+                attention_types.append(
+                    (compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE)
+                )
+                attention_types.append(
+                    (compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE)
+                )
+            else:
+                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESS))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_SCORE))
+        self.attention_type_set = set(attention_types)
 
         # Create buffers for the compressor
         # cu_seq_lens_cuda is the cumulative sequence lengths for the requests
@@ -226,6 +258,23 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
+        self.block_tables = {
+            attention_type: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
+                cache_name=f"block_tables_{attention_type}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for attention_type in self.attention_type_set
+        }
+        self.host_block_tables = {
+            attention_type: torch.empty_like(
+                self.block_tables[attention_type], device="cpu", pin_memory=True
+            )
+            for attention_type in self.attention_type_set
+        }
+
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
         # Shape: [max_num_tokens] per compress_ratio
         self.sparse_mla_topk_lens = {
@@ -239,16 +288,31 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
-    def prepare_for_cache_block_offsets(self):
+    def prepare_for_block_tables(self):
         """
-        Prepare block offsets for cache buffers.
+        Prepare block tables for cache buffers.
         """
+        for compress_ratio, attention_type in self.attention_type_set:
+            host_block_table = self.kv_cache_manager.get_batch_attn_offset(
+                request_ids=self.request_ids,
+                beam_width=1,
+                num_contexts=self.num_contexts,
+                num_seqs=self.num_seqs,
+                attn_type=attention_type,
+                compress_ratio=compress_ratio,
+            )
+            key = (compress_ratio, attention_type)
+            self.host_block_tables[key][: self.num_seqs] = host_block_table[: self.num_seqs]
+            self.block_tables[key][: self.num_seqs].copy_(
+                self.host_block_tables[key][: self.num_seqs], non_blocking=True
+            )
+
         # Build cache buffer block offsets for all compress_ratios
         for compress_ratio in self.compress_ratio_set:
             for i in range(self.num_seqs):
                 request_id = self.request_ids[i]
                 # Get the layer index for the compress ratio
-                layer_idx = self.compress_ratio.index(compress_ratio)
+                layer_idx = self.compress_ratios.index(compress_ratio)
                 if compress_ratio == 1:
                     attn_type = MewtwoAttentionType.SWA
                 else:
@@ -361,13 +425,13 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             layer_idx: self.kv_cache_manager.get_buffers(
                 layer_idx, MewtwoAttentionType.SWA
             ).data_ptr()
-            for layer_idx in range(self.kv_cache_manager.num_local_layers)
+            for layer_idx in self.kv_cache_manager.pp_layers
         }
         self.compressed_buffer_ptrs = {
             layer_idx: self.kv_cache_manager.get_buffers(
                 layer_idx, MewtwoAttentionType.COMPRESS
             ).data_ptr()
-            for layer_idx in range(self.kv_cache_manager.num_local_layers)
+            for layer_idx in self.kv_cache_manager.pp_layers
             if self.kv_cache_manager._is_compress_layer(layer_idx)
         }
 
@@ -378,7 +442,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.prepare_for_indexer_k_cache()
 
         # For block offsets
-        self.prepare_for_cache_block_offsets()
+        self.prepare_for_block_tables()
 
         # For mewtwo indices
         self.prepare_for_mewtwo_indices()
@@ -451,16 +515,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
 
-class MewtwoAttentionType(Enum):
-    SWA = 0
-    COMPRESS = 1
-    COMPRESSOR_STATE = 2
-    COMPRESSOR_SCORE = 3
-    INDEXER_COMPRESS = 4
-    INDEXER_COMPRESSOR_STATE = 5
-    INDEXER_COMPRESSOR_SCORE = 6
-
-
 class MewtwoIndexer(Indexer):
     def __init__(
         self,
@@ -486,8 +540,14 @@ class MewtwoIndexer(Indexer):
             aux_stream,
         )
         rms_norm_eps = 1e-6
+        index_head_dim = sparse_attention_config.index_head_dim
+        indexer_mla_params = MLAParams(
+            hidden_size=mla_params.hidden_size,
+            qk_rope_head_dim=mla_params.qk_rope_head_dim,
+            qk_nope_head_dim=index_head_dim - mla_params.qk_rope_head_dim,
+        )
         self.compressor = Compressor(
-            mla_params,
+            indexer_mla_params,
             layer_idx,
             compress_ratio,
             rms_norm_eps,
@@ -495,14 +555,17 @@ class MewtwoIndexer(Indexer):
             pos_embd_params,
             dtype=dtype,
             kv_cache_dtype="fp8_blockwise",
+            is_indexer=True,
         )
 
     def _qk_projection_and_rope(self, qr: torch.Tensor, position_ids: torch.Tensor):
         """Project Q and apply RoPE"""
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
+        num_tokens = q.shape[0]
         q_nope, q_pe = q.split([self.head_dim - self.rope_dim, self.rope_dim], dim=-1)
-        q_pe = self.rotary_emb(position_ids, [q_pe])[0]
+        q_pe = self.rotary_emb(position_ids, [q_pe.reshape(num_tokens, -1)])[0]
+        q_pe = q_pe.view(num_tokens, self.n_heads, self.rope_dim)
         return q_pe, q_nope
 
     def forward(
@@ -511,10 +574,9 @@ class MewtwoIndexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: MewtwoTrtllmAttentionMetadata,
         position_ids: torch.Tensor,
-        indexer_k: torch.Tensor,
     ):
         # compress k
-        k_fp8, k_scale = self.compressor(indexer_k, metadata)
+        k_fp8, k_scale = self.compressor(hidden_states, metadata)
 
         # multi-stream q proj/rope and weights proj
         q, weights = maybe_execute_in_parallel(
@@ -593,6 +655,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 skip_create_weights_in_init,
                 sparse_attention_config,
                 dtype,
+                self.compress_ratio,
                 layer_idx,
                 aux_stream,
             )
@@ -690,9 +753,6 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 compress_ratio=self.compress_ratio,
                 num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             )
-
-        # Update sparse_mla_topk to match the global_indices buffer width
-        self.sparse_mla_topk = global_indices.shape[1]
 
         return global_indices, None
 

@@ -584,7 +584,6 @@ class CompressorWrapper:
         self.layer_idx = layer_idx
         self.kv_cache_dtype = kv_cache_dtype
         self.is_indexer = is_indexer
-        coff = 2 if self.overlap else 1
 
         # Create MLAParams
         # For indexer mode, use INDEX_HEAD_DIM instead of HEAD_DIM
@@ -1020,9 +1019,9 @@ class CompressorWrapper:
         self.block_offsets = block_table_compress
 
         block_tables = {
-            compress_type: block_table_compress,
-            state_type: block_table_kv_state,
-            score_type: block_table_score_state,
+            (ratio, compress_type): block_table_compress,
+            (ratio, state_type): block_table_kv_state,
+            (ratio, score_type): block_table_score_state,
         }
 
         # Both prefill and decode kernels use absolute token positions for the

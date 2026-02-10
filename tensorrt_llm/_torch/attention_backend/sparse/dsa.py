@@ -332,6 +332,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     sparse_mla_topk: int
     # max number of draft tokens
     max_draft_tokens: int = 0
+    # Indexer head dimension
+    indexer_head_dim: int = 128
+    # Indexer quant block size
+    indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
     # Whether skip the indexer for context requests
@@ -341,7 +345,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Whether to use the expanded buffers for MTP support
     use_expanded_buffers_for_mtp: bool = False
     # Compression ratio for KV tokens
-    compress_ratio: List[int] = [1]
+    compress_ratios: List[int] = [1]
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -365,16 +369,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.indexer_max_chunk_size = 32768  # Default to 32K tokens for the indexer
 
-        # Get compression ratio from sparse attention config
-        if hasattr(self.sparse_attention_config, 'compress_ratio'):
-            self.compress_ratio = self.sparse_attention_config.compress_ratio
-
     def __post_init__(self):
         super().__post_init__()
 
         self.sparse_mla_topk = self.sparse_attention_config.index_topk
+        self.indexer_head_dim = self.sparse_attention_config.index_head_dim
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
         capture_graph = self.is_cuda_graph
+        # Get compression ratio from sparse attention config
+        if hasattr(self.sparse_attention_config, 'compress_ratios'):
+            self.compress_ratios = self.sparse_attention_config.compress_ratios
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
@@ -1258,7 +1262,7 @@ class Indexer(nn.Module):
         """
         device = metadata.cu_seqlen_ks.device
         # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratio else 1
+        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[
@@ -1572,12 +1576,12 @@ class Indexer(nn.Module):
         num_ctx_tokens = metadata.num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
-        head_dim = kv_cache_manager.index_head_dim
+        head_dim = metadata.index_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
-        quant_block_size = kv_cache_manager.quant_block_size
+        quant_block_size = metadata.indexer_quant_block_size
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratio else 1
+        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
@@ -1774,7 +1778,8 @@ class Indexer(nn.Module):
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
                         logits, cu_seqlen_ks, cu_seqlen_ke,
-                        topk_indices_buffer[:num_ctx_tokens, :])
+                        topk_indices_buffer[:num_ctx_tokens, :],
+                        self.index_topk)
                 else:
                     topk_indices = logits.topk(min(self.index_topk,
                                                    logits.shape[-1]),
