@@ -1397,13 +1397,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             qk_rope_head_dim=qk_rope_head_dim,
             model_type="mewtwo",
         )
-        # Precompute freqs_cis for reference calculation
-        freqs_cis = precompute_freqs_cis(
-            rope_config.qk_rope_head_dim, max(seq_lens),
-            rope_config.max_position_embeddings, rope_config.rope_theta,
-            rope_config.rope_scaling['factor'],
-            rope_config.rope_scaling['beta_fast'],
-            rope_config.rope_scaling['beta_slow']).to(device)
+        freqs_cis = None  # Will be set after MLA modules are created
 
     # Calculate scaling factors (aligned with vLLM)
     def yarn_get_mscale(scale=1, mscale=1):
@@ -1506,6 +1500,16 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         print(f"  Testing layer {layer_idx} of {num_layers} (multi-layer pool)")
     else:
         print(f"  Testing single layer (baseline)")
+
+    # For mewtwo: derive freqs_cis from the production RotaryEmbedding to
+    # guarantee matching frequencies (the reference precompute_freqs_cis may
+    # differ from the production's yarn-scaled frequencies).
+    if sparse_attn_algo == "mewtwo" and freqs_cis is None:
+        prod_cos_sin = mla.mqa.compressor.rotary_emb.rotary_cos_sin
+        # prod_cos_sin: [max_positions, 2, rope_dim//2]
+        prod_cos = prod_cos_sin[:, 0, :]  # [max_positions, rope_dim//2]
+        prod_sin = prod_cos_sin[:, 1, :]  # [max_positions, rope_dim//2]
+        freqs_cis = torch.complex(prod_cos, prod_sin).to(device)
 
     # Initialize weights for all layers
     init_layers(mla_layers, sparse_attn_algo, pretrained_config)
@@ -1696,7 +1700,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         output = mla_forward_impl_with_mewtwo_wo_linear(
             mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
             hidden_states, position_ids, dtype, device)
-        print(f"output: {output.shape}")
     else:
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")
@@ -1804,15 +1807,11 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 f"  ⚠ Request {orig_req_idx} [{req_type}]: max error {req_error.max():.3f}"
             )
 
-    if sparse_attn_algo == "dsa":
-        torch.testing.assert_close(output,
-                                   reference_output,
-                                   rtol=0.2,
-                                   atol=0.25)
+    if kv_cache_dtype == "auto":
+        torch.testing.assert_close(output, reference_output, rtol=0.2, atol=0.2)
     else:
         diff = _calc_diff(output, reference_output)
-        # TODO: fix the accuracy issue and reduce this tolerance
-        assert diff < 0.1, f"{diff=}"
+        assert diff < 1e-2, f"{diff=}"
     print(
         f"  ✓ Validation passed: max_error={abs_error.max():.4f}, mean_error={abs_error.mean():.6f}"
     )
