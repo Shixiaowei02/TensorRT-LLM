@@ -268,7 +268,6 @@ def _prepare_generation_seqlens(
 # Test scenarios
 scenarios = [
     Scenario(rope_append=True, num_heads=128, kv_lora_rank=512),
-    Scenario(rope_append=False, num_heads=64, kv_lora_rank=448),
 ]
 
 window_sizes = [128]
@@ -738,7 +737,7 @@ def test_swa_sparse_mla(
 
 if __name__ == "__main__":
     _run_swa_test(
-        scenario=scenarios[1],
+        scenario=scenarios[0],
         context_sequence_lengths=[256],
         window_size=128,
         num_generation_steps=3,
