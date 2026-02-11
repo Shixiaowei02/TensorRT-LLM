@@ -405,7 +405,8 @@ num_generation_steps = [2]
 tokens_per_block = 64
 
 kv_cache_dtype_list = [torch.bfloat16]
-rope_append_values = [False, True]
+# DSA only supports rope_append=True
+rope_append_values = [True]
 scenarios = [
     Scenario(
         kv_cache_dtype=kv_cache_dtype,
