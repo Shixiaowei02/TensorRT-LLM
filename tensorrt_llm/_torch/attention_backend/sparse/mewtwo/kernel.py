@@ -17,6 +17,7 @@ def _next_power_of_2(n):
     n |= n >> 16
     return n + 1
 
+
 # ============================================================================
 # cuTile Kernels (primary implementations)
 #
@@ -77,41 +78,58 @@ def paged_kv_compress_cutile_kernel(
         token_idx = sp + t
         if token_idx < kv_len:
             ape_idx = token_idx % COMPRESS_RATIO
-
-            # Block table lookups (2D index)
             log_blk = token_idx // page_size
             blk_off = token_idx % page_size
+
+            # Issue ALL loads up front with latency hints
             phys_kv = ct.gather(
-                block_table_kv, (batch_idx, log_blk), padding_value=0,
+                block_table_kv,
+                (batch_idx, log_blk),
+                padding_value=0,
+                latency=1,
             )
             phys_sc = ct.gather(
-                block_table_score, (batch_idx, log_blk), padding_value=0,
+                block_table_score,
+                (batch_idx, log_blk),
+                padding_value=0,
+                latency=1,
             )
-
-            # Load kv and score from kv_score (2D)
             kv_data = ct.gather(
-                kv_score, (in_off + t, state_offsets), padding_value=0,
+                kv_score,
+                (in_off + t, state_offsets),
+                padding_value=0,
+                latency=2,
             )
-            kv_data = ct.astype(kv_data, ct.float32)
             sc_data = ct.gather(
-                kv_score, (in_off + t, state_dim + state_offsets), padding_value=0,
+                kv_score,
+                (in_off + t, state_dim + state_offsets),
+                padding_value=0,
+                latency=2,
             )
-            sc_data = ct.astype(sc_data, ct.float32)
-
-            # Load APE (2D)
             ape_data = ct.gather(
-                ape, (ape_idx, state_offsets), padding_value=0,
+                ape,
+                (ape_idx, state_offsets),
+                padding_value=0,
+                latency=2,
             )
+
+            # Type conversions provide distance between loads and stores
+            kv_data = ct.astype(kv_data, ct.float32)
+            sc_data = ct.astype(sc_data, ct.float32)
             ape_data = ct.astype(ape_data, ct.float32)
 
-            # Write to paged caches (3D scatter)
+            # Stores (separated from loads by astype ops + latency)
             ct.scatter(
-                paged_kv, (phys_kv, blk_off, state_offsets),
+                paged_kv,
+                (phys_kv, blk_off, state_offsets),
                 ct.astype(kv_data, paged_kv.dtype),
+                latency=1,
             )
             ct.scatter(
-                paged_score, (phys_sc, blk_off, state_offsets),
+                paged_score,
+                (phys_sc, blk_off, state_offsets),
                 ct.astype(sc_data + ape_data, paged_score.dtype),
+                latency=1,
             )
 
     # ================================================================
@@ -125,18 +143,20 @@ def paged_kv_compress_cutile_kernel(
     # ================================================================
     # Phase 3: Reduction (per-token loop + online softmax weighted avg)
     # ================================================================
-    # Precompute head masks: in overlap mode state_dim = 2*head_dim,
-    # but Phase 3 output is only head_dim wide. Mask out positions >= head_dim.
-    head_mask_score = ct.where(
-        state_offsets < head_dim,
-        ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
-        ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32),
-    )
-    head_mask_kv = ct.where(
-        state_offsets < head_dim,
-        ct.full((BLOCK_SIZE,), 1.0, dtype=ct.float32),
-        ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
-    )
+    # In overlap mode state_dim = 2*head_dim, but output is head_dim wide.
+    # Mask out positions >= head_dim. Non-overlap has state_dim == head_dim
+    # so all offsets are in-bounds — no masking needed.
+    if IS_OVERLAP:
+        head_mask_score = ct.where(
+            state_offsets < head_dim,
+            ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
+            ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32),
+        )
+        head_mask_kv = ct.where(
+            state_offsets < head_dim,
+            ct.full((BLOCK_SIZE,), 1.0, dtype=ct.float32),
+            ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
+        )
     for c in range(NEXT_N):
         if c < num_compressions:
             compress_idx = sp // COMPRESS_RATIO + c
@@ -154,17 +174,30 @@ def paged_kv_compress_cutile_kernel(
                     log_blk = pos // page_size
                     blk_off = pos % page_size
                     phys_kv = ct.gather(
-                        block_table_kv, (batch_idx, log_blk), padding_value=0,
+                        block_table_kv,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     phys_sc = ct.gather(
-                        block_table_score, (batch_idx, log_blk), padding_value=0,
+                        block_table_score,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     k = ct.astype(
-                        ct.gather(paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0, latency=2
+                        ),
                         ct.float32,
                     )
                     s = ct.astype(
-                        ct.gather(paged_score, (phys_sc, blk_off, state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_score,
+                            (phys_sc, blk_off, state_offsets),
+                            padding_value=0,
+                            latency=2,
+                        ),
                         ct.float32,
                     )
                     k = k * head_mask_kv
@@ -177,23 +210,39 @@ def paged_kv_compress_cutile_kernel(
                     running_wsum = running_wsum * scale + k * term
                     running_max = new_max
 
-                # --- Current chunk: second head_dim features (offset by head_dim) ---
+                # --- Current chunk: second head_dim features ---
                 for r in range(COMPRESS_RATIO):
                     pos = curr_chunk_start + r
                     log_blk = pos // page_size
                     blk_off = pos % page_size
                     phys_kv = ct.gather(
-                        block_table_kv, (batch_idx, log_blk), padding_value=0,
+                        block_table_kv,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     phys_sc = ct.gather(
-                        block_table_score, (batch_idx, log_blk), padding_value=0,
+                        block_table_score,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     k = ct.astype(
-                        ct.gather(paged_kv, (phys_kv, blk_off, head_dim + state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_kv,
+                            (phys_kv, blk_off, head_dim + state_offsets),
+                            padding_value=0,
+                            latency=2,
+                        ),
                         ct.float32,
                     )
                     s = ct.astype(
-                        ct.gather(paged_score, (phys_sc, blk_off, head_dim + state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_score,
+                            (phys_sc, blk_off, head_dim + state_offsets),
+                            padding_value=0,
+                            latency=2,
+                        ),
                         ct.float32,
                     )
                     k = k * head_mask_kv
@@ -207,27 +256,38 @@ def paged_kv_compress_cutile_kernel(
                     running_max = new_max
 
             else:
-                # --- Non-overlap: single chunk ---
+                # --- Non-overlap: single chunk (no masking needed) ---
                 for r in range(COMPRESS_RATIO):
                     pos = curr_chunk_start + r
                     log_blk = pos // page_size
                     blk_off = pos % page_size
                     phys_kv = ct.gather(
-                        block_table_kv, (batch_idx, log_blk), padding_value=0,
+                        block_table_kv,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     phys_sc = ct.gather(
-                        block_table_score, (batch_idx, log_blk), padding_value=0,
+                        block_table_score,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     k = ct.astype(
-                        ct.gather(paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0, latency=2
+                        ),
                         ct.float32,
                     )
                     s = ct.astype(
-                        ct.gather(paged_score, (phys_sc, blk_off, state_offsets), padding_value=0),
+                        ct.gather(
+                            paged_score,
+                            (phys_sc, blk_off, state_offsets),
+                            padding_value=0,
+                            latency=2,
+                        ),
                         ct.float32,
                     )
-                    k = k * head_mask_kv
-                    s = s + head_mask_score
 
                     new_max = ct.maximum(running_max, s)
                     scale = ct.exp(running_max - new_max)
@@ -239,10 +299,26 @@ def paged_kv_compress_cutile_kernel(
             # Write compressed output (2D scatter, check_bounds handles OOB)
             result = running_wsum / running_sum
             ct.scatter(
-                output, (out_off + c, state_offsets),
+                output,
+                (out_off + c, state_offsets),
                 ct.astype(result, output.dtype),
                 check_bounds=True,
+                latency=1,
             )
+
+
+def _compress_block_size(compress_ratio, max_dim):
+    """Select BLOCK_SIZE balancing register pressure vs parallelism.
+
+    Large compress_ratio → more iterations in reduction loop → more register
+    pressure → smaller BLOCK_SIZE for better occupancy. Matches Triton's
+    autotune search space of {64, 128, 256, 512} keyed on compress_ratio.
+    """
+    if compress_ratio <= 4:
+        bs = 512
+    else:
+        bs = 64
+    return min(bs, _next_power_of_2(max_dim))
 
 
 def kv_compress_cutile(
@@ -295,7 +371,7 @@ def kv_compress_cutile(
     coff = 2 if overlap else 1
     state_dim = coff * head_dim
 
-    BLOCK_SIZE = min(_next_power_of_2(state_dim), 512)
+    BLOCK_SIZE = _compress_block_size(compress_ratio, state_dim)
     grid = (batch_size, (state_dim + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     ct.launch(
@@ -318,9 +394,9 @@ def kv_compress_cutile(
             page_size,
             state_dim,
             head_dim,
-            compress_ratio,  # COMPRESS_RATIO (compile-time: 4 or 128)
-            overlap,  # IS_OVERLAP
-            next_n,  # NEXT_N
+            compress_ratio,
+            overlap,
+            next_n,
             BLOCK_SIZE,
         ),
     )
@@ -405,37 +481,56 @@ def prefill_reduction_cutile_kernel(
                 log_blk = write_pos // page_size
                 blk_off = write_pos % page_size
                 phys_kv = ct.gather(
-                    block_table_kv, (batch_idx, log_blk), padding_value=0,
+                    block_table_kv,
+                    (batch_idx, log_blk),
+                    padding_value=0,
+                    latency=1,
                 )
                 phys_sc = ct.gather(
-                    block_table_score, (batch_idx, log_blk), padding_value=0,
+                    block_table_score,
+                    (batch_idx, log_blk),
+                    padding_value=0,
+                    latency=1,
                 )
 
                 base_row = cutoff - COMPRESS_RATIO + r
                 for col_idx in range(2):
                     col_off = col_idx * head_dim + head_offset
-                    # Load kv, score, ape (2D gather)
-                    kv_data = ct.astype(
-                        ct.gather(kv_score, (input_offset + base_row, col_off + head_offsets), padding_value=0),
-                        ct.float32,
+                    # Issue all loads with latency hints
+                    kv_data = ct.gather(
+                        kv_score,
+                        (input_offset + base_row, col_off + head_offsets),
+                        padding_value=0,
+                        latency=2,
                     )
-                    sc_data = ct.astype(
-                        ct.gather(kv_score, (input_offset + base_row, state_dim + col_off + head_offsets), padding_value=0),
-                        ct.float32,
+                    sc_data = ct.gather(
+                        kv_score,
+                        (input_offset + base_row, state_dim + col_off + head_offsets),
+                        padding_value=0,
+                        latency=2,
                     )
-                    ape_data = ct.astype(
-                        ct.gather(ape, (r, col_off + head_offsets), padding_value=0),
-                        ct.float32,
+                    ape_data = ct.gather(
+                        ape,
+                        (r, col_off + head_offsets),
+                        padding_value=0,
+                        latency=2,
                     )
-
-                    # Write to paged caches (3D scatter)
+                    # Type conversions provide distance
+                    kv_data = ct.astype(kv_data, ct.float32)
+                    sc_data = ct.astype(sc_data, ct.float32)
+                    ape_data = ct.astype(ape_data, ct.float32)
+                    # Stores (separated from loads)
                     ct.scatter(
-                        paged_kv, (phys_kv, blk_off, col_off + head_offsets),
+                        paged_kv,
+                        (phys_kv, blk_off, col_off + head_offsets),
                         ct.astype(kv_data, paged_kv.dtype),
+                        latency=1,
                     )
                     ct.scatter(
-                        paged_score, (phys_sc, blk_off, col_off + head_offsets),
+                        paged_score,
+                        (phys_sc, blk_off, col_off + head_offsets),
                         ct.astype(sc_data + ape_data, paged_score.dtype),
+                        latency=1,
                     )
 
         # 1b. Remainder tokens
@@ -446,36 +541,55 @@ def prefill_reduction_cutile_kernel(
                     log_blk = write_pos // page_size
                     blk_off = write_pos % page_size
                     phys_kv = ct.gather(
-                        block_table_kv, (batch_idx, log_blk), padding_value=0,
+                        block_table_kv,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
                     phys_sc = ct.gather(
-                        block_table_score, (batch_idx, log_blk), padding_value=0,
+                        block_table_score,
+                        (batch_idx, log_blk),
+                        padding_value=0,
+                        latency=1,
                     )
 
                     base_row = cutoff + r
                     for col_idx in range(2):
                         if col_idx < coff:
                             col_off = col_idx * head_dim + head_offset
-                            kv_data = ct.astype(
-                                ct.gather(kv_score, (input_offset + base_row, col_off + head_offsets), padding_value=0),
-                                ct.float32,
+                            # Issue all loads with latency hints
+                            kv_data = ct.gather(
+                                kv_score,
+                                (input_offset + base_row, col_off + head_offsets),
+                                padding_value=0,
+                                latency=2,
                             )
-                            sc_data = ct.astype(
-                                ct.gather(kv_score, (input_offset + base_row, state_dim + col_off + head_offsets), padding_value=0),
-                                ct.float32,
+                            sc_data = ct.gather(
+                                kv_score,
+                                (input_offset + base_row, state_dim + col_off + head_offsets),
+                                padding_value=0,
+                                latency=2,
                             )
-                            ape_data = ct.astype(
-                                ct.gather(ape, (r, col_off + head_offsets), padding_value=0),
-                                ct.float32,
+                            ape_data = ct.gather(
+                                ape,
+                                (r, col_off + head_offsets),
+                                padding_value=0,
+                                latency=2,
                             )
-
+                            kv_data = ct.astype(kv_data, ct.float32)
+                            sc_data = ct.astype(sc_data, ct.float32)
+                            ape_data = ct.astype(ape_data, ct.float32)
                             ct.scatter(
-                                paged_kv, (phys_kv, blk_off, col_off + head_offsets),
+                                paged_kv,
+                                (phys_kv, blk_off, col_off + head_offsets),
                                 ct.astype(kv_data, paged_kv.dtype),
+                                latency=1,
                             )
                             ct.scatter(
-                                paged_score, (phys_sc, blk_off, col_off + head_offsets),
+                                paged_score,
+                                (phys_sc, blk_off, col_off + head_offsets),
                                 ct.astype(sc_data + ape_data, paged_score.dtype),
+                                latency=1,
                             )
 
     # ================================================================
@@ -484,38 +598,44 @@ def prefill_reduction_cutile_kernel(
     if not should_compress:
         return
 
-    # Precompute head_mask for boundary chunks
-    head_mask_score = ct.where(
-        head_offset + head_offsets < head_dim,
-        ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
-        ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32),
-    )
-    head_mask_kv = ct.where(
-        head_offset + head_offsets < head_dim,
-        ct.full((BLOCK_SIZE,), 1.0, dtype=ct.float32),
-        ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
-    )
-
     running_max = ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32)
     running_sum = ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32)
     running_wsum = ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32)
 
     if IS_OVERLAP:
-        # Previous segment (col = head_offset, first head_dim features)
+        # Mask out positions >= head_dim (overlap has state_dim = 2*head_dim)
+        head_mask_score = ct.where(
+            head_offset + head_offsets < head_dim,
+            ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
+            ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32),
+        )
+        head_mask_kv = ct.where(
+            head_offset + head_offsets < head_dim,
+            ct.full((BLOCK_SIZE,), 1.0, dtype=ct.float32),
+            ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
+        )
+        # Previous segment (first head_dim features)
         if local_output_idx > 0:
             input_start = (local_output_idx - 1) * COMPRESS_RATIO
             for r in range(COMPRESS_RATIO):
                 row = input_offset + input_start + r
                 k = ct.astype(
-                    ct.gather(kv_score, (row, head_offset + head_offsets), padding_value=0),
+                    ct.gather(
+                        kv_score, (row, head_offset + head_offsets), padding_value=0, latency=2
+                    ),
                     ct.float32,
                 )
                 s = ct.astype(
-                    ct.gather(kv_score, (row, state_dim + head_offset + head_offsets), padding_value=0),
+                    ct.gather(
+                        kv_score,
+                        (row, state_dim + head_offset + head_offsets),
+                        padding_value=0,
+                        latency=2,
+                    ),
                     ct.float32,
                 )
                 a = ct.astype(
-                    ct.gather(ape, (r, head_offset + head_offsets), padding_value=0),
+                    ct.gather(ape, (r, head_offset + head_offsets), padding_value=0, latency=2),
                     ct.float32,
                 )
                 s = s + a
@@ -529,20 +649,32 @@ def prefill_reduction_cutile_kernel(
                 running_wsum = running_wsum * scale + k * term
                 running_max = new_max
 
-        # Current segment (col = head_dim + head_offset, second head_dim features)
+        # Current segment (second head_dim features)
         cur_start = local_output_idx * COMPRESS_RATIO
         for r in range(COMPRESS_RATIO):
             row = input_offset + cur_start + r
             k = ct.astype(
-                ct.gather(kv_score, (row, head_dim + head_offset + head_offsets), padding_value=0),
+                ct.gather(
+                    kv_score,
+                    (row, head_dim + head_offset + head_offsets),
+                    padding_value=0,
+                    latency=2,
+                ),
                 ct.float32,
             )
             s = ct.astype(
-                ct.gather(kv_score, (row, state_dim + head_dim + head_offset + head_offsets), padding_value=0),
+                ct.gather(
+                    kv_score,
+                    (row, state_dim + head_dim + head_offset + head_offsets),
+                    padding_value=0,
+                    latency=2,
+                ),
                 ct.float32,
             )
             a = ct.astype(
-                ct.gather(ape, (r, head_dim + head_offset + head_offsets), padding_value=0),
+                ct.gather(
+                    ape, (r, head_dim + head_offset + head_offsets), padding_value=0, latency=2
+                ),
                 ct.float32,
             )
             s = s + a
@@ -557,25 +689,28 @@ def prefill_reduction_cutile_kernel(
             running_max = new_max
 
     else:
-        # Non-overlap: single segment (col = head_offset)
+        # Non-overlap: no masking needed (state_dim == head_dim)
         input_start = local_output_idx * COMPRESS_RATIO
         for r in range(COMPRESS_RATIO):
             row = input_offset + input_start + r
             k = ct.astype(
-                ct.gather(kv_score, (row, head_offset + head_offsets), padding_value=0),
+                ct.gather(kv_score, (row, head_offset + head_offsets), padding_value=0, latency=2),
                 ct.float32,
             )
             s = ct.astype(
-                ct.gather(kv_score, (row, state_dim + head_offset + head_offsets), padding_value=0),
+                ct.gather(
+                    kv_score,
+                    (row, state_dim + head_offset + head_offsets),
+                    padding_value=0,
+                    latency=2,
+                ),
                 ct.float32,
             )
             a = ct.astype(
-                ct.gather(ape, (r, head_offset + head_offsets), padding_value=0),
+                ct.gather(ape, (r, head_offset + head_offsets), padding_value=0, latency=2),
                 ct.float32,
             )
             s = s + a
-            k = k * head_mask_kv
-            s = s + head_mask_score
 
             new_max = ct.maximum(running_max, s)
             scale = ct.exp(running_max - new_max)
@@ -584,12 +719,14 @@ def prefill_reduction_cutile_kernel(
             running_wsum = running_wsum * scale + k * term
             running_max = new_max
 
-    # Output scatter (2D, check_bounds handles OOB for head_offset + head_offsets >= head_dim)
+    # Output scatter (2D, check_bounds handles OOB)
     result = running_wsum / running_sum
     ct.scatter(
-        output, (output_offset + local_output_idx, head_offset + head_offsets),
+        output,
+        (output_offset + local_output_idx, head_offset + head_offsets),
         ct.astype(result, output.dtype),
         check_bounds=True,
+        latency=1,
     )
 
 
@@ -628,14 +765,8 @@ def kv_compress_prefill_cutile(
     num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
     max_outputs = num_outputs_per_batch.max().item()
 
-    # Match Triton's BLOCK_SIZE heuristic for grid parallelism
-    _SMEM_LIMIT = 230000
-    _NUM_LIVE = 4  # k, s, ape, exp in worst case
-    _max_bs = _SMEM_LIMIT // (compress_ratio * 4 * _NUM_LIVE)
-    BLOCK_SIZE = max(64, 1 << (_max_bs.bit_length() - 1)) if _max_bs >= 64 else 64
-    BLOCK_SIZE = min(BLOCK_SIZE, _next_power_of_2(head_dim))
+    BLOCK_SIZE = _compress_block_size(compress_ratio, head_dim)
     num_head_chunks = (head_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-
     grid = (batch_size, max_outputs, num_head_chunks)
 
     ct.launch(
@@ -658,8 +789,8 @@ def kv_compress_prefill_cutile(
             page_size,
             state_dim,
             head_dim,
-            compress_ratio,  # COMPRESS_RATIO
-            overlap,  # IS_OVERLAP
+            compress_ratio,
+            overlap,
             BLOCK_SIZE,
         ),
     )
@@ -729,30 +860,41 @@ def compressed_kv_scatter_cutile_kernel(
     if IS_BLOCKWISE_FP8:
         # FP8 blockwise: non-interleaved layout per block row:
         #   [fp8_data: tpb * head_dim cols | scale_data: tpb * num_scale_blocks cols (fp32)]
-        # FP8 col in kv_cache (uint8): token_offset * head_dim + h
-        # Scale col in kv_cache_scale (fp32): (tpb * head_dim) // 4 + token_offset * nsb + s
         fp8_col_base = token_offset * head_dim
         scale_col_base = (tokens_per_block * head_dim) // 4 + token_offset * num_scale_blocks
 
         # Scatter FP8 data (uint8 byte-level)
         for h_start in range(0, head_dim, BLOCK_SIZE_H):
             h_offsets = h_start + ct.arange(BLOCK_SIZE_H, dtype=ct.int32)
-            data = ct.gather(compressed_kv, (global_token_idx, h_offsets), padding_value=0)
-            ct.scatter(kv_cache, (phys_block, fp8_col_base + h_offsets), data)
+            data = ct.gather(
+                compressed_kv, (global_token_idx, h_offsets), padding_value=0, latency=2
+            )
+            ct.scatter(kv_cache, (phys_block, fp8_col_base + h_offsets), data, latency=1)
 
         # Scatter scale data (fp32)
         for s_start in range(0, num_scale_blocks, BLOCK_SIZE_S):
             s_offsets = s_start + ct.arange(BLOCK_SIZE_S, dtype=ct.int32)
-            scale_data = ct.gather(kv_scale, (global_token_idx, s_offsets), padding_value=0)
-            ct.scatter(kv_cache_scale, (phys_block, scale_col_base + s_offsets), scale_data)
+            scale_data = ct.gather(
+                kv_scale, (global_token_idx, s_offsets), padding_value=0, latency=2
+            )
+            ct.scatter(
+                kv_cache_scale, (phys_block, scale_col_base + s_offsets), scale_data, latency=1
+            )
     else:
         # Default mode or per-tensor FP8: direct element copy
         col_base = token_offset * head_dim
 
         for h_start in range(0, head_dim, BLOCK_SIZE_H):
             h_offsets = h_start + ct.arange(BLOCK_SIZE_H, dtype=ct.int32)
-            data = ct.gather(compressed_kv, (global_token_idx, h_offsets), padding_value=0)
-            ct.scatter(kv_cache, (phys_block, col_base + h_offsets), ct.astype(data, kv_cache.dtype))
+            data = ct.gather(
+                compressed_kv, (global_token_idx, h_offsets), padding_value=0, latency=2
+            )
+            ct.scatter(
+                kv_cache,
+                (phys_block, col_base + h_offsets),
+                ct.astype(data, kv_cache.dtype),
+                latency=1,
+            )
 
 
 def compressed_kv_scatter_cutile(
@@ -851,7 +993,11 @@ def compressed_kv_scatter_cutile(
     else:
         # Convert input to match cache dtype (handles bf16→fp8 when cache is fp8;
         # CuTile doesn't support bf16→fp8 conversion inside kernels)
-        input_kv = compressed_kv.to(cache_2d.dtype) if compressed_kv.dtype != cache_2d.dtype else compressed_kv
+        input_kv = (
+            compressed_kv.to(cache_2d.dtype)
+            if compressed_kv.dtype != cache_2d.dtype
+            else compressed_kv
+        )
 
         # Dummy fp32 2D tensor (not accessed when IS_BLOCKWISE_FP8=False)
         dummy_fp32 = torch.empty(1, 1, dtype=torch.float32, device=compressed_kv.device)
