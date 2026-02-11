@@ -69,6 +69,7 @@ class DummyAttentionMetadata:
         self.slot_mapping_fp8 = slot_mapping_fp8
         self.slot_mapping_scale = slot_mapping_scale
         self.num_compressed_tokens = num_compressed_tokens
+        self.kv_lens_cuda_runtime = None  # Set by caller
 
 
 # ============================================================================
@@ -1048,6 +1049,8 @@ class CompressorWrapper:
             past_kv_lens=past_kv_lens_dict,
             num_compressed_tokens=num_compressed_tokens_dict,
         )
+        # kv_lens_cuda_runtime: [num_seqs] total KV length per sequence (past + current)
+        metadata.kv_lens_cuda_runtime = kv_lens
 
         # Update kv_cache reference for test compatibility
         self._update_kv_cache_reference()

@@ -1257,9 +1257,6 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     if kv_cache_dtype == "fp8" and get_sm_version() < 100:
         pytest.skip(
             "FP8 kv cache is not supported on pre-Blackwell architectures")
-    # TODO: fix the fp8 mewtwo attention
-    if kv_cache_dtype == "fp8" and sparse_attn_algo == "mewtwo":
-        pytest.skip("FP8 kv cache is not supported for mewtwo sparse attention")
 
     device = torch.device('cuda')
     dtype = torch.bfloat16
@@ -1456,10 +1453,16 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     else:
         cache_dtype = dtype
 
+    # Configure quantization for FP8 KV cache (per-tensor FP8, no blockwise scales)
+    quant_config = QuantConfig()
+    if kv_cache_dtype == "fp8":
+        quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+
     model_config = ModelConfig(
         mapping=mapping,
         sparse_attention_config=sparse_config,
         pretrained_config=SimpleNamespace(rms_norm_eps=1e-6, ),
+        quant_config=quant_config,
     )
 
     # Setup positional embedding params

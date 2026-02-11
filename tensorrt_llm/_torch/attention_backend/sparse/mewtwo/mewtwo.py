@@ -662,6 +662,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
 
         if self.compress_ratio > 1:
             rms_norm_eps = 1e-6
+            kv_cache_dtype="fp8_pertensor" if self.has_fp8_kv_cache else "default"
             self.compressor = Compressor(
                 mla_params,
                 layer_idx,
@@ -669,9 +670,9 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 rms_norm_eps,
                 skip_create_weights_in_init,
                 pos_embd_params,
+                kv_cache_dtype=kv_cache_dtype,
                 dtype=dtype,
             )
-
     def sparse_attn_predict(
         self,
         q: torch.Tensor,

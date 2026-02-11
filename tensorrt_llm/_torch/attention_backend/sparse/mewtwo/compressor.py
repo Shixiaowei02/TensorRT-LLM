@@ -11,7 +11,11 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compiled_cat
 from tensorrt_llm.quantization.utils import fp8_utils
 
-from .kernel import compressed_kv_scatter, kv_compress_prefill_triton, kv_compress_triton
+from .kernel import (
+    compressed_kv_scatter_cutile,
+    kv_compress_cutile,
+    kv_compress_prefill_cutile,
+)
 
 if TYPE_CHECKING:
     from .mewtwo import MewtwoTrtllmAttentionMetadata
@@ -153,7 +157,7 @@ class Compressor(nn.Module):
 
         # Run compression kernels
         if num_contexts > 0:
-            kv_compress_prefill_triton(
+            kv_compress_prefill_cutile(
                 kv_score=kv_score[:num_ctx_tokens],
                 ape=self.ape,
                 kv_lens=kv_lens[:num_contexts],
@@ -174,7 +178,7 @@ class Compressor(nn.Module):
 
         if num_generations > 0:
             num_gen_tokens = metadata.num_tokens - num_ctx_tokens
-            kv_compress_triton(
+            kv_compress_cutile(
                 kv_score=kv_score[num_ctx_tokens:],
                 ape=self.ape,
                 kv_lens=kv_lens[num_contexts:],
@@ -238,7 +242,7 @@ class Compressor(nn.Module):
                 compress_tokens_per_block,
             )
         else:
-            compressed_kv_scatter(
+            compressed_kv_scatter_cutile(
                 kv_comp,
                 num_comp_tokens_bsz,
                 cu_new_comp_kv,
@@ -273,14 +277,9 @@ class Compressor(nn.Module):
         kv_fp8, kv_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(kv_comp, use_ue8m0=False)
 
         # kv_fp8: [num_tokens, head_dim] in float8_e4m3fn - pass directly
-        # kv_scale: [num_tokens, num_scale_blocks] in float32 - convert to bytes for interleaved storage
-        scale_bytes = kv_scale.shape[1] * 4  # 4 bytes per float32 scale
-        # Reshape to ensure contiguous memory, then view as bytes and reshape back
-        kv_scale_c = torch.empty_like(kv_scale, memory_format=torch.contiguous_format)
-        kv_scale_c.copy_(kv_scale)
-        kv_scale_bytes = kv_scale_c.view(torch.uint8)
+        # kv_scale: [num_tokens, num_scale_blocks] in float32 - pass directly
 
-        compressed_kv_scatter(
+        compressed_kv_scatter_cutile(
             kv_fp8.contiguous().view(num_tokens, self.head_dim),
             num_comp_tokens,
             cu_new_comp_kv,
@@ -290,7 +289,7 @@ class Compressor(nn.Module):
             tokens_per_block,
             self.head_dim,
             kv_cache_dtype="fp8_blockwise",
-            kv_scale=kv_scale_bytes,
+            kv_scale=kv_scale,
         )
         return kv_fp8, kv_scale
 
@@ -325,7 +324,7 @@ class Compressor(nn.Module):
         # Quantize with scale = 1.0 (direct cast to FP8)
         kv_fp8 = kv_comp.to(torch.float8_e4m3fn)
 
-        compressed_kv_scatter(
+        compressed_kv_scatter_cutile(
             kv_fp8.view(torch.uint8),
             num_comp_tokens,
             cu_new_comp_kv,
