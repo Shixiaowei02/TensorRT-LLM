@@ -1262,7 +1262,8 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
             if self.is_mewtwo:
-                self.q_b_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
+                self.q_b_layernorm = RMSNorm(hidden_size=self.num_heads *
+                                             self.qk_head_dim,
                                              eps=rms_norm_eps,
                                              dtype=dtype)
         else:
@@ -1645,6 +1646,8 @@ class MLA(nn.Module):
     def _mewtwo_o_proj(self, attn_out_latent: torch.Tensor,
                        position_ids: torch.Tensor) -> torch.Tensor:
         num_tokens = attn_out_latent.shape[0]
+        attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
+                                               -1)
 
         # RoPE for attention results
         attn_out_nope, attn_out_pe = attn_out_latent.split(
@@ -2034,6 +2037,8 @@ class MLA(nn.Module):
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
+            topk_indices_ctx = topk_indices[:
+                                            num_ctx_tokens, :] if topk_indices is not None else None
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
@@ -2047,13 +2052,16 @@ class MLA(nn.Module):
                 k_pe_ctx,
                 attn_metadata,
                 output[:num_ctx_tokens, :],
-                latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :],
                 position_ids=position_ids[:num_ctx_tokens],
+                latent_cache=latent_cache_ctx,
+                topk_indices=topk_indices_ctx,
             )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
+            topk_indices_gen = topk_indices[
+                num_ctx_tokens:
+                num_tokens, :] if topk_indices is not None else None
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
@@ -2067,9 +2075,9 @@ class MLA(nn.Module):
                 k_pe_gen,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
-                latent_cache_gen,
-                topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
                 position_ids=position_ids[num_ctx_tokens:num_tokens],
+                latent_cache=latent_cache_gen,
+                topk_indices=topk_indices_gen,
             )
 
     def forward_context_default(

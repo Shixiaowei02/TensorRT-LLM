@@ -689,17 +689,26 @@ class mHC(nn.Module):
             term2 = torch.bmm(comb_res_mix.mT, residual.float())
             return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
         elif self.backend == "tilelang":
-            out = torch.empty_like(residual)
+            outer_shape = residual.shape[:-2]
+            residual_flat = residual.flatten(0, -3)
+            x_flat = x.flatten(0, -2)
+            comb_flat = comb_res_mix.flatten(0, -3)
+            post_flat = post_layer_mix.view(-1, post_layer_mix.shape[-2])
+
+            hc = residual_flat.shape[-2]
+            hidden = residual_flat.shape[-1]
+
+            out = torch.empty_like(residual_flat)
             mhc_post_tilelang(
-                comb_res_mix,
-                residual,
-                post_layer_mix.squeeze(-1),
-                x,
+                comb_flat,
+                residual_flat,
+                post_flat.squeeze(-1),
+                x_flat,
                 out,
-                residual.shape[-2],
-                residual.shape[-1],
+                residual_flat.shape[-2],
+                residual_flat.shape[-1],
             )
-            return out
+            return out.view(*residual.shape)
         elif self.backend == "triton":
             outer_shape = residual.shape[:-2]
             residual_flat = residual.view(-1, residual.shape[-2], residual.shape[-1])
@@ -722,7 +731,7 @@ class mHC(nn.Module):
                 hidden,
             )
 
-            return out.view(*outer_shape, hc, hidden)
+            return out.view(*residual.shape)
 
 
 class HCHead(nn.Module):
@@ -758,7 +767,7 @@ class HCHead(nn.Module):
             rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
             mixes = F.linear(x, self.fn) * rsqrt
             pre = torch.sigmoid(mixes * self.scale + self.base) + self.eps
-            y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+            y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
             return y.to(dtype)
         elif self.backend == "deepgemm":
             raise NotImplementedError("HC head GEMM n <= 32 is too small for DeepGEMM to support.")
@@ -780,7 +789,7 @@ class HCHead(nn.Module):
             )
             mixes = d * (s.unsqueeze(-1) / gemm_k + self.norm_eps).rsqrt()
             pre = torch.sigmoid(mixes * self.scale + self.base) + self.eps
-            y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=2)
+            y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=1)
             return y.to(dtype)
         elif self.backend == "triton":
             shape, dtype = x.size(), x.dtype
@@ -799,5 +808,5 @@ class HCHead(nn.Module):
             )
             mixes = d * (s.unsqueeze(-1) / gemm_k + self.norm_eps).rsqrt()
             pre = torch.sigmoid(mixes * self.scale + self.base) + self.eps
-            y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=2)
+            y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=1)
             return y.to(dtype)

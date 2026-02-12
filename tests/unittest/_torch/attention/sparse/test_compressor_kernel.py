@@ -11,6 +11,7 @@ from typing import Tuple
 import pytest
 import torch
 import triton
+
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.kernel import (
     compressed_kv_scatter_cutile,
     kv_compress_cutile,
@@ -1398,8 +1399,14 @@ def benchmark_scatter_all_backends():
 
         def cutile_fn():
             compressed_kv_scatter_cutile(
-                compressed_kv, num_outputs, cu_kv_comp, start_pos,
-                kv_cache_cutile, block_offsets, tokens_per_block, head_dim,
+                compressed_kv,
+                num_outputs,
+                cu_kv_comp,
+                start_pos,
+                kv_cache_cutile,
+                block_offsets,
+                tokens_per_block,
+                head_dim,
             )
 
         def pytorch_fn():
@@ -1419,12 +1426,14 @@ def benchmark_scatter_all_backends():
         cutile_us = cutile_ms * 1000
         pytorch_us = pytorch_ms * 1000
 
-        results.append({
-            "name": name,
-            "cutile_us": cutile_us,
-            "pytorch_us": pytorch_us,
-            "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
-        })
+        results.append(
+            {
+                "name": name,
+                "cutile_us": cutile_us,
+                "pytorch_us": pytorch_us,
+                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
+            }
+        )
 
     # Print results
     print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
@@ -1504,18 +1513,36 @@ def benchmark_compress_kernel():
 
         def cutile_fn():
             kv_compress_cutile(
-                kv_score, ape, kv_lens, start_pos,
-                cu_seq_lens, cu_outputs, kv_comp_cutile, compressed_mask,
-                paged_kv_cutile, paged_score_cutile,
-                block_table, block_table,
-                compress_ratio, head_dim, overlap, page_size, next_n=1,
+                kv_score,
+                ape,
+                kv_lens,
+                start_pos,
+                cu_seq_lens,
+                cu_outputs,
+                kv_comp_cutile,
+                compressed_mask,
+                paged_kv_cutile,
+                paged_score_cutile,
+                block_table,
+                block_table,
+                compress_ratio,
+                head_dim,
+                overlap,
+                page_size,
+                next_n=1,
             )
 
         def pytorch_fn():
             run_pytorch_reference(
-                new_kv.unsqueeze(1), new_score.unsqueeze(1), ape,
-                kv_state_py.clone(), score_state_py.clone(),
-                step, compress_ratio, head_dim, overlap,
+                new_kv.unsqueeze(1),
+                new_score.unsqueeze(1),
+                ape,
+                kv_state_py.clone(),
+                score_state_py.clone(),
+                step,
+                compress_ratio,
+                head_dim,
+                overlap,
             )
 
         cutile_ms = triton.testing.do_bench(cutile_fn, warmup=25, rep=100)
@@ -1524,12 +1551,14 @@ def benchmark_compress_kernel():
         cutile_us = cutile_ms * 1000
         pytorch_us = pytorch_ms * 1000
 
-        results.append({
-            "name": name,
-            "cutile_us": cutile_us,
-            "pytorch_us": pytorch_us,
-            "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
-        })
+        results.append(
+            {
+                "name": name,
+                "cutile_us": cutile_us,
+                "pytorch_us": pytorch_us,
+                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
+            }
+        )
 
     # Print results
     print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
@@ -1602,18 +1631,34 @@ def benchmark_compress_prefill_kernel():
 
         def cutile_fn():
             kv_compress_prefill_cutile(
-                kv_score, ape, kv_lens, start_pos,
-                cu_seq_lens, cu_outputs, kv_comp_cutile, compressed_mask_cutile,
-                paged_kv_cutile, paged_score_cutile,
-                block_table, block_table,
-                compress_ratio, head_dim, overlap, page_size,
+                kv_score,
+                ape,
+                kv_lens,
+                start_pos,
+                cu_seq_lens,
+                cu_outputs,
+                kv_comp_cutile,
+                compressed_mask_cutile,
+                paged_kv_cutile,
+                paged_score_cutile,
+                block_table,
+                block_table,
+                compress_ratio,
+                head_dim,
+                overlap,
+                page_size,
             )
 
         def pytorch_fn():
             run_pytorch_prefill_reference(
-                kv.clone(), score.clone(), ape,
-                kv_state_py.clone(), score_state_py.clone(),
-                compress_ratio, head_dim, overlap,
+                kv.clone(),
+                score.clone(),
+                ape,
+                kv_state_py.clone(),
+                score_state_py.clone(),
+                compress_ratio,
+                head_dim,
+                overlap,
             )
 
         cutile_ms = triton.testing.do_bench(cutile_fn, warmup=25, rep=100)
@@ -1622,12 +1667,14 @@ def benchmark_compress_prefill_kernel():
         cutile_us = cutile_ms * 1000
         pytorch_us = pytorch_ms * 1000
 
-        results.append({
-            "name": name,
-            "cutile_us": cutile_us,
-            "pytorch_us": pytorch_us,
-            "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
-        })
+        results.append(
+            {
+                "name": name,
+                "cutile_us": cutile_us,
+                "pytorch_us": pytorch_us,
+                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
+            }
+        )
 
     # Print results
     print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")

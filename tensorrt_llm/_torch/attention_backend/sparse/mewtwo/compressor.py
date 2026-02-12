@@ -11,11 +11,7 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compiled_cat
 from tensorrt_llm.quantization.utils import fp8_utils
 
-from .kernel import (
-    compressed_kv_scatter_cutile,
-    kv_compress_cutile,
-    kv_compress_prefill_cutile,
-)
+from .kernel import compressed_kv_scatter_cutile, kv_compress_cutile, kv_compress_prefill_cutile
 
 if TYPE_CHECKING:
     from .mewtwo import MewtwoTrtllmAttentionMetadata

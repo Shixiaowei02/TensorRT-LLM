@@ -80,8 +80,10 @@ enum class RoutingMethodType : int64_t
     RenormalizeNaive = 4,
     // MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
     MiniMax2 = 5,
+    // Mewtwo
+    Mewtwo = 6,
     // Unspecified
-    Unspecified = 6,
+    Unspecified = 7,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)

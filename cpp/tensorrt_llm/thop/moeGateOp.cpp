@@ -31,44 +31,33 @@ static constexpr int kN_EXPERTS = 256;
 static constexpr int kTOPK = 6;
 
 // PyTorch wrapper function that calls the kernel implementation
-void gate_forward(
-    th::Tensor scores_in,     // [batch_size, nExperts] - pre-computed from linear(x, weight)
-    th::Tensor bias,          // empty tensor if hash mode
-    th::Tensor input_ids,     // empty tensor if non-hash mode
-    th::Tensor tid2eid,       // empty tensor if non-hash mode
-    th::Tensor out_weights,   // [batch_size, topK] - pre-allocated
-    th::Tensor out_indices,   // [batch_size, topK] - pre-allocated
-    int64_t topk,
-    double route_scale,
-    bool is_hash
-) {
+void gate_forward(th::Tensor scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
+    th::Tensor bias,                    // empty tensor if hash mode
+    th::Tensor input_ids,               // empty tensor if non-hash mode
+    th::Tensor tid2eid,                 // empty tensor if non-hash mode
+    th::Tensor out_weights,             // [batch_size, topK] - pre-allocated
+    th::Tensor out_indices,             // [batch_size, topK] - pre-allocated
+    int64_t topk, double route_scale, bool is_hash)
+{
     TORCH_CHECK(topk == kTOPK, "topk must be ", kTOPK);
     TORCH_CHECK(scores_in.size(1) == kN_EXPERTS, "n_experts must be ", kN_EXPERTS);
     TORCH_CHECK(scores_in.scalar_type() == torch::kFloat32, "scores_in must be float32");
     TORCH_CHECK(out_weights.scalar_type() == torch::kFloat32, "out_weights must be float32");
     TORCH_CHECK(out_indices.scalar_type() == torch::kInt32, "out_indices must be int32");
-    TORCH_CHECK(scores_in.is_cuda() && out_weights.is_cuda() && out_indices.is_cuda(),
-        "All tensors must be CUDA tensors");
-    TORCH_CHECK(scores_in.get_device() == out_weights.get_device() 
-        && scores_in.get_device() == out_indices.get_device(),
+    TORCH_CHECK(
+        scores_in.is_cuda() && out_weights.is_cuda() && out_indices.is_cuda(), "All tensors must be CUDA tensors");
+    TORCH_CHECK(
+        scores_in.get_device() == out_weights.get_device() && scores_in.get_device() == out_indices.get_device(),
         "All tensors must be on the same device");
-    
+
     auto const batch_size = scores_in.size(0);
     auto stream = at::cuda::getCurrentCUDAStream(scores_in.get_device());
 
     // Call the kernel implementation from kernels namespace
-    kernels::gate_forward(
-        scores_in.data_ptr<float>(),
-        is_hash ? nullptr : bias.data_ptr<float>(),
-        is_hash ? input_ids.data_ptr<int>() : nullptr,
-        is_hash ? tid2eid.data_ptr<int>() : nullptr,
-        out_weights.data_ptr<float>(),
-        out_indices.data_ptr<int>(),
-        batch_size,
-        static_cast<float>(route_scale),
-        is_hash,
-        stream
-    );
+    kernels::gate_forward(scores_in.data_ptr<float>(), is_hash ? nullptr : bias.data_ptr<float>(),
+        is_hash ? input_ids.data_ptr<int>() : nullptr, is_hash ? tid2eid.data_ptr<int>() : nullptr,
+        out_weights.data_ptr<float>(), out_indices.data_ptr<int>(), batch_size, static_cast<float>(route_scale),
+        is_hash, stream);
 }
 
 } // namespace torch_ext

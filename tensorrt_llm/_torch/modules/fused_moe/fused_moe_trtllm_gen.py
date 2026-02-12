@@ -773,6 +773,7 @@ class TRTLLMGenFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -803,7 +804,7 @@ class TRTLLMGenFusedMoE(MoE):
             self._load_balancer_start_wait_gpu_stage(is_first_call)
 
             token_selected_experts, token_final_scales = self.routing_method.apply(
-                router_logits)
+                router_logits, input_ids)
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
