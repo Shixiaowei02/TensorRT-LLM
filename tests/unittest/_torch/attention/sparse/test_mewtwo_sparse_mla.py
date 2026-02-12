@@ -201,7 +201,7 @@ def _prefill_compress_buffer(
     """
     compress_ratio = cache_manager._compress_ratios[layer_idx]
     buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.COMPRESS)
-    tokens_per_block_compressed = cache_manager.tokens_per_block // compress_ratio
+    tokens_per_block_compressed = cache_manager.compressed_block_sizes[layer_idx]
 
     ref_data = []
     for req_idx, ctx_len in enumerate(context_lengths):
@@ -1013,4 +1013,4 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
 
 
 if __name__ == "__main__":
-    test_mewtwo_sparse_mla(context_lengths=[14, 508, 3947], num_generation_steps=200)
+    test_mewtwo_sparse_mla(context_lengths=[4399], num_generation_steps=2)

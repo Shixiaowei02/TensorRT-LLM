@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -9,7 +10,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.math_utils import ceil_div
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -20,10 +22,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
-from .mewtwo import MewtwoAttentionType
-
-MEWTWO_SPARSE_RATIO = 4
-MEWTWO_OVERLAP_COMPRESSOR_RATIO = 4
+from .mewtwo import (
+    MEWTWO_SPARSE_RATIO,
+    MewtwoAttentionType,
+    compress_ratio_has_attention,
+    get_attn_dim,
+    get_token_bytes,
+    is_compress_layer,
+    is_overlap_compressor,
+    is_sparse_layer,
+)
 
 
 class MewtwoCacheManager(KVCacheManagerV2):
@@ -50,6 +58,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         max_batch_size: int,
         max_beam_width: int = 1,
         tokens_per_block: int,
+        max_seq_len: int,
         vocab_size: int,
         dtype: DataType = DataType.BF16,
         compressor_dtype: DataType = DataType.FLOAT,
@@ -100,6 +109,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
             vocab_size=vocab_size,
             dtype=dtype,
             **kwargs,
@@ -113,12 +123,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
             tokens_per_block=tokens_per_block,
             kv_cache_config=kv_cache_config,
             vocab_size=vocab_size,
-        )
-
-        # Cache the first sparse layer index for use in get_batch_indexer_k_cache_indices
-        self._first_sparse_layer_idx = next(
-            (layer for layer in self.pp_layers if self._is_sparse_layer(layer)),
-            None,
         )
 
         # Used by the KVCacheManagerV2
@@ -140,6 +144,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
             pin_memory=True,
             device="cpu",
         )
+        # TODO(jiaganc): get_num_available_tokens will hang in some cases, skip this to workaround
+        # max_num_tokens = self.get_num_available_tokens()
+        # if max_seq_len > max_num_tokens:
+        #     logger.warning(
+        #         f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} that can be allocated"
+        #         f" in kv cache manager, setting max_seq_len to {max_num_tokens}"
+        #     )
+        # self.max_seq_len = min(max_seq_len, max_num_tokens)
+        self.max_seq_len = max_seq_len
 
         # Mewtwo expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
@@ -194,7 +207,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
             block_size = self.compressed_block_sizes[layer_idx]
 
-        attn_dim = self._get_attn_dim(layer_idx, attn_type)
+        attn_dim = get_attn_dim(
+            self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
+        )
         scale_size = 0
         if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
             scale_size = self._indexer_scale_size
@@ -242,43 +257,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
         scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
         return [idx * scale if idx != -1 else -1 for idx in base_indices]
 
-    def get_token_bytes(self, layer_idx: int, attn_type: MewtwoAttentionType) -> int:
-        """
-        Get the token bytes for a specific layer and attention type.
-
-        Args:
-            layer_idx: The layer index
-            attn_type: The attention type
-
-        Returns:
-            The token bytes, shape (1,)
-        """
-
-        if not self._layer_has_attention(layer_idx, attn_type):
-            raise ValueError(f"Layer {layer_idx} does not have attention type {attn_type}")
-
-        attn_dim = self._get_attn_dim(layer_idx, attn_type)
-
-        dtype = self.dtype
-        # (indexer) compressor state and score use compressor_dtype
-        if attn_type in [
-            MewtwoAttentionType.COMPRESSOR_STATE,
-            MewtwoAttentionType.COMPRESSOR_SCORE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
-        ]:
-            dtype = self._compressor_dtype
-        # indexer compress use indexer_dtype
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            dtype = self._indexer_dtype
-
-        scale_size = 0
-        # indexer compress has scaling factor
-        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            scale_size = self._indexer_scale_size
-
-        return get_size_in_bytes(attn_dim, dtype) + scale_size
-
     def _create_cache_manager(
         self,
         tokens_per_block: int,
@@ -291,10 +269,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # Calculate the quota for KV cache
         quota = float("inf")
         if kv_cache_config.max_tokens is not None:
-            max_tokens = int(
-                ceil_div(kv_cache_config.max_tokens, kv_cache_config.max_util_for_resume) * 1.2
+            quota = int(
+                math.ceil(
+                    kv_cache_config.max_tokens
+                    * self._get_cache_bytes_per_token()
+                    / kv_cache_config.max_util_for_resume
+                )
             )
-            quota = int(max_tokens * self._get_cache_bytes_per_token())
+            # Add extra quota to ensure sufficient space for small max_tokens cases.
+            quota += len(MewtwoAttentionType) * (2 << 20)
             if kv_cache_config.free_gpu_memory_fraction is not None:
                 logger.warning(
                     f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens}"
@@ -315,6 +298,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         assert quota != float("inf"), (
             "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
         )
+
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers = [GpuCacheTierConfig(quota=quota)]
@@ -350,16 +334,16 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # create the layer config for Mewtwo
         for layer in self.pp_layers:
             compress_ratio = self._compress_ratios[layer]
-            is_compress_layer = self._is_compress_layer(layer)
-            is_sparse_layer = self._is_sparse_layer(layer)
-            is_overlap = self._is_overlap_compressor(layer)
+            is_compress = is_compress_layer(compress_ratio)
+            is_sparse = is_sparse_layer(compress_ratio)
+            is_overlap = is_overlap_compressor(compress_ratio)
 
             state_factor = 2 if is_overlap else 1
 
             # sliding window attention pool
             _add_layer(layer, MewtwoAttentionType.SWA, self._window_size)
 
-            if is_compress_layer:
+            if is_compress:
                 # compressed attention pool
                 _add_layer(layer, MewtwoAttentionType.COMPRESS, None)
                 # compressor state, managed as a sliding window attention cache,
@@ -369,7 +353,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 _add_layer(layer, MewtwoAttentionType.COMPRESSOR_SCORE, compressor_window)
 
             # sparse attention layer has indexer
-            if is_sparse_layer:
+            if is_sparse:
                 # indexer kv cache pool, dim is indexer_head_dim
                 _add_layer(layer, MewtwoAttentionType.INDEXER_COMPRESS, None)
                 # indexer has its own compressor, so a separate compressor state
@@ -405,7 +389,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             (attn_type, layer_idx)
             for attn_type in MewtwoAttentionType
             for layer_idx in self.pp_layers
-            if self._layer_has_attention(layer_idx, attn_type)
+            if compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type)
         ]
         for attn_type, layer_idx in comb:
             compress_ratio = self._compress_ratios[layer_idx]
@@ -446,61 +430,22 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self._attn_ratio_to_pool_id = attn_ratio_to_pool_id
         self._attn_ratio_to_scale = attn_ratio_to_scale
 
-    def _is_overlap_compressor(self, layer_idx: int) -> bool:
-        """
-        Check if the compressor of the given layer is working in the overlap mode.
-        """
-        return self._compress_ratios[layer_idx] == MEWTWO_OVERLAP_COMPRESSOR_RATIO
-
-    def _is_sparse_layer(self, layer_idx: int) -> bool:
-        """
-        Check if the given layer is a sparse layer.
-        """
-        return self._compress_ratios[layer_idx] == MEWTWO_SPARSE_RATIO
-
-    def _is_compress_layer(self, layer_idx: int) -> bool:
-        """
-        Check if the given layer is a compress layer.
-        """
-        return self._compress_ratios[layer_idx] > 1
-
-    def _get_attn_dim(self, layer_idx: int, attn_type: MewtwoAttentionType) -> int:
-        """
-        Get the dimension of the attention type for a specific layer.
-        """
-        is_overlap = self._is_overlap_compressor(layer_idx)
-        state_factor = 2 if is_overlap else 1
-        if attn_type == MewtwoAttentionType.SWA:
-            return self.head_dim
-        elif attn_type == MewtwoAttentionType.COMPRESS:
-            return self.head_dim
-        elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
-            return state_factor * self.head_dim
-        elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
-            return state_factor * self.head_dim
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            return self.index_head_dim
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
-            return state_factor * self.index_head_dim
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
-            return state_factor * self.index_head_dim
-
     def _get_attn_bytes_per_block(
         self,
         attn_type: MewtwoAttentionType,
         layer_idx: int,
     ) -> int:
         """
-        Get the cache bytes per token for a specific pool type and layer.
-
-        Args:
-            pool: DataRole of the pool
-            layer_idx: Global index of the layer
-
-        Returns:
-            Size in bytes for this pool
+        Get the cache bytes per token for a specific attention type and layer.
         """
-        token_bytes = self.get_token_bytes(layer_idx, attn_type)
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        token_bytes = get_token_bytes(
+            self.head_dim,
+            self.index_head_dim,
+            self._compress_ratios[layer_idx],
+            attn_type,
+            has_fp8_kv_cache,
+        )
 
         block_size = self.tokens_per_block
         if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
@@ -511,41 +456,39 @@ class MewtwoCacheManager(KVCacheManagerV2):
     def _get_cache_bytes_per_token(self) -> int:
         """
         Get the average cache bytes per token for Mewtwo. This helper function is used to estimate the cache quota.
-
-        Returns:
-            Cache bytes per token across all local layers
         """
-        return (
-            sum(
-                self._get_attn_bytes_per_block(attn, layer)
-                for layer in self.pp_layers
-                for attn in MewtwoAttentionType
-                if self._layer_has_attention(layer, attn)
-            )
-            // self.tokens_per_block
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        return self._estimate_bytes_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
         )
 
-    def _layer_has_attention(self, layer_idx: int, attn_type: MewtwoAttentionType) -> bool:
-        """
-        Check if the given layer has the given attention type.
-        """
-        is_sparse = self._is_sparse_layer(layer_idx)
-        is_compress = self._is_compress_layer(layer_idx)
-
-        if attn_type == MewtwoAttentionType.SWA:
-            return True
-        elif attn_type == MewtwoAttentionType.COMPRESS:
-            return is_compress
-        elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
-            return is_compress
-        elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
-            return is_compress
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
-            return is_sparse
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
-            return is_sparse
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
-            return is_sparse
+    @staticmethod
+    def _estimate_bytes_per_token(
+        head_dim: int,
+        index_head_dim: int,
+        compress_ratios: List[int],
+        has_fp8_kv_cache,
+    ) -> int:
+        total_bytes = 0
+        for ratio in compress_ratios:
+            for attn in MewtwoAttentionType:
+                if compress_ratio_has_attention(ratio, attn):
+                    attn_bytes = get_token_bytes(
+                        head_dim,
+                        index_head_dim,
+                        ratio,
+                        attn,
+                        has_fp8_kv_cache,
+                    )
+                    # compressed attention will be compressed by the compress ratio
+                    if attn in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+                        attn_bytes //= ratio
+                    total_bytes += attn_bytes
+        return total_bytes
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
@@ -624,3 +567,52 @@ class MewtwoCacheManager(KVCacheManagerV2):
         offsets = self.host_kv_cache_block_offsets[pool_id, copy_idx, 0] * scale
         offsets[offsets == -scale] = -1
         return offsets
+
+    @staticmethod
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):
+        head_dim = model_config.head_dim
+        index_head_dim = model_config.sparse_attention_config.index_head_dim
+        pp_layers = mapping.pp_layers(model_config.get_num_attention_layers())
+        compress_ratios = [
+            model_config.sparse_attention_config.compress_ratios[layer] for layer in pp_layers
+        ]
+        has_fp8_kv_cache = model_config.quant_mode.has_fp8_kv_cache()
+        return MewtwoCacheManager._estimate_bytes_per_token(
+            head_dim,
+            index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+        )
+
+    def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
+        some_checks_unavailable = False
+        has_invalid_values = torch.tensor(
+            [False], dtype=torch.bool, device=torch.cuda.current_device()
+        )
+        pool_handled = set()
+
+        # Handle each layer from start to end to traverse the whole KV cache.
+        for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            pool_id = self.layer_to_pool_mapping_dict[layer_id]
+            if pool_id in pool_handled:
+                continue
+            buffer = self.get_buffers(layer, attn)
+            # process in chunks of 256 pages to avoid OoM
+            for i in range(0, buffer.shape[0], 256):
+                buffer_slice = buffer[i : i + 256]
+                try:
+                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
+                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
+                except NotImplementedError:
+                    some_checks_unavailable = True
+            if fill_with_zero:
+                buffer.zero_()
+            pool_handled.add(pool_id)
+        torch.cuda.synchronize()
+
+        if some_checks_unavailable:
+            logger.warning(
+                "`torch.isnan` or `torch.isinf` is not implemented for current kv cache dtype, "
+                "related checks are skipped"
+            )
+        return bool(has_invalid_values)

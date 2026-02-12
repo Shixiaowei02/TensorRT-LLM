@@ -20,6 +20,13 @@ _RequestCache = Dict[
 ]
 
 
+def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
+    """View an FP8 buffer as uint8. Non-FP8 buffers are returned as-is."""
+    if buffer.dtype == torch.float8_e4m3fn:
+        return buffer.view(torch.uint8)
+    return buffer
+
+
 class TestMewtwoCacheManager:
     # mewtwo specific param
     head_dim = 512
@@ -36,8 +43,6 @@ class TestMewtwoCacheManager:
 
     # cache manager specific param
     tokens_per_block = 128
-    max_batch_size = 256
-    max_seq_len = 1024
 
     def _is_compress_layer(self, compress_ratio: int) -> bool:
         """Check if a layer uses compression based on its compress ratio.
@@ -98,6 +103,8 @@ class TestMewtwoCacheManager:
     def _create_mewtwo_cache_manager(
         self,
         tokens_per_block: int,
+        max_batch_size: int,
+        max_seq_len: int,
         compress_ratios: List[int],
         dtype: DataType,
         compressor_dtype: DataType,
@@ -112,7 +119,7 @@ class TestMewtwoCacheManager:
         )
 
         # Create KV cache config
-        max_num_tokens = self.max_seq_len * self.max_batch_size
+        max_num_tokens = max_seq_len * max_batch_size
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=max_num_tokens,
@@ -130,8 +137,8 @@ class TestMewtwoCacheManager:
             num_kv_heads=1,
             head_dim=self.head_dim,
             tokens_per_block=tokens_per_block,
-            max_seq_len=self.max_seq_len,
-            max_batch_size=self.max_batch_size,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
             compressor_dtype=compressor_dtype,
@@ -169,8 +176,9 @@ class TestMewtwoCacheManager:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        if dtype == torch.uint8:
-            return torch.randint(0, 255, shape, dtype=dtype, device=device)
+        if dtype in (torch.uint8, torch.float8_e4m3fn):
+            # Use uint8 for both uint8 and FP8 (same 1-byte layout)
+            return torch.randint(0, 255, shape, dtype=torch.uint8, device=device)
         else:
             return torch.randn(shape, dtype=dtype, device=device) * 1000.0
 
@@ -404,7 +412,7 @@ class TestMewtwoCacheManager:
             else:
                 seq_len = prompt_len
 
-            buffer = cache_manager.get_buffers(layer_idx, attn_type)
+            buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
                 # indexer compress is blockwise FP8 quantized
                 values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
@@ -458,7 +466,7 @@ class TestMewtwoCacheManager:
                     continue
                 compressed_token_idx = token_idx // compress_ratios[layer_idx]
 
-            buffer = cache_manager.get_buffers(layer_idx, attn_type)
+            buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
             if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
                 values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
                 self._decode_write_paged_cache(
@@ -538,7 +546,7 @@ class TestMewtwoCacheManager:
                     attn_len = seq_len
                 window_size = self._get_window_size(ratio, attn_type)
 
-                buffer = cache_manager.get_buffers(layer, attn_type)
+                buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer, attn_type))
                 if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
                     values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
                     values = self._read_paged_cache(
@@ -633,18 +641,26 @@ class TestMewtwoCacheManager:
                 )
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
-    @pytest.mark.parametrize("request_lens", [[(512, 520), (128, 130), (160, 170)]])
+    @pytest.mark.parametrize(
+        "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
+    )
+    @pytest.mark.parametrize("prompt_lens", [[512, 128, 160], [1024, 2048, 4096]])
+    @pytest.mark.parametrize("num_generation_steps", [2, 100])
     def test_write_read_cache(
         self,
         compress_ratios: List[int],
-        request_lens: List[Tuple[int, int]],
+        prompt_lens: List[int],
+        num_generation_steps: int,
         dtype: DataType,
         compressor_dtype: DataType,
     ):
+        max_batch_size = len(prompt_lens)
+        max_seq_len = max(prompt_lens) + num_generation_steps + 1
         # Create cache manager and sparse attention config
         cache_manager, sparse_attn_config = self._create_mewtwo_cache_manager(
             tokens_per_block=self.tokens_per_block,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
             compress_ratios=compress_ratios,
             dtype=dtype,
             compressor_dtype=compressor_dtype,
@@ -653,13 +669,13 @@ class TestMewtwoCacheManager:
         # Create requests and their cache values
         requests = list[LlmRequest]()
         cache_values = dict[int, _RequestCache]()
-        for req_id, (prompt_len, max_seq_len) in enumerate(request_lens):
+        for req_id, prompt_len in enumerate(prompt_lens):
             req = self._create_request(req_id, prompt_len)
             requests.append(req)
 
             # Generate random cache values for this request
             cache_values[req_id] = self._create_random_cache(
-                seq_len=max_seq_len,
+                seq_len=prompt_len + num_generation_steps + 1,
                 head_dim=self.head_dim,
                 sparse_attn_config=sparse_attn_config,
                 dtype=binding_to_torch_dtype(dtype),
@@ -667,7 +683,6 @@ class TestMewtwoCacheManager:
             )
 
         # Simulate the prefill phrase
-        seq_lens = [request_lens[r.py_request_id][0] for r in requests]
         scheduled_batch = ScheduledRequests()
         scheduled_batch.context_requests = requests
         cache_manager.prepare_resources(scheduled_batch)
@@ -676,15 +691,15 @@ class TestMewtwoCacheManager:
         for req in requests:
             self._write_request_prefill(
                 req=req,
-                prompt_len=seq_lens[req.py_request_id],
+                prompt_len=prompt_lens[req.py_request_id],
                 cache_manager=cache_manager,
                 cache_values=cache_values[req.py_request_id],
             )
 
         # Update requests state and call update_resources
         for req in requests:
-            req.context_current_position = seq_lens[req.py_request_id]
-            req.add_new_token(seq_lens[req.py_request_id], 0)
+            req.context_current_position = prompt_lens[req.py_request_id]
+            req.add_new_token(prompt_lens[req.py_request_id], 0)
         cache_manager.update_resources(scheduled_batch)
 
         # For disagg example: cache transmission happens here
@@ -693,56 +708,61 @@ class TestMewtwoCacheManager:
         for req in requests:
             actual_cache_values = self._read_request(
                 req=req,
-                seq_len=seq_lens[req.py_request_id],
+                seq_len=prompt_lens[req.py_request_id],
                 cache_manager=cache_manager,
                 compress_ratios=compress_ratios,
             )
             self._assert_cache_equal(
-                seq_len=seq_lens[req.py_request_id],
+                seq_len=prompt_lens[req.py_request_id],
                 compress_ratios=compress_ratios,
                 expect=cache_values[req.py_request_id],
                 actual=actual_cache_values,
             )
 
         # Simulate the decode phrase
-        seq_lens = [seq_len + 1 for seq_len in seq_lens]
-        scheduled_batch = ScheduledRequests()
-        scheduled_batch.generation_requests = requests
-        cache_manager.prepare_resources(scheduled_batch)
+        for i in range(num_generation_steps):
+            seq_lens = [prompt_len + i + 1 for prompt_len in prompt_lens]
+            scheduled_batch = ScheduledRequests()
+            scheduled_batch.generation_requests = requests
+            cache_manager.prepare_resources(scheduled_batch)
 
-        # Write new token to cache
-        for req in requests:
-            self._write_request_decode(
-                req=req,
-                token_idx=seq_lens[req.py_request_id] - 1,
-                cache_manager=cache_manager,
-                cache_values=cache_values[req.py_request_id],
-            )
+            # Write new token to cache
+            for req in requests:
+                self._write_request_decode(
+                    req=req,
+                    token_idx=seq_lens[req.py_request_id] - 1,
+                    cache_manager=cache_manager,
+                    cache_values=cache_values[req.py_request_id],
+                )
 
-        # Read context from cache and verify
-        for req in requests:
-            actual_cache_values = self._read_request(
-                req=req,
-                seq_len=seq_lens[req.py_request_id],
-                cache_manager=cache_manager,
-                compress_ratios=compress_ratios,
-            )
-            self._assert_cache_equal(
-                seq_len=seq_lens[req.py_request_id],
-                compress_ratios=compress_ratios,
-                expect=cache_values[req.py_request_id],
-                actual=actual_cache_values,
-            )
+            # Read context from cache and verify
+            for req in requests:
+                actual_cache_values = self._read_request(
+                    req=req,
+                    seq_len=seq_lens[req.py_request_id],
+                    cache_manager=cache_manager,
+                    compress_ratios=compress_ratios,
+                )
+                self._assert_cache_equal(
+                    seq_len=seq_lens[req.py_request_id],
+                    compress_ratios=compress_ratios,
+                    expect=cache_values[req.py_request_id],
+                    actual=actual_cache_values,
+                )
 
-        for req in requests:
-            req.add_new_token(seq_lens[req.py_request_id], 0)
-        cache_manager.update_resources(scheduled_batch)
+            for req in requests:
+                req.add_new_token(seq_lens[req.py_request_id], 0)
+            cache_manager.update_resources(scheduled_batch)
 
         # Clean up
+        for req in requests:
+            cache_manager.free_resources(req)
         cache_manager.shutdown()
 
     @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
-    @pytest.mark.parametrize("dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT)])
+    @pytest.mark.parametrize(
+        "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
+    )
     def test_kv_cache_pool_mapping(
         self, compress_ratios: List[int], dtype: DataType, compressor_dtype: DataType
     ):
@@ -750,6 +770,8 @@ class TestMewtwoCacheManager:
         num_layers = len(compress_ratios)
         cache_manager, _ = self._create_mewtwo_cache_manager(
             tokens_per_block=self.tokens_per_block,
+            max_batch_size=4,
+            max_seq_len=1024,
             compress_ratios=compress_ratios,
             dtype=dtype,
             compressor_dtype=compressor_dtype,
@@ -767,3 +789,61 @@ class TestMewtwoCacheManager:
         assert torch.all(kv_cache_pool_mapping[:, 0] == kv_cache_pool_mapping[0, 0]), (
             "all layers should have the same pool_id"
         )
+
+    @pytest.mark.parametrize("compress_ratios", [[1, 4, 128]])
+    @pytest.mark.parametrize(
+        "dtype,compressor_dtype", [(DataType.BF16, DataType.FLOAT), (DataType.FP8, DataType.FLOAT)]
+    )
+    @pytest.mark.parametrize("invalid", [False, True])
+    @pytest.mark.parametrize("fill_with_zero", [False, True])
+    def test_check_invalid_values_in_kv_cache(
+        self,
+        compress_ratios: List[int],
+        dtype: DataType,
+        compressor_dtype: DataType,
+        invalid: bool,
+        fill_with_zero: bool,
+    ):
+        """Test invalid value detection and optional zero-fill behavior in KV cache."""
+        cache_manager, _ = self._create_mewtwo_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=4,
+            max_seq_len=1024,
+            compress_ratios=compress_ratios,
+            dtype=dtype,
+            compressor_dtype=compressor_dtype,
+        )
+
+        # Fresh cache (zero-initialized) should have no invalid values
+        result = cache_manager.check_invalid_values_in_kv_cache()
+        assert not result, "Fresh cache should have no invalid values"
+
+        if invalid:
+            # Inject invalid into a float buffer so NaN/Inf checks are supported.
+            layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
+            buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.COMPRESSOR_STATE)
+            buffer[0, 0, 0] = torch.nan
+
+        result = cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=fill_with_zero)
+        assert result == invalid, (
+            f"Expected invalid={invalid} from check_invalid_values_in_kv_cache, got {result}"
+        )
+
+        # Verify whether invalid values remain after the check.
+        post_check = cache_manager.check_invalid_values_in_kv_cache()
+        expected_post_check = invalid and not fill_with_zero
+        assert post_check == expected_post_check, (
+            f"Expected post-check invalid={expected_post_check}, got {post_check}"
+        )
+
+        if expected_post_check:
+            # Cleanup for shutdown path when zero-fill wasn't requested above.
+            cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+
+        cache_manager.shutdown()
+
+
+if __name__ == "__main__":
+    tester = TestMewtwoCacheManager()
+    tester.test_write_read_cache([1, 4, 128], [512, 128, 160], 100, DataType.BF16, DataType.FLOAT)
+    print("Test passed")

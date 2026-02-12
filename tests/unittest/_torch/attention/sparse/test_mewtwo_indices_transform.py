@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention_backend.sparse.mewtwo import (
     MewtwoAttentionType,
     MewtwoCacheManager,
 )
+from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import get_token_bytes
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -65,10 +66,11 @@ def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
         compress_ratios=[scenario.compress_ratio] * num_layers,
     )
 
+    max_tokens = scenario.max_seq_len * scenario.max_batch_size
     cache_manager = MewtwoCacheManager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
-            max_tokens=scenario.max_seq_len * scenario.max_batch_size,
+            max_tokens=max_tokens,
             event_buffer_max_size=0,
         ),
         kv_cache_type=CacheTypeCpp.SELFKONLY,
@@ -82,7 +84,7 @@ def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
         dtype=scenario.dtype,
         compressor_dtype=scenario.compressor_dtype,
         vocab_size=scenario.vocab_size,
-        max_num_tokens=scenario.max_seq_len * scenario.max_batch_size,
+        max_num_tokens=max_tokens,
         sparse_attn_config=sparse_attn_config,
     )
     return cache_manager
@@ -158,7 +160,14 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     swa_buffer_ptr = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
 
     # Single token stride for all buffers
-    token_stride = cache_manager.get_token_bytes(0, MewtwoAttentionType.SWA)
+    has_fp8_kv_cache = scenario.dtype == DataType.FP8
+    token_stride = get_token_bytes(
+        scenario.head_dim,
+        scenario.index_head_dim,
+        scenario.compress_ratio,
+        MewtwoAttentionType.SWA,
+        has_fp8_kv_cache,
+    )
     swa_offset = (swa_buffer_ptr - swa_pool_ptr) // token_stride
 
     # Get compressed buffer type from scenario property

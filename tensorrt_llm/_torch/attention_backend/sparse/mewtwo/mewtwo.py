@@ -16,6 +16,136 @@ from .compressor import Compressor
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
+MEWTWO_SPARSE_RATIO = 4
+MEWTWO_OVERLAP_COMPRESSOR_RATIO = 4
+
+
+class MewtwoAttentionType(Enum):
+    SWA = 0
+    COMPRESS = 1
+    COMPRESSOR_STATE = 2
+    COMPRESSOR_SCORE = 3
+    INDEXER_COMPRESS = 4
+    INDEXER_COMPRESSOR_STATE = 5
+    INDEXER_COMPRESSOR_SCORE = 6
+
+
+def is_overlap_compressor(compress_ratio: int) -> bool:
+    """
+    Check if the compressor of the given layer is working in the overlap mode.
+    """
+    return compress_ratio == MEWTWO_OVERLAP_COMPRESSOR_RATIO
+
+
+def is_sparse_layer(compress_ratio: int) -> bool:
+    """
+    Check if the given layer is a sparse layer.
+    """
+    return compress_ratio == MEWTWO_SPARSE_RATIO
+
+
+def is_compress_layer(compress_ratio: int) -> bool:
+    """
+    Check if the given layer is a compress layer.
+    """
+    return compress_ratio > 1
+
+
+def compress_ratio_has_attention(compress_ratio: int, attn_type: MewtwoAttentionType) -> bool:
+    """
+    Check if the given compress ratio has the given attention type.
+    """
+    is_sparse = is_sparse_layer(compress_ratio)
+    is_compress = is_compress_layer(compress_ratio)
+
+    if attn_type == MewtwoAttentionType.SWA:
+        return True
+    elif attn_type == MewtwoAttentionType.COMPRESS:
+        return is_compress
+    elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
+        return is_compress
+    elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
+        return is_compress
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        return is_sparse
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
+        return is_sparse
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
+        return is_sparse
+
+
+def get_attn_dim(
+    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: MewtwoAttentionType
+) -> int:
+    """
+    Get the dimension of the attention type for a specific layer.
+    """
+    state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+    if attn_type == MewtwoAttentionType.SWA:
+        return head_dim
+    elif attn_type == MewtwoAttentionType.COMPRESS:
+        return head_dim
+    elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
+        return state_factor * head_dim
+    elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
+        return state_factor * head_dim
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        return index_head_dim
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
+        return state_factor * index_head_dim
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
+        return state_factor * index_head_dim
+
+
+def get_token_bytes(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratio: int,
+    attn_type: MewtwoAttentionType,
+    has_fp8_kv_cache: bool,
+) -> int:
+    """
+    Get the token bytes for a specific layer and attention type.
+
+    Args:
+        head_dim: The head dimension
+        index_head_dim: The index head dimension
+        compress_ratio: The compress ratio
+        attn_type: The attention type
+        has_fp8_kv_cache: Whether the KV cache uses FP8 quantization
+
+    Returns:
+        The number of bytes per token, including scaling factor
+    """
+    if not compress_ratio_has_attention(compress_ratio, attn_type):
+        raise ValueError(
+            f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
+        )
+
+    attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
+
+    # Default dtype is bfloat16 (2 bytes), or fp8 (1 byte) when FP8 kv cache is enabled
+    dtype_bytes = 1 if has_fp8_kv_cache else 2
+    # (indexer) compressor state and score always use float32
+    if attn_type in [
+        MewtwoAttentionType.COMPRESSOR_STATE,
+        MewtwoAttentionType.COMPRESSOR_SCORE,
+        MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
+        MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+    ]:
+        dtype_bytes = 4  # (indexer) compressor state and score use float32
+    # indexer compress always uses fp8
+    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        dtype_bytes = 1  # indexer compress use fp8
+
+    scale_size = 0
+    # indexer compress has scaling factor
+    if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        quant_block_size = 128
+        scale_size = index_head_dim // quant_block_size * 4  # indexer scale is float32
+
+    return attn_dim * dtype_bytes + scale_size
+
 
 def build_window_local_indices(
     token_positions: torch.Tensor,
@@ -63,16 +193,6 @@ def build_compressed_local_indices(
     indices = torch.where(valid_mask, col_indices.unsqueeze(0).expand(num_tokens, -1), indices)
 
     return indices
-
-
-class MewtwoAttentionType(Enum):
-    SWA = 0
-    COMPRESS = 1
-    COMPRESSOR_STATE = 2
-    COMPRESSOR_SCORE = 3
-    INDEXER_COMPRESS = 4
-    INDEXER_COMPRESSOR_STATE = 5
-    INDEXER_COMPRESSOR_SCORE = 6
 
 
 class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
@@ -309,20 +429,21 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # Build cache buffer block offsets for all compress_ratios
         for compress_ratio in self.compress_ratio_set:
-            for i in range(self.num_seqs):
-                request_id = self.request_ids[i]
-                # Get the layer index for the compress ratio
-                layer_idx = self.compress_ratios.index(compress_ratio)
-                if compress_ratio == 1:
-                    attn_type = MewtwoAttentionType.SWA
-                else:
-                    attn_type = MewtwoAttentionType.COMPRESS
-                cache_buffer_blocks = self.kv_cache_manager.get_cache_indices(
-                    request_id, layer_idx=layer_idx, attn_type=attn_type
+            if compress_ratio == 1:
+                attn_type = MewtwoAttentionType.SWA
+            else:
+                attn_type = MewtwoAttentionType.COMPRESS
+
+            self.host_cache_buffer_block_offsets[compress_ratio][: self.num_seqs].copy_(
+                self.kv_cache_manager.get_batch_attn_offset(
+                    self.request_ids,
+                    beam_width=self.beam_width,
+                    num_contexts=self.num_contexts,
+                    num_seqs=self.num_seqs,
+                    attn_type=attn_type,
+                    compress_ratio=compress_ratio,
                 )
-                self.host_cache_buffer_block_offsets[compress_ratio][
-                    i, : len(cache_buffer_blocks)
-                ].copy_(torch.tensor(cache_buffer_blocks, dtype=torch.int32, device="cpu"))
+            )
             self.cache_buffer_block_offsets[compress_ratio][: self.num_seqs].copy_(
                 self.host_cache_buffer_block_offsets[compress_ratio][: self.num_seqs],
                 non_blocking=True,
@@ -432,7 +553,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 layer_idx, MewtwoAttentionType.COMPRESS
             ).data_ptr()
             for layer_idx in self.kv_cache_manager.pp_layers
-            if self.kv_cache_manager._is_compress_layer(layer_idx)
+            if is_compress_layer(self.compress_ratios[layer_idx])
         }
 
         # For indices conversion
@@ -700,7 +821,17 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
 
         # Token stride
-        token_stride = kv_cache_manager.get_token_bytes(layer_idx, MewtwoAttentionType.SWA)
+        index_head_dim = self.sparse_attention_config.index_head_dim
+        has_fp8_kv_cache = False
+        if self.quant_config is not None:
+            has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache()
+        token_stride = get_token_bytes(
+            self.head_dim,
+            index_head_dim,
+            self.compress_ratio,
+            MewtwoAttentionType.SWA,
+            has_fp8_kv_cache,
+        )
 
         # Select indices/tables based on phase
         if is_generation:
