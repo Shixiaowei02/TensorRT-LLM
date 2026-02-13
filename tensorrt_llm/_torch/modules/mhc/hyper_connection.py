@@ -6,24 +6,51 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm.deep_gemm import tf32_hc_prenorm_gemm
-from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
-    mhc_gemm_rms_scale as mhc_gemm_rms_scale_cutile,
-    mhc_apply_residual as mhc_apply_residual_cutile,
-    mhc_post_mapping as mhc_post_mapping_cutile,
-    mhc_pre_mapping_fused as mhc_pre_mapping_fused_cutile,
-)
+
+_cutile_import_error = None
+try:
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
+        mhc_apply_residual as mhc_apply_residual_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
+        mhc_gemm_rms_scale as mhc_gemm_rms_scale_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
+        mhc_post_mapping as mhc_post_mapping_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
+        mhc_pre_mapping_fused as mhc_pre_mapping_fused_cutile,
+    )
+except (ModuleNotFoundError, OSError) as e:
+    _cutile_import_error = e
+    mhc_gemm_rms_scale_cutile = None
+    mhc_apply_residual_cutile = None
+    mhc_post_mapping_cutile = None
+    mhc_pre_mapping_fused_cutile = None
+
 _tilelang_import_error = None
 try:
+    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import mhc_post as mhc_post_tilelang
+    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
+        mhc_pre_big_fuse as mhc_pre_big_fuse_tilelang,
+    )
     from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
         mhc_pre_gemm_sqrsum as mhc_pre_gemm_sqrsum_tilelang,
-        mhc_pre_big_fuse as mhc_pre_big_fuse_tilelang,
-        mhc_post as mhc_post_tilelang,
     )
 except (ModuleNotFoundError, OSError) as e:
     _tilelang_import_error = e
     mhc_pre_gemm_sqrsum_tilelang = None
     mhc_pre_big_fuse_tilelang = None
     mhc_post_tilelang = None
+
+
+def _require_cutile():
+    if _cutile_import_error is not None:
+        raise RuntimeError(
+            "CuTile backend is unavailable in current environment. "
+            "Please install cuda.tile and cuda.tile_experimental, "
+            "or switch backend to non-cutile."
+        ) from _cutile_import_error
 
 
 def _require_tilelang():
@@ -147,6 +174,7 @@ class mHC(nn.Module):
             layer_input = (x * pre_mix).sum(-2).bfloat16()
             return post_mix, res_mix, layer_input
         elif self.backend == "cutile":
+            _require_cutile()
             assert x.dtype == torch.bfloat16
             assert self.mult == x.shape[-2]
             assert self.hidden_size == x.shape[-1]
@@ -253,6 +281,7 @@ class mHC(nn.Module):
             term2 = torch.bmm(comb_res_mix.mT, residual.float())
             return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
         elif self.backend == "cutile":
+            _require_cutile()
             outer_shape = residual.shape[:-2]
             n = self.mult
             hidden = residual.shape[-1]
@@ -327,17 +356,18 @@ class HCHead(nn.Module):
         elif self.backend == "deepgemm":
             raise NotImplementedError("HC head GEMM n <= 32 is too small for DeepGEMM to support.")
         elif self.backend == "cutile":
+            _require_cutile()
             shape, dtype = x.size(), x.dtype
             x_flat = x.flatten(-2, -1)  # [batch, mult*hidden_size], bf16
             # mhc_gemm_rms_scale with n=mult: all columns are "pre" (sigmoid)
             y, _r = mhc_gemm_rms_scale_cutile(
                 x_flat,
-                self.fn.T,            # [mult*hidden_size, mult]
-                self.mult,            # n=mult: all columns are pre (sigmoid)
-                float(self.scale),    # alpha_pre
-                0.0,                  # alpha_post (no post columns)
-                0.0,                  # alpha_res (no res columns)
-                self.base,            # bias
+                self.fn.T,  # [mult*hidden_size, mult]
+                self.mult,  # n=mult: all columns are pre (sigmoid)
+                float(self.scale),  # alpha_pre
+                0.0,  # alpha_post (no post columns)
+                0.0,  # alpha_res (no res columns)
+                self.base,  # bias
                 norm_eps=self.norm_eps,
             )
             # y: [batch, mult] — all sigmoid columns
