@@ -742,6 +742,7 @@ def kv_compress_prefill_cutile(
     paged_kv: torch.Tensor,
     paged_score: torch.Tensor,
     block_table_kv: torch.Tensor,
+    max_outputs: int,
     block_table_score: torch.Tensor = None,
     compress_ratio: int = None,
     head_dim: int = None,
@@ -761,13 +762,9 @@ def kv_compress_prefill_cutile(
     state_dim = coff * head_dim
 
     # Compute grid dimensions
-    seq_lens = kv_lens - start_pos
-    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
-    max_outputs = num_outputs_per_batch.max().item()
-
     BLOCK_SIZE = _compress_block_size(compress_ratio, head_dim)
     num_head_chunks = (head_dim + BLOCK_SIZE - 1) // BLOCK_SIZE
-    grid = (batch_size, max_outputs, num_head_chunks)
+    grid = (batch_size, max(max_outputs, 1), num_head_chunks)
 
     ct.launch(
         torch.cuda.current_stream(),
@@ -817,6 +814,7 @@ def compressed_kv_scatter_cutile_kernel(
     # Runtime scalar
     tokens_per_block: int,
     # Compile-time constants
+    HAS_WORK: ConstInt,
     head_dim: ConstInt,
     num_scale_blocks: ConstInt,
     BLOCK_SIZE_H: ConstInt,
@@ -833,6 +831,10 @@ def compressed_kv_scatter_cutile_kernel(
     """
     batch_idx = ct.bid(0)
     local_output_idx = ct.bid(1)
+
+    # Early exit if no work
+    if HAS_WORK == 0:
+        return
 
     # Load per-batch metadata (scalar gathers)
     n_outputs = ct.gather(num_outputs, batch_idx, padding_value=0)
@@ -906,6 +908,7 @@ def compressed_kv_scatter_cutile(
     block_offsets: torch.Tensor,  # [num_seqs, max_blocks_per_seq]
     tokens_per_block: int,
     head_dim: int,
+    max_outputs: int,
     kv_cache_dtype: str = "default",
     kv_scale: torch.Tensor = None,  # [total_tokens, num_scale_blocks] fp32, for fp8_blockwise
 ):
@@ -918,18 +921,19 @@ def compressed_kv_scatter_cutile(
 
     Uses 2D gather/scatter in the kernel to avoid host-side flatten/reshape
     ops, making the wrapper compatible with torch.compile/graph mode.
+
+    CUDA graph compatibility: Always launches kernel (even when empty) to maintain
+    fixed computation graph. Checks moved into kernel for early exit.
     """
-    if compressed_kv.numel() == 0:
-        return
-
     batch_size = num_comp_tokens.shape[0]
-    max_outputs = num_comp_tokens.max().item()
 
-    if max_outputs == 0:
-        return
+    # Check if there's actual work to do (for kernel early exit)
+    has_work = 1 if (compressed_kv.numel() > 0 and max_outputs > 0) else 0
 
+    # Always launch with valid grid for CUDA graph compatibility
+    # Use max(max_outputs, 1) to ensure grid dimension is at least 1
     block_size_h = min(_next_power_of_2(head_dim), 512)
-    grid = (batch_size, max_outputs)
+    grid = (batch_size, max(max_outputs, 1))
 
     # Ensure cache is 2D [num_blocks, block_elems] (collapse kv_factor if 3D)
     cache_2d = kv_cache if kv_cache.dim() == 2 else kv_cache.reshape(kv_cache.shape[0], -1)
@@ -957,6 +961,7 @@ def compressed_kv_scatter_cutile(
                 start_pos,
                 block_offsets,
                 tokens_per_block,
+                has_work,
                 head_dim,
                 num_scale_blocks,
                 block_size_h,
@@ -983,6 +988,7 @@ def compressed_kv_scatter_cutile(
                 start_pos,
                 block_offsets,
                 tokens_per_block,
+                has_work,
                 head_dim,
                 0,  # num_scale_blocks (not used)
                 block_size_h,
@@ -1016,6 +1022,7 @@ def compressed_kv_scatter_cutile(
                 start_pos,
                 block_offsets,
                 tokens_per_block,
+                has_work,
                 head_dim,
                 0,  # num_scale_blocks (not used)
                 block_size_h,

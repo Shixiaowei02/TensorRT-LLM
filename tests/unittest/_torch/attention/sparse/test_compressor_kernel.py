@@ -354,6 +354,9 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
     kv_comp, compressed_mask = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
+    seq_lens = kv_lens - start_pos
+    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+    max_outputs = num_outputs_per_batch.max().item()
 
     kv_compress_prefill_cutile(
         kv_score,
@@ -367,6 +370,7 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
         paged_kv,
         paged_score,
         block_table,
+        max_outputs,
         block_table,
         compress_ratio,
         head_dim,
@@ -555,6 +559,9 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     kv_comp, compressed_mask = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
+    seq_lens = kv_lens - start_pos
+    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+    max_outputs = num_outputs_per_batch.max().item()
 
     kv_compress_prefill_cutile(
         kv_score,
@@ -568,6 +575,7 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
         paged_kv,
         paged_score,
         block_table,
+        max_outputs,
         block_table,
         compress_ratio,
         head_dim,
@@ -680,6 +688,9 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
     kv_comp, compressed_mask = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
+    seq_lens = kv_lens - start_pos
+    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+    max_outputs = num_outputs_per_batch.max().item()
 
     kv_compress_prefill_cutile(
         kv_score,
@@ -693,6 +704,7 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
         paged_kv,
         paged_score,
         block_table,
+        max_outputs,
         block_table,
         compress_ratio,
         head_dim,
@@ -799,6 +811,9 @@ def test_prefill_then_decode(
     kv_comp, compressed_mask = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score_prefill.device, torch.bfloat16
     )
+    seq_lens = kv_lens_prefill - start_pos_prefill
+    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+    max_outputs = num_outputs_per_batch.max().item()
 
     kv_compress_prefill_cutile(
         kv_score_prefill,
@@ -812,6 +827,7 @@ def test_prefill_then_decode(
         paged_kv,
         paged_score,
         block_table,
+        max_outputs,
         block_table,
         compress_ratio,
         head_dim,
@@ -1082,6 +1098,7 @@ def test_compressed_kv_scatter(
     kv_cache, block_offsets, _, _ = create_compressed_kv_cache(
         batch_size, max_compressed_len, head_dim, tokens_per_block
     )
+    max_outputs = num_outputs.max().item()
 
     compressed_kv_scatter_cutile(
         compressed_kv,
@@ -1092,6 +1109,7 @@ def test_compressed_kv_scatter(
         block_offsets,
         tokens_per_block,
         head_dim,
+        max_outputs,
     )
 
     for b in range(batch_size):
@@ -1171,6 +1189,7 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
     cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
     cu_new_comp_kv[1:] = num_comp_tokens.cumsum(0)
     start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    max_outputs = num_comp_tokens.max().item()
 
     # ========== cuTile Kernel ==========
     compressed_kv_scatter_cutile(
@@ -1182,6 +1201,7 @@ def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
         block_offsets,
         block_size,
         head_dim,
+        max_outputs=max_outputs,
         kv_cache_dtype="fp8_blockwise",
         kv_scale=k_scale,
     )
@@ -1322,6 +1342,7 @@ def test_fp8_pertensor_scatter_cutile(head_dim, batch_size, tokens_per_req):
     cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
     cu_new_comp_kv[1:] = num_comp_tokens.cumsum(0)
     start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    max_outputs = num_comp_tokens.max().item()
 
     # Run CuTile kernel
     compressed_kv_scatter_cutile(
@@ -1333,6 +1354,7 @@ def test_fp8_pertensor_scatter_cutile(head_dim, batch_size, tokens_per_req):
         block_offsets,
         tokens_per_block,
         head_dim,
+        max_outputs=max_outputs,
         kv_cache_dtype="fp8_pertensor",
     )
     torch.cuda.synchronize()
@@ -1396,6 +1418,7 @@ def benchmark_scatter_all_backends():
         )
 
         kv_cache_cutile = kv_cache.clone()
+        max_outputs = num_outputs.max().item()
 
         def cutile_fn():
             compressed_kv_scatter_cutile(
@@ -1407,6 +1430,7 @@ def benchmark_scatter_all_backends():
                 block_offsets,
                 tokens_per_block,
                 head_dim,
+                max_outputs=max_outputs,
             )
 
         def pytorch_fn():
@@ -1630,6 +1654,9 @@ def benchmark_compress_prefill_kernel():
         compressed_mask_cutile = compressed_mask.clone()
 
         def cutile_fn():
+            seq_lens = kv_lens - start_pos
+            num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+            max_outputs = num_outputs_per_batch.max().item()
             kv_compress_prefill_cutile(
                 kv_score,
                 ape,
@@ -1642,6 +1669,7 @@ def benchmark_compress_prefill_kernel():
                 paged_kv_cutile,
                 paged_score_cutile,
                 block_table,
+                max_outputs,
                 block_table,
                 compress_ratio,
                 head_dim,

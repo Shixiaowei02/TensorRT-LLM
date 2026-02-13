@@ -201,7 +201,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of (compress ratio, attention type) for the layers
     attention_type_set: Set[Tuple[int, MewtwoAttentionType]]
     # The number of total compressed tokens for each compress ratio
-    num_compressed_tokens: Dict[int, int] = {}
+    num_total_compressed_tokens: Dict[int, int] = {}
+    # The max number of compressed tokens for each compress ratio
+    max_num_compressed_tokens: Dict[int, Tuple[int, int, int]] = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -245,6 +247,24 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.cu_seq_lens = torch.empty_like(self.cu_seq_lens_cuda, device="cpu", pin_memory=True)
         self.cu_seq_lens[0] = 0
+
+        # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
+        self.new_comp_kv_lens_cuda = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences,),
+                dtype=torch.int,
+                cache_name=f"new_comp_kv_lens_cuda_{compress_ratio}",
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+        self.new_comp_kv_lens = {
+            compress_ratio: torch.empty_like(
+                self.new_comp_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=True
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
 
         # cu_new_comp_kv_cuda is the cumulative number of new compressed tokens for the requests
         self.cu_new_comp_kv_cuda = {
@@ -578,7 +598,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
         )
 
-        # Prepare num_compressed_tokens, cu_new_comp_kv_cuda/cu_new_comp_kv and,
+        # Prepare num_total_compressed_tokens, cu_new_comp_kv_cuda/cu_new_comp_kv and,
         # compressed_kv_lens_cuda/compressed_kv_lens
         num_gen_tokens_per_seq = (
             num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
@@ -587,6 +607,10 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_comp_kv_lens = kv_lens[:num_requests] // compress_ratio
             past_comp_kv_lens = cached_token_lens // compress_ratio
             new_comp_kv_lens = num_comp_kv_lens - past_comp_kv_lens
+            self.new_comp_kv_lens[compress_ratio][:num_requests] = new_comp_kv_lens
+            self.new_comp_kv_lens_cuda[compress_ratio][:num_requests].copy_(
+                self.new_comp_kv_lens[compress_ratio][:num_requests], non_blocking=True
+            )
             self.cu_new_comp_kv[compress_ratio][1 : num_requests + 1] = new_comp_kv_lens.cumsum(0)
             self.cu_new_comp_kv_cuda[compress_ratio][: num_requests + 1].copy_(
                 self.cu_new_comp_kv[compress_ratio][: num_requests + 1], non_blocking=True
@@ -600,8 +624,17 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_gen_compressed_tokens = self.num_generations * math.ceil(
                 num_gen_tokens_per_seq / compress_ratio
             )
-            self.num_compressed_tokens[compress_ratio] = (
+            self.num_total_compressed_tokens[compress_ratio] = (
                 num_ctx_compressed_tokens + num_gen_compressed_tokens
+            )
+            max_ctx_comp_kv_lens, max_gen_comp_kv_lens = 0, 0
+            if self.num_contexts > 0:
+                max_ctx_comp_kv_lens = new_comp_kv_lens[:self.num_contexts].max().item()
+            if self.num_generations > 0:
+                max_gen_comp_kv_lens = new_comp_kv_lens[self.num_contexts:self.num_seqs].max().item()
+            max_comp_kv_lens = max(max_ctx_comp_kv_lens, max_gen_comp_kv_lens)
+            self.max_num_compressed_tokens[compress_ratio] = (
+                max_ctx_comp_kv_lens, max_gen_comp_kv_lens, max_comp_kv_lens
             )
 
         # Prepare past_kv_lens_cuda/past_kv_lens

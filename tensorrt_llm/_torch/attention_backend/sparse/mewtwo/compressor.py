@@ -140,9 +140,10 @@ class Compressor(nn.Module):
         # Get compression metadata
         cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
         kv_lens = metadata.kv_lens_cuda_runtime
-        total_num_comp_tokens = metadata.num_compressed_tokens[self.compress_ratio]
-        # TODO: Move this to metadata preparation
-        num_comp_tokens = cu_new_comp_kv[1:] - cu_new_comp_kv[:-1]
+        total_num_comp_tokens = metadata.num_total_compressed_tokens[self.compress_ratio]
+        num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
+        max_num_comp_tokens = metadata.max_num_compressed_tokens[self.compress_ratio]
+        max_ctx_comp_kv_lens, _, max_comp_kv_lens = max_num_comp_tokens
 
         # Project input to KV and score
         kv_score = self.wkv_gate(x.float())
@@ -170,6 +171,7 @@ class Compressor(nn.Module):
                 head_dim=self.head_dim,
                 overlap=self.overlap,
                 page_size=state_tokens_per_block,
+                max_outputs=max_ctx_comp_kv_lens,
             )
 
         if num_generations > 0:
@@ -215,38 +217,40 @@ class Compressor(nn.Module):
 
         # Scatter to cache with appropriate quantization
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
-        num_comp_tokens_bsz = num_comp_tokens[:bsz]
 
         if self.kv_cache_dtype == "fp8_blockwise":
             return self._scatter_fp8_blockwise(
                 kv_comp,
-                num_comp_tokens_bsz,
+                num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
                 kv_cache,
                 block_table,
                 compress_tokens_per_block,
+                max_comp_kv_lens,
             )
         elif self.kv_cache_dtype == "fp8_pertensor":
             return self._scatter_fp8_pertensor(
                 kv_comp,
-                num_comp_tokens_bsz,
+                num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
                 kv_cache,
                 block_table,
                 compress_tokens_per_block,
+                max_comp_kv_lens,
             )
         else:
             compressed_kv_scatter_cutile(
                 kv_comp,
-                num_comp_tokens_bsz,
+                num_comp_tokens,
                 cu_new_comp_kv,
                 start_pos,
                 kv_cache,
                 block_table,
                 compress_tokens_per_block,
                 self.head_dim,
+                max_comp_kv_lens,
             )
             return kv_comp
 
@@ -259,6 +263,7 @@ class Compressor(nn.Module):
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
         tokens_per_block: int,
+        max_outputs: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Quantize to blockwise FP8 and scatter to cache.
 
@@ -284,6 +289,7 @@ class Compressor(nn.Module):
             block_offsets,
             tokens_per_block,
             self.head_dim,
+            max_outputs=max_outputs,
             kv_cache_dtype="fp8_blockwise",
             kv_scale=kv_scale,
         )
@@ -298,6 +304,7 @@ class Compressor(nn.Module):
         kv_cache: torch.Tensor,
         block_offsets: torch.Tensor,
         tokens_per_block: int,
+        max_outputs: int,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Quantize to per-tensor FP8 and scatter to cache.
 
@@ -329,6 +336,7 @@ class Compressor(nn.Module):
             block_offsets,
             tokens_per_block,
             self.head_dim,
+            max_outputs=max_outputs,
             kv_cache_dtype="fp8_pertensor",
         )
         return kv_fp8, kv_scale_quant_orig
