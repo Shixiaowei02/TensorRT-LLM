@@ -1,11 +1,11 @@
 # Copied and modified from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_mhc
 """TileLang MHC kernels: pre_gemm_sqrsum, pre_big_fuse, and post_mapping."""
+
 import math
 
 import tilelang
 import tilelang.language as T
 import torch
-
 
 # ============================================================================
 # Kernel 1: Fused GEMM + square-sum (pre-mapping first stage)
@@ -50,25 +50,19 @@ def _mhc_pre_gemm_sqrsum_kernel(
             x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
             fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
-            T.annotate_layout(
-                {x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)}
-            )
+            T.annotate_layout({x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)})
 
             T.copy(x[px * token_block, pz * hidden_block], x_smem_16)
             T.copy(fn[0, pz * hidden_block], fn_smem)
 
-            x_frag_16 = T.alloc_fragment(
-                (token_block, hidden_block), T.bfloat16
-            )
+            x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
             T.copy(x_smem_16, x_frag_16)
             x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
             T.copy(x_frag_16, x_frag)
 
             for jj in T.serial(hidden_block // 4):
                 for i, j in T.Parallel(token_block, 4):
-                    sqrsum_part[i, j] += (
-                        x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
-                    )
+                    sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
 
             # TF32 gemm
             T.gemm(
@@ -156,10 +150,7 @@ def _mhc_pre_big_fuse_kernel(
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
-                    T.sigmoid(
-                        mixes_shared[j + hc_mult] * hc_scale[1]
-                        + hc_base[j + hc_mult]
-                    )
+                    T.sigmoid(mixes_shared[j + hc_mult] * hc_scale[1] + hc_base[j + hc_mult])
                     * hc_post_mult_value
                 )
             for j, k in T.Parallel(hc_mult, hc_mult):
@@ -211,9 +202,7 @@ def _mhc_pre_big_fuse_kernel(
                     + hc_pre_eps
                 )
             # _pre_apply_mix_fwd
-            for i0_h in T.Pipelined(
-                hidden_size // hidden_block, num_stages=2
-            ):
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
                 T.copy(residual[i, 0, i0_h * hidden_block], xs)
@@ -295,9 +284,7 @@ def _mhc_post_kernel(
             for i_hco, i1_h in T.Parallel(hc, h_blk):
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
                 for i_hci in T.serial(hc):
-                    x_local[i_hco, i1_h] += (
-                        a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
-                    )
+                    x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
             T.copy(x_local, x_shared)
 
             T.copy(x_shared, x[i_n, 0, i0_h * h_blk])

@@ -1,4 +1,3 @@
-
 """cuTile MHC (multi-head Hyper-Connection) kernels.
 
 Moved from tilegym/ops/cutile/mhc.py so that trtllm no longer depends on the
@@ -32,8 +31,11 @@ def _default_split_gemm_cfg(N, max_split_k=None):
     tile_n = 8 if N <= 8 else (16 if N <= 16 else 32)
     split_k = 1 if (max_split_k is not None and max_split_k <= 1) else 1
     return SimpleNamespace(
-        TILE_SIZE_M=128, TILE_SIZE_N=tile_n, TILE_SIZE_K=128,
-        SPLIT_K=split_k, GROUP_SIZE_M=8,
+        TILE_SIZE_M=128,
+        TILE_SIZE_N=tile_n,
+        TILE_SIZE_K=128,
+        SPLIT_K=split_k,
+        GROUP_SIZE_M=8,
     )
 
 
@@ -232,7 +234,6 @@ def mhc_finalize_scale_bias_sigmoid_kernel(
     bid_n = ct.bid(1)
 
     num_bid_m = ct.cdiv(M, TILE_SIZE_M)
-    num_bid_n = ct.cdiv(N, TILE_SIZE_N)
 
     y_accum = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)
     r_accum = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
@@ -385,11 +386,11 @@ def mhc_apply_residual_kernel(
 
 @ct.kernel(occupancy=4)
 def mhc_post_mapping_kernel(
-    Residual,    # [B, n, C] bfloat16
-    X,           # [B, C] bfloat16
-    PostMix,     # [B, n] float32
-    CombMix,     # [B, n, n] float32  (NOT transposed)
-    Out,         # [B, n, C] bfloat16
+    Residual,  # [B, n, C] bfloat16
+    X,  # [B, C] bfloat16
+    PostMix,  # [B, n] float32
+    CombMix,  # [B, n, n] float32  (NOT transposed)
+    Out,  # [B, n, C] bfloat16
     C: int,
     n: ConstInt,
     TILE_SIZE_C: ConstInt,
@@ -404,11 +405,15 @@ def mhc_post_mapping_kernel(
 
     # ---- Load small tensors ONCE per token (L2-cached, ~80 bytes) ----
     post_vec = ct.load(
-        PostMix, index=(row, 0), shape=(1, n),
+        PostMix,
+        index=(row, 0),
+        shape=(1, n),
         padding_mode=ct.PaddingMode.ZERO,
     )
     comb_mat = ct.load(
-        CombMix, index=(row, 0, 0), shape=(1, n, n),
+        CombMix,
+        index=(row, 0, 0),
+        shape=(1, n, n),
         padding_mode=ct.PaddingMode.ZERO,
     )
     post_col = ct.reshape(post_vec, (n, 1))
@@ -420,12 +425,18 @@ def mhc_post_mapping_kernel(
         # BULK load: all n residual rows in one transaction (no TMA —
         # matching TileLang's TL_DISABLE_TMA_LOWER for strided access)
         all_res = ct.load(
-            Residual, index=(row, 0, c_tile), shape=(1, n, TILE_SIZE_C),
-            padding_mode=ct.PaddingMode.ZERO, latency=4,
+            Residual,
+            index=(row, 0, c_tile),
+            shape=(1, n, TILE_SIZE_C),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=4,
         )
         x_tile = ct.load(
-            X, index=(row, c_tile), shape=(1, TILE_SIZE_C),
-            padding_mode=ct.PaddingMode.ZERO, latency=4,
+            X,
+            index=(row, c_tile),
+            shape=(1, TILE_SIZE_C),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=4,
         )
 
         all_res_2d = ct.reshape(all_res, (n, TILE_SIZE_C))
@@ -438,12 +449,14 @@ def mhc_post_mapping_kernel(
             res_fp32 = ct.astype(res_row, ct.float32)
             comb_row = ct.extract(comb_2d, (j, 0), shape=(1, n))
             comb_col = ct.reshape(comb_row, (n, 1))
-            acc = acc + ct.broadcast_to(comb_col, (n, TILE_SIZE_C)) * \
-                ct.broadcast_to(res_fp32, (n, TILE_SIZE_C))
+            acc = acc + ct.broadcast_to(comb_col, (n, TILE_SIZE_C)) * ct.broadcast_to(
+                res_fp32, (n, TILE_SIZE_C)
+            )
 
         # post * x
-        out_tile = acc + ct.broadcast_to(post_col, (n, TILE_SIZE_C)) * \
-            ct.broadcast_to(x_fp32, (n, TILE_SIZE_C))
+        out_tile = acc + ct.broadcast_to(post_col, (n, TILE_SIZE_C)) * ct.broadcast_to(
+            x_fp32, (n, TILE_SIZE_C)
+        )
 
         out_tile = ct.astype(out_tile, Out.dtype)
         out_tile = ct.reshape(out_tile, (1, n, TILE_SIZE_C))
@@ -486,16 +499,16 @@ def mhc_sinkhorn_kernel(
 
 @ct.kernel
 def mhc_big_fuse_kernel(
-    Y_pp,          # [M, 2n] float32  – pre+post columns of GEMM output
-    Y_res,         # [M, n²] float32  – res columns of GEMM output
-    R_acc,         # [M, num_bid_n] float32  – partial sqrsum
-    Residual,      # [M, n, hidden_size] bfloat16
-    HcScale,       # [4] float32  (padded from 3)
-    BiasPP,        # [2n] float32  – pre+post bias
-    BiasRes,       # [n²] float32  – res bias
-    PostMix,       # [M, n] float32  (output)
-    CombMix,       # [M, n*n] float32  (output)
-    LayerInput,    # [M, hidden_size] bfloat16  (output)
+    Y_pp,  # [M, 2n] float32  – pre+post columns of GEMM output
+    Y_res,  # [M, n²] float32  – res columns of GEMM output
+    R_acc,  # [M, num_bid_n] float32  – partial sqrsum
+    Residual,  # [M, n, hidden_size] bfloat16
+    HcScale,  # [4] float32  (padded from 3)
+    BiasPP,  # [2n] float32  – pre+post bias
+    BiasRes,  # [n²] float32  – res bias
+    PostMix,  # [M, n] float32  (output)
+    CombMix,  # [M, n*n] float32  (output)
+    LayerInput,  # [M, hidden_size] bfloat16  (output)
     M: int,
     K: int,
     hidden_size: int,
@@ -503,9 +516,9 @@ def mhc_big_fuse_kernel(
     hc_pre_eps: float,
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
-    n: ConstInt,                   # = mult  (compile-time)
-    sinkhorn_repeat: ConstInt,     # number of Sinkhorn iterations
-    TILE_SIZE_H: ConstInt,         # hidden-dim tile width
+    n: ConstInt,  # = mult  (compile-time)
+    sinkhorn_repeat: ConstInt,  # number of Sinkhorn iterations
+    TILE_SIZE_H: ConstInt,  # hidden-dim tile width
 ):
     """Fused: split-K reduce + RMS + sigmoid + Sinkhorn + pre_apply_mix.
 
@@ -519,24 +532,30 @@ def mhc_big_fuse_kernel(
     """
     token = ct.bid(0)
     n2 = n * n
-    nn2 = 2 * n   # pre+post width (compile-time)
+    nn2 = 2 * n  # pre+post width (compile-time)
 
     # ---- 1. Load GEMM partials & sqrsum for this token ----------------------
     pp_row = ct.load(
-        Y_pp, index=(token, 0), shape=(1, nn2),
+        Y_pp,
+        index=(token, 0),
+        shape=(1, nn2),
         padding_mode=ct.PaddingMode.ZERO,
     )
     pp_row = ct.astype(pp_row, ct.float32)
 
     res_row = ct.load(
-        Y_res, index=(token, 0), shape=(1, n2),
+        Y_res,
+        index=(token, 0),
+        shape=(1, n2),
         padding_mode=ct.PaddingMode.ZERO,
     )
     res_row = ct.astype(res_row, ct.float32)
 
     # sqrsum: all bid_n copies are identical for SPLIT_K=1; read column 0.
     sqrsum = ct.load(
-        R_acc, index=(token, 0), shape=(1, 1),
+        R_acc,
+        index=(token, 0),
+        shape=(1, 1),
         padding_mode=ct.PaddingMode.ZERO,
     )
     sqrsum = ct.astype(sqrsum, ct.float32)
@@ -544,7 +563,7 @@ def mhc_big_fuse_kernel(
     # ---- 2. RMS normalize ---------------------------------------------------
     K_tile = ct.full((1, 1), K * 1.0, dtype=ct.float32)
     eps_rms = ct.full((1, 1), rms_eps, dtype=ct.float32)
-    rstd = ct.rsqrt(ct.truediv(sqrsum, K_tile) + eps_rms)   # (1, 1)
+    rstd = ct.rsqrt(ct.truediv(sqrsum, K_tile) + eps_rms)  # (1, 1)
 
     rstd_pp = ct.broadcast_to(rstd, (1, nn2))
     pp_row = pp_row * rstd_pp
@@ -554,22 +573,28 @@ def mhc_big_fuse_kernel(
 
     # ---- 3. Load scale [4] and bias sub-vectors ----------------------------
     scale_vec = ct.load(
-        HcScale, index=(0,), shape=(4,),
+        HcScale,
+        index=(0,),
+        shape=(4,),
         padding_mode=ct.PaddingMode.ZERO,
     )
     pp_bias = ct.load(
-        BiasPP, index=(0,), shape=(nn2,),
+        BiasPP,
+        index=(0,),
+        shape=(nn2,),
         padding_mode=ct.PaddingMode.ZERO,
     )
     res_bias = ct.load(
-        BiasRes, index=(0,), shape=(n2,),
+        BiasRes,
+        index=(0,),
+        shape=(n2,),
         padding_mode=ct.PaddingMode.ZERO,
     )
 
     # ---- 4. Pre columns [0, n): sigmoid(x * scale[0] + base) + pre_eps ----
     # ct.extract uses tile-based offset: physical = offset * shape
-    pre_vals = ct.extract(pp_row, (0, 0), shape=(1, n))        # cols 0..n-1
-    pre_bias_v = ct.extract(pp_bias, (0,), shape=(n,))          # bias[0..n-1]
+    pre_vals = ct.extract(pp_row, (0, 0), shape=(1, n))  # cols 0..n-1
+    pre_bias_v = ct.extract(pp_bias, (0,), shape=(n,))  # bias[0..n-1]
     pre_bias_v = ct.reshape(pre_bias_v, (1, n))
     s0 = ct.extract(scale_vec, (0,), shape=(1,))
     s0 = ct.reshape(s0, (1, 1))
@@ -578,8 +603,8 @@ def mhc_big_fuse_kernel(
     pre_mix = _sigmoid(pre_vals * s0 + pre_bias_v) + pre_eps_tile  # (1, n)
 
     # ---- 5. Post columns [n, 2n): sigmoid(x * scale[1] + base) * mult_val -
-    post_vals = ct.extract(pp_row, (0, 1), shape=(1, n))       # cols n..2n-1
-    post_bias_v = ct.extract(pp_bias, (1,), shape=(n,))         # bias[n..2n-1]
+    post_vals = ct.extract(pp_row, (0, 1), shape=(1, n))  # cols n..2n-1
+    post_bias_v = ct.extract(pp_bias, (1,), shape=(n,))  # bias[n..2n-1]
     post_bias_v = ct.reshape(post_bias_v, (1, n))
     s1 = ct.extract(scale_vec, (1,), shape=(1,))
     s1 = ct.reshape(s1, (1, 1))
@@ -591,18 +616,18 @@ def mhc_big_fuse_kernel(
     s2 = ct.extract(scale_vec, (2,), shape=(1,))
     s2 = ct.reshape(s2, (1, 1))
     s2 = ct.broadcast_to(s2, (1, n2))
-    res_linear = res_row * s2 + res_bias                         # (1, n²)
+    res_linear = res_row * s2 + res_bias  # (1, n²)
 
     # ---- 7. Sinkhorn normalization (matches sinkhorn_normalize_ref) ---------
     mat = ct.reshape(res_linear, (n, n))
     # Step 1: softmax(dim=-1) + eps  →  exp / row_sum + eps
     mat = ct.exp(mat)
-    row_sum = ct.sum(mat, axis=1, keepdims=True)          # (n, 1)
+    row_sum = ct.sum(mat, axis=1, keepdims=True)  # (n, 1)
     mat = ct.truediv(mat, row_sum)
     eps_nn = ct.full((n, n), hc_sinkhorn_eps, dtype=ct.float32)
     mat = mat + eps_nn
     # Step 2: col normalize  →  x / (col_sum + eps)
-    col_sum = ct.sum(mat, axis=0, keepdims=True)           # (1, n)
+    col_sum = ct.sum(mat, axis=0, keepdims=True)  # (1, n)
     eps_1n = ct.full((1, n), hc_sinkhorn_eps, dtype=ct.float32)
     mat = ct.truediv(mat, col_sum + eps_1n)
     # Steps 3+:  (sinkhorn_repeat − 1) iterations of row/col normalize
@@ -740,9 +765,7 @@ def cutile_autotune_mhc_split_gemm_rms(stream, x, w, M, N, K, cfg=None, max_spli
     max_split_k_val = max(cfg.SPLIT_K for cfg in configs)
     max_num_bid_n = max(ceil(N / cfg.TILE_SIZE_N) for cfg in configs)
     y_acc = torch.empty((M * max_split_k_val, N), device=x.device, dtype=torch.float32)
-    r_acc = torch.empty(
-        (M * max_split_k_val, max_num_bid_n), device=x.device, dtype=torch.float32
-    )
+    r_acc = torch.empty((M * max_split_k_val, max_num_bid_n), device=x.device, dtype=torch.float32)
     tuned = ct_experimental.autotune_launch(
         stream,
         grid_fn=lambda cfg: (
@@ -869,8 +892,8 @@ def mhc_gemm_rms_scale(
     N_orig = N
     if N < _MIN_TILE_N:
         pad = _MIN_TILE_N - N
-        w = torch.nn.functional.pad(w, (0, pad))          # [K, _MIN_TILE_N]
-        bias = torch.nn.functional.pad(bias, (0, pad))    # [_MIN_TILE_N]
+        w = torch.nn.functional.pad(w, (0, pad))  # [K, _MIN_TILE_N]
+        bias = torch.nn.functional.pad(bias, (0, pad))  # [_MIN_TILE_N]
         N = _MIN_TILE_N
 
     y_acc, r_acc, cfg = cutile_autotune_mhc_split_gemm_rms(
@@ -1104,12 +1127,13 @@ def mhc_pre_mapping_fused(
     # Split Y_acc and bias into pre+post (2n cols) and res (n² cols).
     # This ensures every ct.load/ct.extract shape dim is a power of two.
     # 2n=8 and n²=16 are both powers of two for n=4.
-    y_pp = y_acc[:, :2 * n].contiguous()           # [M, 2n]
-    y_res = y_acc[:, 2 * n:2 * n + n2].contiguous()  # [M, n²]
-    bias_pp = hc_base[:2 * n]                        # [2n] (1D slice, already contiguous)
-    bias_res = hc_base[2 * n:2 * n + n2]              # [n²] (1D slice, already contiguous)
+    y_pp = y_acc[:, : 2 * n].contiguous()  # [M, 2n]
+    y_res = y_acc[:, 2 * n : 2 * n + n2].contiguous()  # [M, n²]
+    bias_pp = hc_base[: 2 * n]  # [2n] (1D slice, already contiguous)
+    bias_res = hc_base[2 * n : 2 * n + n2]  # [n²] (1D slice, already contiguous)
     hc_scale_pad = torch.nn.functional.pad(
-        hc_scale, (0, 4 - hc_scale.numel()),
+        hc_scale,
+        (0, 4 - hc_scale.numel()),
     )  # [4]
 
     post_mix = torch.empty((M, n), dtype=torch.float32, device=x.device)

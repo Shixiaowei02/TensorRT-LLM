@@ -1,27 +1,21 @@
-import unittest
 import weakref
 from copy import deepcopy
-from typing import List, Optional
 
 import torch
 from transformers import PretrainedConfig
-# from utils.util import default_dtype
 
+# from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoTrtllmAttentionMetadata, MewtwoAttentionType
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.cache_manager import MewtwoCacheManager
+from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoTrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_mewtwo import (MewtwoForCausalLM,
-                                                        MewtwoGate)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.models.modeling_mewtwo import MewtwoForCausalLM
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest, LlmRequestState, SamplingConfig)
-from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-
 
 MEWTWO_TINY_CONFIG = {
     "architectures": ["MewtwoForCausalLM"],
@@ -67,18 +61,15 @@ MEWTWO_TINY_CONFIG = {
         "fmt": "e4m3",
         "quant_method": "fp8",
         "scale_fmt": "ue8m0",
-        "weight_block_size": [
-        128,
-        128
-        ]
+        "weight_block_size": [128, 128],
     },
 }
 
 
 # class TestMewtwo(unittest.TestCase):
 
-def test_mewtwo_sanity():
 
+def test_mewtwo_sanity():
     config_dict = deepcopy(MEWTWO_TINY_CONFIG)
     config = PretrainedConfig(**config_dict)
     config.dtype = torch.bfloat16
@@ -99,28 +90,26 @@ def test_mewtwo_sanity():
 
     device = torch.device("cuda")
     # with default_dtype(config.dtype):
-    model_config = ModelConfig(pretrained_config=config,
-                            sparse_attention_config=sparse_attn_config,
-                            attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
+    )
     model = MewtwoForCausalLM(model_config).to(device)
 
     context_sequence_length = [3, 2, 5]
     sequence_length = context_sequence_length + [1, 1]
 
     # Total tokens = sum(sequence_length) = 3+2+5+1+1 = 12
-    input_ids = torch.randint(0, vocab_size,
-                                (sum(sequence_length),),
-                                dtype=torch.int32,
-                                device=device)
+    input_ids = torch.randint(
+        0, vocab_size, (sum(sequence_length),), dtype=torch.int32, device=device
+    )
     past_seen_tokens = [0, 0, 0, 62, 75]
     request_ids = list(range(len(sequence_length)))
-    token_nums = (torch.tensor(past_seen_tokens) +
-                    torch.tensor(sequence_length)).tolist()
+    token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-    tokens_per_block = 128 # Mewtwo requirement
+    tokens_per_block = 128  # Mewtwo requirement
     required_blocks = sum(
-        (token_num + tokens_per_block - 1) // tokens_per_block
-        for token_num in token_nums)
+        (token_num + tokens_per_block - 1) // tokens_per_block for token_num in token_nums
+    )
     num_blocks = max(10, required_blocks)
     head_dim = config.v_head_dim
     num_layers = config.num_hidden_layers
@@ -135,10 +124,10 @@ def test_mewtwo_sanity():
         raise ValueError("Invalid dtype")
     mapping = config.mapping
     kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
-    kv_cache_config.max_util_for_resume=0.1
+    kv_cache_config.max_util_for_resume = 0.1
 
     kv_cache_manager = MewtwoCacheManager(
-        kv_cache_config = KvCacheConfig(
+        kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=num_blocks * tokens_per_block,
             event_buffer_max_size=0,
@@ -189,11 +178,8 @@ def test_mewtwo_sanity():
     position_ids = []
     seq_lens = []
     for i, tokens in enumerate(past_seen_tokens):
-        seq_len = context_sequence_length[i] if i < len(
-            context_sequence_length) else 1
-        position_id = torch.arange(tokens,
-                                    tokens + seq_len,
-                                    device=input_ids.device)
+        seq_len = context_sequence_length[i] if i < len(context_sequence_length) else 1
+        position_id = torch.arange(tokens, tokens + seq_len, device=input_ids.device)
         position_ids.append(position_id)
         seq_lens.append(seq_len)
 
@@ -207,15 +193,15 @@ def test_mewtwo_sanity():
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
 
-        logits = model.forward(input_ids=input_ids,
-                            position_ids=position_ids,
-                            attn_metadata=attn_metadata)
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+        )
 
         for req in reqs:
             req.context_current_position = seq_lens[req.py_request_id]
             req.add_new_token(seq_lens[req.py_request_id], 0)
         kv_cache_manager.update_resources(scheduled_batch)
-    # self.assertEqual(len(past_seen_tokens), logits.shape[0])
+    assert len(past_seen_tokens) == logits.shape[0]
 
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with torch.inference_mode(), model_extra_attrs(extra_attrs):
@@ -224,17 +210,20 @@ def test_mewtwo_sanity():
         scheduled_batch.generation_requests = reqs
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
-        logits = model.forward(input_ids=input_ids,
-                                position_ids=position_ids,
-                                attn_metadata=attn_metadata,
-                                return_context_logits=True)
+        logits = model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attn_metadata=attn_metadata,
+            return_context_logits=True,
+        )
         for req in reqs:
             req.add_new_token(seq_lens[req.py_request_id], 0)
         kv_cache_manager.update_resources(scheduled_batch)
-    # self.assertEqual(input_ids.shape, logits.shape[:-1])
+    assert input_ids.shape == logits.shape[:-1]
 
     for req in reqs:
         kv_cache_manager.free_resources(req)
     kv_cache_manager.shutdown()
+
 
 test_mewtwo_sanity()
