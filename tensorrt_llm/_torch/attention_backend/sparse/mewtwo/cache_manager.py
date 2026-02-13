@@ -570,13 +570,18 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):
-        head_dim = model_config.head_dim
+        config = model_config.pretrained_config
+        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         index_head_dim = model_config.sparse_attention_config.index_head_dim
         pp_layers = mapping.pp_layers(model_config.get_num_attention_layers())
         compress_ratios = [
             model_config.sparse_attention_config.compress_ratios[layer] for layer in pp_layers
         ]
-        has_fp8_kv_cache = model_config.quant_mode.has_fp8_kv_cache()
+        quant_config = model_config.quant_config
+        if quant_config is not None:
+            has_fp8_kv_cache = quant_config.quant_mode.has_fp8_kv_cache()
+        else:
+            has_fp8_kv_cache = False
         return MewtwoCacheManager._estimate_bytes_per_token(
             head_dim,
             index_head_dim,

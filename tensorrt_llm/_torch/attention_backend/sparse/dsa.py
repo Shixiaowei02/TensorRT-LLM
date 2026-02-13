@@ -119,7 +119,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if not HAS_FAST_HADAMARD:
         # Fallback: skip transformation (acceptable for test/dev)
         logger.warning_once(
-            "fast-hadamard-transform not available. DSA sparse attention will skip "
+            "fast-hadamard-transform not available. Sparse MLA will skip "
             "hadamard transformation. Install with: "
             "pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
             key="fast_hadamard_import_missing")

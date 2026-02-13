@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-from torch.nn.parameter import Parameter
 
 from tensorrt_llm.deep_gemm import tf32_hc_prenorm_gemm
 
@@ -482,13 +481,13 @@ class mHC(nn.Module):
         self.hc_dim = self.mult * self.hidden_size
 
         # Parameters
-        self.fn = Parameter(
+        self.fn = nn.Parameter(
             torch.empty((self.mix_hc, self.hc_dim), dtype=torch.float32), requires_grad=False
-        ).cuda()
-        self.base = Parameter(
+        )
+        self.base = nn.Parameter(
             torch.empty((self.mix_hc,), dtype=torch.float32), requires_grad=False
-        ).cuda()
-        self.scale = Parameter(torch.empty((3,), dtype=torch.float32), requires_grad=False).cuda()
+        )
+        self.scale = nn.Parameter(torch.empty((3,), dtype=torch.float32), requires_grad=False)
 
     def pre_mapping(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
@@ -751,13 +750,11 @@ class HCHead(nn.Module):
         self.fn = nn.Parameter(
             torch.empty((self.mult, self.mult * self.hidden_size), dtype=torch.float32),
             requires_grad=False,
-        ).cuda()
+        )
         self.base = nn.Parameter(
             torch.empty((self.mult,), dtype=torch.float32), requires_grad=False
-        ).cuda()
-        self.scale = nn.Parameter(
-            torch.empty((1,), dtype=torch.float32), requires_grad=False
-        ).cuda()
+        )
+        self.scale = nn.Parameter(torch.empty((1,), dtype=torch.float32), requires_grad=False)
         self.backend = backend
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -696,7 +696,6 @@ class MewtwoAttention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        assert config.num_key_value_heads == 1, "MewtwoAttention only supports num_key_value_heads=1"
         assert config.qk_rope_head_dim == 64, "MewtwoAttention only supports qk_rope_head_dim=64"
         assert config.kv_lora_rank == 448, "MewtwoAttention only supports kv_lora_rank=448"
         super().__init__(hidden_size=config.hidden_size,
@@ -719,7 +718,7 @@ class MewtwoAttention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
-                         num_groups=config.n_group,
+                         num_groups=config.o_groups,
                          o_lora_rank=config.o_lora_rank,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
@@ -782,7 +781,7 @@ class MewtwoGate(nn.Module):
 
         # WAR to avoid illegal expert indexes in hashed gating
         if self.is_hashed:
-            self.tid2eid.data.copy_(torch.randint(0, num_experts, (vocab_size, top_k), dtype=torch.int32))
+            self.tid2eid.data.copy_(torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(vocab_size)]).to(torch.int32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
@@ -843,7 +842,7 @@ class MewtwoMoE(nn.Module):
                                n_group=config.n_group,
                                topk_group=config.topk_group,
                                routed_scaling_factor=config.routed_scaling_factor,
-                               is_hashed=layer_idx < 3,  # Only the first 3 layers use hashed routing
+                               is_hashed=layer_idx < config.n_hash_layers,
                                vocab_size=config.vocab_size,
                                dtype=dtype,
                                fuse_routing_kernel=True,
@@ -1278,8 +1277,6 @@ class MewtwoDecoderLayer(DecoderLayer):
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
         post_mix, res_mix, hidden_states = self.hc_ffn.pre_mapping(hidden_states)
-        # hidden_shapes = hidden_states.shape[:-1]
-        # hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states, _ = self.forward_MoE(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,

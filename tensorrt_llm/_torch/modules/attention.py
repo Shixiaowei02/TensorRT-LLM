@@ -1196,7 +1196,6 @@ class MLA(nn.Module):
         else:
             self.mapping = config.mapping
         tp_size = self.mapping.tp_size
-        self.n_local_groups = self.num_groups // tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
         dp_size = 1
@@ -1225,6 +1224,7 @@ class MLA(nn.Module):
         self.num_heads_tp_cp = self.num_heads_tp // cp_size
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size -
                                        1) // tp_size
+        self.n_local_groups = self.num_groups // tp_size
 
         rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
@@ -1262,7 +1262,7 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
             if self.is_mewtwo:
-                self.q_b_layernorm = RMSNorm(hidden_size=self.num_heads *
+                self.q_b_layernorm = RMSNorm(hidden_size=self.num_heads_tp *
                                              self.qk_head_dim,
                                              eps=rms_norm_eps,
                                              dtype=dtype)

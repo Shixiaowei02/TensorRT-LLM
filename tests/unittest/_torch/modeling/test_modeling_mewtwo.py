@@ -117,7 +117,6 @@ def test_mewtwo_sanity():
     token_nums = (torch.tensor(past_seen_tokens) +
                     torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-
     tokens_per_block = 128 # Mewtwo requirement
     required_blocks = sum(
         (token_num + tokens_per_block - 1) // tokens_per_block
@@ -125,7 +124,6 @@ def test_mewtwo_sanity():
     num_blocks = max(10, required_blocks)
     head_dim = config.v_head_dim
     num_layers = config.num_hidden_layers
-    num_kv_heads = config.num_key_value_heads
     max_seq_len = num_blocks * tokens_per_block
     batch_size = len(sequence_length)
 
@@ -147,7 +145,7 @@ def test_mewtwo_sanity():
         ),
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
+        num_kv_heads=1,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
         max_seq_len=max_seq_len,

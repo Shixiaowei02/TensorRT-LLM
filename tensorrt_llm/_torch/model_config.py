@@ -19,6 +19,7 @@ from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          MewtwoSparseAttentionConfig,
                                           MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -498,6 +499,30 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
+
+        def update_sparse_attention_indexer_config(pretrained_config, kwargs):
+            sparse_attention_config = kwargs.get('sparse_attention_config')
+            if sparse_attention_config:
+                index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+            else:
+                index_n_heads = pretrained_config.index_n_heads
+                index_head_dim = pretrained_config.index_head_dim
+                index_topk = pretrained_config.index_topk
+                indexer_max_chunk_size = None
+                skip_indexer_for_short_seqs = True
+            indexer_config = {}
+            indexer_config['index_n_heads'] = index_n_heads
+            indexer_config['index_head_dim'] = index_head_dim
+            indexer_config['index_topk'] = index_topk
+            indexer_config['indexer_max_chunk_size'] = indexer_max_chunk_size
+            indexer_config[
+                'skip_indexer_for_short_seqs'] = skip_indexer_for_short_seqs
+            return indexer_config
+
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
@@ -543,6 +568,22 @@ class ModelConfig(Generic[TConfig]):
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave)
+                elif pretrained_config.architectures[0] == "MewtwoForCausalLM":
+                    indexer_config = update_sparse_attention_indexer_config(
+                        pretrained_config, kwargs)
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    if sparse_attention_config:
+                        compress_ratios = sparse_attention_config.compress_ratios
+                        window_size = sparse_attention_config.window_size
+                    else:
+                        compress_ratios = pretrained_config.compress_ratios
+                        window_size = pretrained_config.window_size
+                    kwargs[
+                        'sparse_attention_config'] = MewtwoSparseAttentionConfig(
+                            compress_ratios=compress_ratios,
+                            window_size=window_size,
+                            **indexer_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
