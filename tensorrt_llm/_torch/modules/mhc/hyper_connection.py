@@ -56,7 +56,7 @@ class mHC(nn.Module):
         sinkhorn_eps: float = 1e-6,
         post_mult_value: float = 1.0,
         n_splits: int = 1,
-        backend: str = "cutile",
+        backend: str = "tilelang",
     ):
         super().__init__()
         self.mult = mult
