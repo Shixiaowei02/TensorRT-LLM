@@ -66,7 +66,7 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import (MewtwoMoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
-from ..modules.hyper_connection import mHC, HCHead
+from ..modules.mhc.hyper_connection import mHC, HCHead
 from ..modules.linear import Linear
 
 # isort: off

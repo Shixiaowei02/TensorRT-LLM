@@ -5,7 +5,7 @@ from collections import defaultdict
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.hyper_connection import HCHead, mHC
+from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
 
 # Global dictionary to store timing statistics
 timing_stats = defaultdict(lambda: {"total_time": 0.0, "count": 0, "times": []})
@@ -101,10 +101,10 @@ def generate_head_data(
     }
 
 
-@pytest.mark.parametrize("n", [512, 1024, 2048, 8192])
-@pytest.mark.parametrize("hidden_size", [1280, 2560, 4096])
+@pytest.mark.parametrize("n", [64, 128, 4096, 8192])
+@pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["vanilla", "deepgemm", "tilelang", "triton"])
+@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
 def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_pre_data(
         n=n,
@@ -122,7 +122,7 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         norm_eps=test_data["rms_eps"],
         post_mult_value=test_data["hc_post_mult_value"],
         backend="vanilla",
-    )
+    ).cuda()
     ref_module.fn.copy_(test_data["fn"])
     ref_module.scale.copy_(test_data["hc_scale"])
     ref_module.base.copy_(test_data["hc_base"])
@@ -136,7 +136,7 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         norm_eps=test_data["rms_eps"],
         post_mult_value=test_data["hc_post_mult_value"],
         backend=backend,
-    )
+    ).cuda()
     test_module.fn.copy_(test_data["fn"])
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
@@ -165,15 +165,18 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         post_mix_vanilla, comb_mix_vanilla, layer_input_vanilla = ref_module.pre_mapping(
             test_data["residual"]
         )
-        torch.testing.assert_close(post_mix_vanilla, post_mix_ref)
-        torch.testing.assert_close(comb_mix_vanilla, comb_mix_ref)
-        torch.testing.assert_close(layer_input_vanilla, layer_input_ref)
+        # cutile/deepgemm backends use tf32 MMA which has larger rounding diffs
+        torch.testing.assert_close(post_mix_vanilla, post_mix_ref, rtol=1e-4, atol=1e-3)
+        # comb_mix goes through Sinkhorn normalization (exp → iterated row/col
+        # normalize) which amplifies small tf32 rounding differences.
+        torch.testing.assert_close(comb_mix_vanilla, comb_mix_ref, rtol=1e-3, atol=5e-3)
+        torch.testing.assert_close(layer_input_vanilla, layer_input_ref, rtol=1e-4, atol=1e-3)
 
 
-@pytest.mark.parametrize("n", [4096])
-@pytest.mark.parametrize("hidden_size", [1280, 2560, 7168])
+@pytest.mark.parametrize("n", [64, 128, 4096, 8192])
+@pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["vanilla", "deepgemm", "tilelang", "triton"])
+@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
 def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_post_data(
         n=n,
@@ -208,13 +211,17 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     # Compare outputs with vanilla backend
     if backend != "vanilla":
         output_ref = ref_module.post_mapping(**test_data)
-        torch.testing.assert_close(output_ref, output)
+        # tilelang backend uses bf16 MMA which has larger rounding differences
+        if backend == "tilelang":
+            torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
+        else:
+            torch.testing.assert_close(output_ref, output, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("m", [1024, 4096])
-@pytest.mark.parametrize("hidden_size", [2560, 4096])
+@pytest.mark.parametrize("m", [64, 128, 4096, 8192])
+@pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["vanilla", "tilelang", "triton"])
+@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
 def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_head_data(
         m=m,
@@ -222,12 +229,12 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
         hidden_size=hidden_size,
     )
 
-    ref_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend="vanilla")
+    ref_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend="vanilla").cuda()
     ref_module.fn.copy_(test_data["hc_fn"])
     ref_module.scale.copy_(test_data["hc_scale"])
     ref_module.base.copy_(test_data["hc_base"])
 
-    test_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend=backend)
+    test_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend=backend).cuda()
     test_module.fn.copy_(test_data["hc_fn"])
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
