@@ -2174,7 +2174,7 @@ def mewtwo_local_to_global_indices(
         req_id: torch.Tensor,  # int32 [num_tokens]
         block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
         swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
-        swa_pool_ptr: int,  # int64: base address of SWA pool
+        sparse_mla_base_ptr: int,  # int64: base address of sparse MLA pool
         swa_buffer_ptr: int,  # int64: base address of SWA buffer
         tokens_per_block: int,  # tokens per block for SWA
         token_stride: int,  # bytes per token (use SWA token stride)
@@ -2192,7 +2192,7 @@ def mewtwo_local_to_global_indices(
     For compress_ratio>1: Processes both SWA and compressed indices.
 
     Output indices are pool-based, not buffer-based:
-        address = swa_pool_ptr + global_indices[i] * token_stride
+        address = sparse_mla_base_ptr + global_indices[i] * token_stride
 
     Output is compact: valid SWA indices, then valid compressed indices, then -1 padding.
     [valid_swa_0, ..., valid_swa_k, valid_comp_0, ..., valid_comp_m, -1, -1, ...]
@@ -2202,8 +2202,8 @@ def mewtwo_local_to_global_indices(
         block_table_swa: SWA block table [num_requests, max_blocks_swa], int32
         swa_local_indices: Local indices for SWA cache [num_tokens, num_swa_indices], int32
             Use -1 for invalid/padding indices.
-        swa_pool_ptr: Base address of SWA pool (Slot 0 address, used as unified base)
-        swa_buffer_ptr: Base address of SWA buffer (pool_ptr + buffer_offset_in_slot)
+        sparse_mla_base_ptr: Base address of sparse MLA pool (Slot 0 address, used as unified base)
+        swa_buffer_ptr: Base address of SWA buffer (base_pool_ptr + buffer_offset_in_slot)
         tokens_per_block: Number of tokens per block for SWA cache
         token_stride: Bytes per token (use SWA token stride)
         block_table_compressed: Compressed block table [num_requests, max_blocks_compressed], int32 (optional)
@@ -2230,7 +2230,7 @@ def mewtwo_local_to_global_indices(
 
     # Compute SWA buffer offset from pool_ptr in tokens
     swa_buffer_offset_in_tokens = (swa_buffer_ptr -
-                                   swa_pool_ptr) // token_stride
+                                   sparse_mla_base_ptr) // token_stride
 
     if has_compressed:
         assert block_table_compressed is not None, "block_table_compressed required when compress_ratio > 1"
@@ -2244,13 +2244,13 @@ def mewtwo_local_to_global_indices(
         assert compressed_local_indices.shape[0] == num_tokens
 
         tokens_per_block_compressed = tokens_per_block // compress_ratio
-        # Compute compressed buffer offset from swa_pool_ptr in tokens
+        # Compute compressed buffer offset from sparse_mla_base_ptr in tokens
         assert (
-            compressed_buffer_ptr - swa_pool_ptr
+            compressed_buffer_ptr - sparse_mla_base_ptr
         ) % token_stride == 0, "compressed_buffer_ptr must be aligned to token_stride"
         # Use swa buffer token stride to compute compressed buffer offset
-        compressed_buffer_offset_in_tokens = (compressed_buffer_ptr -
-                                              swa_pool_ptr) // token_stride
+        compressed_buffer_offset_in_tokens = (
+            compressed_buffer_ptr - sparse_mla_base_ptr) // token_stride
         _, max_blocks_compressed = block_table_compressed.shape
         block_table_compressed_c = block_table_compressed.contiguous()
         compressed_local_indices_c = compressed_local_indices.contiguous()

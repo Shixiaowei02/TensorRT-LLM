@@ -246,6 +246,7 @@ class TrtllmAttentionWrapper:
         sparse_attn_indices_block_size: int = 1,
         sparse_mla_topk: int = 0,
         sparse_mla_topk_lens: Optional[torch.Tensor] = None,
+        sparse_mla_kv_cache_pool_ptr: Optional[int] = None,
         skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
         skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
         helix_position_offsets: Optional[torch.Tensor] = None,
@@ -347,6 +348,7 @@ class TrtllmAttentionWrapper:
         self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
         self.sparse_mla_topk = sparse_mla_topk
         self.sparse_mla_topk_lens = sparse_mla_topk_lens
+        self.sparse_mla_kv_cache_pool_ptr = sparse_mla_kv_cache_pool_ptr
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
 
@@ -736,6 +738,7 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.flash_mla_tile_scheduler_metadata,
                 self.flash_mla_num_splits,
+                self.sparse_mla_kv_cache_pool_ptr,
             )
 
         if self.print_skip_softmax_stat:
@@ -1951,6 +1954,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_softmax_threshold_scale_factor_prefill = None
         skip_softmax_threshold_scale_factor_decode = None
         sparse_mla_topk_lens, sparse_mla_topk = None, 0
+        sparse_mla_kv_cache_pool_ptr = None
         if self.sparse_attention_config is not None:
             if isinstance(self.sparse_attention_config,
                           SkipSoftmaxAttentionConfig):
@@ -1982,6 +1986,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     window_size = self.sparse_attention_config.window_size
                     compressed_len = metadata.max_compressed_indices[ratio]
                     sparse_mla_topk = compressed_len + window_size
+                    sparse_mla_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[
+                        ratio]
                 else:
                     if hasattr(metadata, 'sparse_mla_topk'):
                         sparse_mla_topk = metadata.sparse_mla_topk
@@ -2074,6 +2080,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size=sparse_attn_indices_block_size,
             sparse_mla_topk=sparse_mla_topk,
             sparse_mla_topk_lens=sparse_mla_topk_lens,
+            sparse_mla_kv_cache_pool_ptr=sparse_mla_kv_cache_pool_ptr,
             skip_softmax_threshold_scale_factor_prefill=
             skip_softmax_threshold_scale_factor_prefill,
             skip_softmax_threshold_scale_factor_decode=

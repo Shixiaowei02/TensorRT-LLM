@@ -576,6 +576,14 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(self.compress_ratios[layer_idx])
         }
 
+        # Per-ratio base pointer for sparse MLA = min(swa_pool_ptr, compressed_pool_ptr).
+        swa_pool_ptr = self.kv_cache_manager.swa_pool_ptr
+        self.sparse_mla_base_ptrs = {
+            1: swa_pool_ptr,
+        }
+        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
+            self.sparse_mla_base_ptrs[ratio] = min(swa_pool_ptr, compress_pool_ptr)
+
         # For indices conversion
         self.prepare_for_indices_conversion()
 
@@ -629,12 +637,16 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
             max_ctx_comp_kv_lens, max_gen_comp_kv_lens = 0, 0
             if self.num_contexts > 0:
-                max_ctx_comp_kv_lens = new_comp_kv_lens[:self.num_contexts].max().item()
+                max_ctx_comp_kv_lens = new_comp_kv_lens[: self.num_contexts].max().item()
             if self.num_generations > 0:
-                max_gen_comp_kv_lens = new_comp_kv_lens[self.num_contexts:self.num_seqs].max().item()
+                max_gen_comp_kv_lens = (
+                    new_comp_kv_lens[self.num_contexts : self.num_seqs].max().item()
+                )
             max_comp_kv_lens = max(max_ctx_comp_kv_lens, max_gen_comp_kv_lens)
             self.max_num_compressed_tokens[compress_ratio] = (
-                max_ctx_comp_kv_lens, max_gen_comp_kv_lens, max_comp_kv_lens
+                max_ctx_comp_kv_lens,
+                max_gen_comp_kv_lens,
+                max_comp_kv_lens,
             )
 
         # Prepare past_kv_lens_cuda/past_kv_lens
@@ -849,8 +861,9 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
 
+        sparse_mla_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
+
         # Get cached buffer pointers
-        swa_pool_ptr = kv_cache_manager.swa_pool_ptr
         swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
 
         # Token stride
@@ -891,7 +904,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 req_id=req_id,
                 block_table_swa=block_table_swa,
                 swa_local_indices=swa_local_indices,
-                swa_pool_ptr=swa_pool_ptr,
+                sparse_mla_base_ptr=sparse_mla_base_ptr,
                 swa_buffer_ptr=swa_buffer_ptr,
                 tokens_per_block=kv_cache_manager.tokens_per_block,
                 token_stride=token_stride,
@@ -912,7 +925,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 req_id=req_id,
                 block_table_swa=block_table_swa,
                 swa_local_indices=swa_local_indices,
-                swa_pool_ptr=swa_pool_ptr,
+                sparse_mla_base_ptr=sparse_mla_base_ptr,
                 swa_buffer_ptr=swa_buffer_ptr,
                 tokens_per_block=kv_cache_manager.tokens_per_block,
                 token_stride=token_stride,

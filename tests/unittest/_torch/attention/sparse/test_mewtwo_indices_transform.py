@@ -60,10 +60,14 @@ batch_configs = [
 
 def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
     """Create a MewtwoCacheManager for testing."""
+    base_ratios = [1, 4, 128]
+    compress_ratios = [base_ratios[i % len(base_ratios)] for i in range(num_layers)]
+    if scenario.layer_idx < num_layers:
+        compress_ratios[scenario.layer_idx] = scenario.compress_ratio
     sparse_attn_config = MewtwoSparseAttentionConfig(
         index_head_dim=scenario.index_head_dim,
         window_size=scenario.window_size,
-        compress_ratios=[scenario.compress_ratio] * num_layers,
+        compress_ratios=compress_ratios,
     )
 
     max_tokens = scenario.max_seq_len * scenario.max_batch_size
@@ -156,8 +160,14 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     cache_manager.prepare_resources(scheduled_batch)
 
     # Get pointers and offsets
-    swa_pool_ptr = cache_manager.kv_cache_pool_pointers[0, 0].item()
+    swa_pool_ptr = cache_manager.swa_pool_ptr
     swa_buffer_ptr = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
+    # Use min(swa_pool_ptr, compressed_pool_ptr) as base to ensure non-negative indices
+    sparse_mla_base_ptr = swa_pool_ptr
+    if has_compressed and scenario.compress_ratio in cache_manager.compress_pool_ptrs:
+        sparse_mla_base_ptr = min(
+            swa_pool_ptr, cache_manager.compress_pool_ptrs[scenario.compress_ratio]
+        )
 
     # Single token stride for all buffers
     has_fp8_kv_cache = scenario.dtype == DataType.FP8
@@ -168,7 +178,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         MewtwoAttentionType.SWA,
         has_fp8_kv_cache,
     )
-    swa_offset = (swa_buffer_ptr - swa_pool_ptr) // token_stride
+    swa_offset = (swa_buffer_ptr - sparse_mla_base_ptr) // token_stride
 
     # Get compressed buffer type from scenario property
     compressed_attn_type = scenario.compressed_attn_type
@@ -177,7 +187,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         compressed_buffer_ptr = cache_manager.get_buffers(
             layer_idx, compressed_attn_type
         ).data_ptr()
-        compressed_offset = (compressed_buffer_ptr - swa_pool_ptr) // token_stride
+        compressed_offset = (compressed_buffer_ptr - sparse_mla_base_ptr) // token_stride
         tokens_per_block_compressed = scenario.tokens_per_block // scenario.compress_ratio
     else:
         compressed_buffer_ptr, compressed_offset, tokens_per_block_compressed = (
@@ -267,7 +277,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         req_id=req_id,
         block_table_swa=block_table_swa_t,
         swa_local_indices=swa_local_indices,
-        swa_pool_ptr=swa_pool_ptr,
+        sparse_mla_base_ptr=sparse_mla_base_ptr,
         swa_buffer_ptr=swa_buffer_ptr,
         tokens_per_block=scenario.tokens_per_block,
         token_stride=token_stride,

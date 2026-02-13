@@ -163,6 +163,22 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
         self.swa_pool_ptr = swa_pool_ptr
 
+        self.compress_pool_ptrs = {}
+        if 4 in self._compress_ratios:  # indexer compressor
+            self.compress_pool_ptrs[4] = self.impl.get_mem_pool_base_address(
+                self._layer_attn_to_layer_id[
+                    self._compress_ratios.index(4), MewtwoAttentionType.COMPRESS
+                ],
+                Role.KEY,
+            )
+        if 128 in self._compress_ratios:  # compressor
+            self.compress_pool_ptrs[128] = self.impl.get_mem_pool_base_address(
+                self._layer_attn_to_layer_id[
+                    self._compress_ratios.index(128), MewtwoAttentionType.COMPRESS
+                ],
+                Role.KEY,
+            )
+
         swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
 
         def _get_layer_offset(layer_idx: int) -> int:
