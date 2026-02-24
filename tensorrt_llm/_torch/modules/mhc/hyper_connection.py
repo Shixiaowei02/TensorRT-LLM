@@ -7,59 +7,47 @@ from torch import nn
 
 from tensorrt_llm.deep_gemm import tf32_hc_prenorm_gemm
 
-_cutile_import_error = None
 try:
     from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_apply_residual as mhc_apply_residual_cutile,
-    )
-    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_gemm_rms_scale as mhc_gemm_rms_scale_cutile,
-    )
-    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_post_mapping as mhc_post_mapping_cutile,
-    )
-    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_pre_mapping_fused as mhc_pre_mapping_fused_cutile,
     )
-except (ModuleNotFoundError, OSError) as e:
-    _cutile_import_error = e
-    mhc_gemm_rms_scale_cutile = None
+    _cutile_available = True
+except Exception as _e:
+    _cutile_available = False
     mhc_apply_residual_cutile = None
+    mhc_gemm_rms_scale_cutile = None
     mhc_post_mapping_cutile = None
     mhc_pre_mapping_fused_cutile = None
 
-_tilelang_import_error = None
 try:
-    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import mhc_post as mhc_post_tilelang
     from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
+        mhc_post as mhc_post_tilelang,
         mhc_pre_big_fuse as mhc_pre_big_fuse_tilelang,
-    )
-    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
         mhc_pre_gemm_sqrsum as mhc_pre_gemm_sqrsum_tilelang,
     )
-except (ModuleNotFoundError, OSError) as e:
-    _tilelang_import_error = e
-    mhc_pre_gemm_sqrsum_tilelang = None
-    mhc_pre_big_fuse_tilelang = None
+    _tilelang_available = True
+except Exception as _e:
+    _tilelang_available = False
     mhc_post_tilelang = None
+    mhc_pre_big_fuse_tilelang = None
+    mhc_pre_gemm_sqrsum_tilelang = None
 
 
 def _require_cutile():
-    if _cutile_import_error is not None:
+    if not _cutile_available:
         raise RuntimeError(
-            "CuTile backend is unavailable in current environment. "
-            "Please install cuda.tile and cuda.tile_experimental, "
-            "or switch backend to non-cutile."
-        ) from _cutile_import_error
+            "CuTile backend is unavailable. Install cuda.tile or use a different backend."
+        )
 
 
 def _require_tilelang():
-    if _tilelang_import_error is not None:
+    if not _tilelang_available:
         raise RuntimeError(
-            "TileLang backend is unavailable in current environment. "
-            "Please install tilelang and required CUDA runtime libraries "
-            "(e.g. libcudart/libnvrtc), or switch backend to non-tilelang."
-        ) from _tilelang_import_error
+            "TileLang backend is unavailable. Install tilelang or use a different backend."
+        )
 
 
 def sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:

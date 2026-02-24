@@ -10,8 +10,14 @@ from types import SimpleNamespace
 from typing import Dict, Tuple
 
 import cuda.tile as ct
-import cuda.tile_experimental as ct_experimental
 import torch
+
+try:
+    import cuda.tile_experimental as ct_experimental
+    _HAS_TILE_EXPERIMENTAL = True
+except (ModuleNotFoundError, ImportError, OSError):
+    ct_experimental = None  # type: ignore[misc, assignment]
+    _HAS_TILE_EXPERIMENTAL = False
 
 # Type aliases for constants
 ConstInt = ct.Constant[int]
@@ -22,14 +28,20 @@ _SPLIT_GEMM_CFG_CACHE: Dict[Tuple, SimpleNamespace] = {}
 _BIG_FUSE_CFG_CACHE: Dict[Tuple, SimpleNamespace] = {}
 _POST_MAPPING_CFG_CACHE: Dict[Tuple, SimpleNamespace] = {}
 
-# Set DISABLE_CUTILE_TUNE=1 to skip autotuning and use default configs (e.g. pytest).
+# Autotune only when cuda.tile_experimental is installed; otherwise use default configs.
+# Set DISABLE_CUTILE_TUNE=1 to force default configs even when tile_experimental is available.
 _AUTOTUNE_DISABLED = os.environ.get("DISABLE_CUTILE_TUNE", "0") == "1"
+
+
+def _autotune_enabled() -> bool:
+    """True only when tile_experimental is installed and autotune is not disabled."""
+    return _HAS_TILE_EXPERIMENTAL and not _AUTOTUNE_DISABLED
 
 
 def _default_split_gemm_cfg(N, max_split_k=None):
     """Conservative defaults when autotuning is disabled."""
     tile_n = 8 if N <= 8 else (16 if N <= 16 else 32)
-    split_k = 1 if (max_split_k is not None and max_split_k <= 1) else 1
+    split_k = min(4, max_split_k) if (max_split_k is not None and max_split_k >= 1) else 4
     return SimpleNamespace(
         TILE_SIZE_M=128,
         TILE_SIZE_N=tile_n,
@@ -41,12 +53,12 @@ def _default_split_gemm_cfg(N, max_split_k=None):
 
 def _default_big_fuse_cfg():
     """Conservative defaults when autotuning is disabled."""
-    return SimpleNamespace(TILE_SIZE_H=256, occupancy=2)
+    return SimpleNamespace(TILE_SIZE_H=512, occupancy=2)
 
 
 def _default_post_mapping_cfg():
     """Conservative defaults when autotuning is disabled."""
-    return SimpleNamespace(TILE_SIZE_C=512, occupancy=4)
+    return SimpleNamespace(TILE_SIZE_C=1024, occupancy=4)
 
 
 def _device_sm(device: torch.device) -> Tuple[int, int]:
@@ -130,7 +142,7 @@ def _sigmoid(x):
 # ============================================================================
 
 
-@ct.kernel
+@ct.kernel(occupancy=2)
 def mhc_split_gemm_rms_kernel(
     X,
     W,
@@ -190,12 +202,14 @@ def mhc_split_gemm_rms_kernel(
             latency=2,
         )
 
-        a_mma = ct.astype(a, mma_dtype)
-        b_mma = ct.astype(b, mma_dtype)
-        accumulator = ct.mma(a_mma, b_mma, acc=accumulator)
-
+        # Compute RMS from a BEFORE MMA conversion so a_fp32 dies before
+        # MMA accumulator registers are live — reduces peak register pressure.
         a_fp32 = ct.astype(a, ct.float32)
         rms_acc = rms_acc + ct.sum(a_fp32 * a_fp32, axis=1, keepdims=True)
+
+        a_mma = ct.astype(a_fp32, mma_dtype)
+        b_mma = ct.astype(b, mma_dtype)
+        accumulator = ct.mma(a_mma, b_mma, acc=accumulator)
 
     bid_m_k = bid_m + bid_k * num_bid_m
     ct.store(Y_acc, index=(bid_m_k, bid_n), tile=accumulator)
@@ -460,7 +474,7 @@ def mhc_post_mapping_kernel(
 
         out_tile = ct.astype(out_tile, Out.dtype)
         out_tile = ct.reshape(out_tile, (1, n, TILE_SIZE_C))
-        ct.store(Out, index=(row, 0, c_tile), tile=out_tile, latency=3)
+        ct.store(Out, index=(row, 0, c_tile), tile=out_tile, latency=4)
 
 
 # ============================================================================
@@ -497,7 +511,7 @@ def mhc_sinkhorn_kernel(
 # ============================================================================
 
 
-@ct.kernel
+@ct.kernel(occupancy=2)
 def mhc_big_fuse_kernel(
     Y_pp,  # [M, 2n] float32  – pre+post columns of GEMM output
     Y_res,  # [M, n²] float32  – res columns of GEMM output
@@ -655,15 +669,15 @@ def mhc_big_fuse_kernel(
             shape=(1, n, TILE_SIZE_H),
             padding_mode=ct.PaddingMode.ZERO,
             allow_tma=True,
-            latency=2,
+            latency=4,
         )
         all_x_2d = ct.reshape(all_x, (n, TILE_SIZE_H))
-        all_x_fp32 = ct.astype(all_x_2d, ct.float32)
 
         # Weighted sum: Σ_j pre_mix[j] * residual[token, j, h_tile]
+        # Per-row fp32 cast reduces peak live registers by (n-1)*TILE_SIZE_H.
         acc = ct.full((1, TILE_SIZE_H), 0.0, dtype=ct.float32)
         for j in range(n):
-            x_row = ct.extract(all_x_fp32, (j, 0), shape=(1, TILE_SIZE_H))
+            x_row = ct.astype(ct.extract(all_x_2d, (j, 0), shape=(1, TILE_SIZE_H)), ct.float32)
             pre_j = ct.extract(pre_mix, (0, j), shape=(1, 1))
             pre_j = ct.broadcast_to(pre_j, (1, TILE_SIZE_H))
             acc = acc + pre_j * x_row
@@ -723,7 +737,7 @@ def cutile_autotune_mhc_split_gemm_rms(stream, x, w, M, N, K, cfg=None, max_spli
         cached_cfg = _SPLIT_GEMM_CFG_CACHE.get(split_key)
         if cached_cfg is not None:
             cfg = SimpleNamespace(**vars(cached_cfg))
-        elif _AUTOTUNE_DISABLED:
+        elif not _autotune_enabled():
             cfg = _default_split_gemm_cfg(N, max_split_k)
     if cfg is not None:
         cfg = _to_cfg_namespace(cfg)
@@ -1006,7 +1020,7 @@ def mhc_post_mapping(
         cached_cfg = _POST_MAPPING_CFG_CACHE.get(cache_key)
         if cached_cfg is not None:
             cfg = SimpleNamespace(**vars(cached_cfg))
-        elif _AUTOTUNE_DISABLED:
+        elif not _autotune_enabled():
             cfg = _default_post_mapping_cfg()
 
     if cfg is not None:
@@ -1146,7 +1160,7 @@ def mhc_pre_mapping_fused(
         )
         if cached_big_cfg is not None:
             cfg_big_fuse = SimpleNamespace(**vars(cached_big_cfg))
-        elif _AUTOTUNE_DISABLED:
+        elif not _autotune_enabled():
             cfg_big_fuse = _default_big_fuse_cfg()
 
     if cfg_big_fuse is not None:
