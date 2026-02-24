@@ -782,9 +782,17 @@ class MewtwoGate(nn.Module):
             )
             self.e_score_correction_bias = None
         else:
-            self.e_score_correction_bias = nn.Parameter(torch.empty(num_experts, dtype=bias_dtype))
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty(num_experts, dtype=bias_dtype), requires_grad=False
+            )
 
         assert not apply_routing, "MewtwoGate routing is called inside MoE"
+
+        def fetch_e_score_correction_bias():
+            if not self.is_hashed:
+                return self.e_score_correction_bias.to(torch.float32)
+            else:
+                return None
 
         self._routing_method = MewtwoMoeRoutingMethod(
             top_k=self.top_k,
@@ -792,7 +800,7 @@ class MewtwoGate(nn.Module):
             topk_group=self.topk_group,
             routed_scaling_factor=self.routed_scaling_factor,
             # Pass a callable to fetch the tensor from MewtwoGate at runtime, ensuring it is on the correct device
-            callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
+            callable_e_score_correction_bias=fetch_e_score_correction_bias,
             callable_tid2eid=lambda: self.tid2eid,
             is_hashed=self.is_hashed,
         )
