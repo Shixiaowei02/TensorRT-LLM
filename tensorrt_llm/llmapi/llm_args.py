@@ -353,7 +353,7 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
     """
     Configuration for Mewtwo Sparse Attention.
     """
-    algorithm: ClassVar[str] = "mewtwo"
+    algorithm: Literal["mewtwo"] = "mewtwo"
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
@@ -369,10 +369,6 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
 
     index_topk: Optional[int] = Field(default=512,
                                       description="The topk for the indexer.")
-
-    @classmethod
-    def from_dict(cls, data: dict):
-        return cls(**data)
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
