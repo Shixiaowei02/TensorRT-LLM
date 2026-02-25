@@ -1743,7 +1743,8 @@ class Indexer(nn.Module):
                         torch.ops.trtllm.indexer_topk_prefill(
                             logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
                             topk_indices_buffer[
-                                chunk.token_start:chunk.token_end, :])
+                                chunk.token_start:chunk.token_end, :],
+                            self.index_topk)
                     else:
                         topk_indices = logits.topk(min(self.index_topk,
                                                        logits.shape[-1]),

@@ -777,8 +777,15 @@ class MewtwoGate(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
 
         if self.is_hashed:
+            # self.tid2eid = nn.Parameter(
+            #     torch.empty(vocab_size, top_k, dtype=torch.int32), requires_grad=False
+            # )
+            # WAR to avoid illegal expert indexes in hashed gating
             self.tid2eid = nn.Parameter(
-                torch.empty(vocab_size, top_k, dtype=torch.int32), requires_grad=False
+                torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(vocab_size)])
+                .to(torch.int32)
+                .contiguous(),
+                requires_grad=False,
             )
             self.e_score_correction_bias = None
         else:
@@ -804,14 +811,6 @@ class MewtwoGate(nn.Module):
             callable_tid2eid=lambda: self.tid2eid,
             is_hashed=self.is_hashed,
         )
-
-        # WAR to avoid illegal expert indexes in hashed gating
-        if self.is_hashed:
-            self.tid2eid.data.copy_(
-                torch.stack([torch.randperm(num_experts)[:top_k] for _ in range(vocab_size)]).to(
-                    torch.int32
-                )
-            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = torch.ops.trtllm.dsv3_router_gemm_op(
