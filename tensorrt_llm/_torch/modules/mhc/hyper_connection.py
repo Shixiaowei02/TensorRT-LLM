@@ -35,6 +35,19 @@ except Exception as _e:
     mhc_pre_big_fuse_tilelang = None
     mhc_pre_gemm_sqrsum_tilelang = None
 
+try:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
+        mhc_hc_head_cuda,
+        mhc_post_mapping_cuda,
+        mhc_pre_mapping_fused as mhc_pre_mapping_fused_cuda,
+    )
+    _cuda_available = True
+except Exception as _e:
+    _cuda_available = False
+    mhc_hc_head_cuda = None
+    mhc_post_mapping_cuda = None
+    mhc_pre_mapping_fused_cuda = None
+
 
 def _require_cutile():
     if not _cutile_available:
@@ -72,6 +85,7 @@ class mHC(nn.Module):
         post_mult_value: float = 1.0,
         n_splits: int = 1,
         backend: str = "tilelang",
+        cuda_use_mma: bool = False,
     ):
         super().__init__()
         self.mult = mult
@@ -84,6 +98,7 @@ class mHC(nn.Module):
         self.post_mult_value = post_mult_value
         self.n_splits = n_splits
         self.backend = backend
+        self.cuda_use_mma = cuda_use_mma
         self.mix_hc = (2 + self.mult) * self.mult
         self.hc_dim = self.mult * self.hidden_size
 
@@ -191,6 +206,39 @@ class mHC(nn.Module):
             comb_mix = comb_mix.view(*outer_shape, self.mult, self.mult)
             layer_input = layer_input.view(*outer_shape, self.hidden_size)
             return post_mix, comb_mix, layer_input
+        elif self.backend == "cuda":
+            if not _cuda_available:
+                raise RuntimeError(
+                    "Raw CUDA backend is unavailable. "
+                    "Ensure torch.utils.cpp_extension and CUDA toolkit are installed."
+                )
+            assert x.dtype == torch.bfloat16
+            assert self.mult == x.shape[-2]
+            assert self.hidden_size == x.shape[-1]
+            outer_shape = x.shape[:-2]
+            residual_flat = x.view(-1, self.mult, self.hidden_size)
+            num_tokens = residual_flat.shape[0]
+
+            post_mix, comb_mix, layer_input = mhc_pre_mapping_fused_cuda(
+                residual_flat.view(num_tokens, self.hc_dim),
+                self.fn.contiguous(),
+                residual_flat,
+                self.mult,
+                self.scale,
+                self.base,
+                self.hidden_size,
+                self.norm_eps,
+                self.eps,
+                self.sinkhorn_eps,
+                self.post_mult_value,
+                self.sinkhorn_iters,
+                use_mma=self.cuda_use_mma,
+            )
+
+            post_mix = post_mix.view(*outer_shape, self.mult, 1)
+            comb_mix = comb_mix.view(*outer_shape, self.mult, self.mult)
+            layer_input = layer_input.view(*outer_shape, self.hidden_size)
+            return post_mix, comb_mix, layer_input
         elif self.backend == "tilelang":
             _require_tilelang()
             assert x.dtype == torch.bfloat16
@@ -277,6 +325,26 @@ class mHC(nn.Module):
             B = residual_flat.shape[0]
 
             out = mhc_post_mapping_cutile(
+                residual_flat,
+                x.reshape(B, hidden),
+                post_layer_mix.view(B, n),
+                comb_res_mix.view(B, n, n),
+                n,
+            )
+            return out.view(*outer_shape, n, hidden)
+        elif self.backend == "cuda":
+            if not _cuda_available:
+                raise RuntimeError(
+                    "Raw CUDA backend is unavailable. "
+                    "Ensure torch.utils.cpp_extension and CUDA toolkit are installed."
+                )
+            outer_shape = residual.shape[:-2]
+            n = self.mult
+            hidden = residual.shape[-1]
+            residual_flat = residual.view(-1, n, hidden)
+            B = residual_flat.shape[0]
+
+            out = mhc_post_mapping_cuda(
                 residual_flat,
                 x.reshape(B, hidden),
                 post_layer_mix.view(B, n),
@@ -381,4 +449,20 @@ class HCHead(nn.Module):
             mixes = d * (s.unsqueeze(-1) / gemm_k + self.norm_eps).rsqrt()
             pre = torch.sigmoid(mixes * self.scale + self.base) + self.eps
             y = torch.sum(pre.unsqueeze(-1) * x_flat.float().view(shape), dim=1)
+            return y.to(dtype)
+        elif self.backend == "cuda":
+            if not _cuda_available:
+                raise RuntimeError("CUDA MHC kernels not available")
+            dtype = x.dtype
+            x_bf16 = x.to(torch.bfloat16).contiguous()
+            y = mhc_hc_head_cuda(
+                x_bf16,
+                self.fn,
+                self.scale,
+                self.base,
+                self.mult,
+                self.hidden_size,
+                norm_eps=self.norm_eps,
+                eps=self.eps,
+            )
             return y.to(dtype)

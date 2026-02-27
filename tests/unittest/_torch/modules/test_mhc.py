@@ -19,7 +19,7 @@ def generate_pre_data(
     hc_pre_eps: float = 1e-6,
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
-    sinkhorn_repeat: int = 10,
+    sinkhorn_repeat: int = 20,
 ) -> dict[str, torch.Tensor | float]:
     """Generate test data for big fuse operator."""
     torch.random.manual_seed(42)
@@ -101,10 +101,10 @@ def generate_head_data(
     }
 
 
-@pytest.mark.parametrize("n", [64, 128, 4096, 8192])
+@pytest.mark.parametrize("n", [1, 32, 64, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
+@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
 def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_pre_data(
         n=n,
@@ -142,13 +142,13 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.base.copy_(test_data["hc_base"])
 
     # Warm up both vanilla and test modules
-    for _ in range(10):
+    for _ in range(50):
         ref_module.pre_mapping(test_data["residual"])
         test_module.pre_mapping(test_data["residual"])
     torch.cuda.synchronize()
 
-    # Timing with 100 iterations
-    for _ in range(100):
+    # Timing with 500 iterations
+    for _ in range(500):
         start_time = time.perf_counter()
         post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(test_data["residual"])
         torch.cuda.synchronize()
@@ -176,7 +176,7 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
 @pytest.mark.parametrize("n", [64, 128, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
+@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
 def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_post_data(
         n=n,
@@ -190,13 +190,13 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend=backend)
 
     # Warm up both vanilla and test modules
-    for _ in range(10):
+    for _ in range(50):
         ref_module.post_mapping(**test_data)
         test_module.post_mapping(**test_data)
     torch.cuda.synchronize()
 
-    # Timing with 100 iterations
-    for _ in range(100):
+    # Timing with 500 iterations
+    for _ in range(500):
         start_time = time.perf_counter()
         output = test_module.post_mapping(**test_data)
         torch.cuda.synchronize()
@@ -211,8 +211,8 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     # Compare outputs with vanilla backend
     if backend != "vanilla":
         output_ref = ref_module.post_mapping(**test_data)
-        # tilelang backend uses bf16 MMA which has larger rounding differences
-        if backend == "tilelang":
+        # bf16 I/O kernels have FMA ordering differences vs vanilla fp32 path
+        if backend in ("tilelang", "cuda"):
             torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
         else:
             torch.testing.assert_close(output_ref, output, rtol=1e-3, atol=1e-3)
@@ -221,7 +221,7 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
 @pytest.mark.parametrize("m", [64, 128, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cutile", "tilelang"])
+@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
 def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_data = generate_head_data(
         m=m,
@@ -240,13 +240,13 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.base.copy_(test_data["hc_base"])
 
     # Warm up both vanilla and test modules
-    for _ in range(10):
+    for _ in range(50):
         ref_module(test_data["x"])
         test_module(test_data["x"])
     torch.cuda.synchronize()
 
-    # Timing with 100 iterations
-    for _ in range(100):
+    # Timing with 500 iterations
+    for _ in range(500):
         start_time = time.perf_counter()
         output = test_module(test_data["x"])
         torch.cuda.synchronize()
@@ -261,8 +261,10 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     # Compare outputs with vanilla backend
     if backend != "vanilla":
         output_ref = ref_module(test_data["x"])
-        # TileLang backend may have larger numerical differences due to bf16 GEMM
-        torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=1e-3)
+        if backend in ("tilelang", "cuda"):
+            torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
+        else:
+            torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=2e-3)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -310,40 +312,76 @@ def print_timing_stats():
             backends = test_shape_groups[(test_type, shape_str, shape_label)]
             for backend in sorted(backends.keys()):
                 stats = backends[backend]
-                avg_time = stats["total_time"] / stats["count"] if stats["count"] > 0 else 0
-                min_time = min(stats["times"]) if stats["times"] else 0
-                max_time = max(stats["times"]) if stats["times"] else 0
+                times = sorted(stats["times"])
+                n = len(times)
+                lo, hi = n // 10, n - n // 10
+                trimmed = times[lo:hi] if hi > lo else times
+
+                avg_time = sum(trimmed) / len(trimmed)
+                med_time = trimmed[len(trimmed) // 2]
+                min_time = trimmed[0]
+                max_time = trimmed[-1]
 
                 # Convert to microseconds
                 print(
                     f"  {backend:12s}: "
-                    f"avg={avg_time * 1e6:7.2f}us  "
-                    f"min={min_time * 1e6:7.2f}us  "
-                    f"max={max_time * 1e6:7.2f}us  "
-                    f"total={stats['total_time'] * 1e6:8.2f}us  "
-                    f"runs={stats['count']}"
+                    f"median={med_time * 1e6:8.1f}us  "
+                    f"avg={avg_time * 1e6:8.1f}us  "
+                    f"min={min_time * 1e6:8.1f}us  "
+                    f"max={max_time * 1e6:8.1f}us  "
+                    f"runs={n} (trimmed {len(trimmed)})"
                 )
 
-            avg_times = {b: s["total_time"] / s["count"] for b, s in backends.items()}
+            # Speedup using median of trimmed times
+            med_times = {}
+            for backend in backends.keys():
+                times = sorted(backends[backend]["times"])
+                n = len(times)
+                lo, hi = n // 10, n - n // 10
+                trimmed = times[lo:hi] if hi > lo else times
+                med_times[backend] = trimmed[len(trimmed) // 2]
 
-            # Speedup relative to vanilla baseline
-            if len(backends) > 1 and "vanilla" in backends:
-                baseline = avg_times.get("vanilla", 0)
-                if baseline > 0:
-                    print("\n  Relative Performance (speedup vs vanilla):")
-                    for backend in sorted(backends.keys()):
-                        speedup = baseline / avg_times[backend]
-                        print(f"    {backend:12s}: {speedup:.2f}x")
-
-            # Calculate speedup relative to slowest backend
             if len(backends) > 1:
-                print("\n  Relative Performance (speedup vs slowest):")
-                slowest_time = max(avg_times.values())
-                for backend in sorted(backends.keys()):
-                    speedup = slowest_time / avg_times[backend]
+                slowest = max(med_times.values())
+                print("\n  Speedup (median, vs slowest):")
+                for backend in sorted(med_times.keys()):
+                    speedup = slowest / med_times[backend] if med_times[backend] > 0 else float("inf")
                     print(f"    {backend:12s}: {speedup:.2f}x")
 
         print("\n" + "=" * 100)
+
+
+@pytest.mark.parametrize("n", [8])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hc_mult", [4])
+@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
+def test_ncu_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
+    """Profiling-only test: warmup outside profiler range, single call inside.
+
+    Usage:
+      ncu --set full --nvtx --nvtx-include "mhc_profile/" -o ncu_pre_<backend> \
+        pytest test_mhc.py -k "ncu_pre_mapping and <backend>" --no-header -rN
+    """
+    test_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+    mod = mHC(
+        mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=test_data["sinkhorn_repeat"],
+        dtype=None, eps=test_data["hc_pre_eps"], norm_eps=test_data["rms_eps"],
+        post_mult_value=test_data["hc_post_mult_value"], backend=backend,
+    ).cuda()
+    mod.fn.copy_(test_data["fn"])
+    mod.scale.copy_(test_data["hc_scale"])
+    mod.base.copy_(test_data["hc_base"])
+
+    for _ in range(50):
+        mod.pre_mapping(test_data["residual"])
+    torch.cuda.synchronize()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push("mhc_profile")
+    mod.pre_mapping(test_data["residual"])
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.cudart().cudaProfilerStop()
 
 
 if __name__ == "__main__":

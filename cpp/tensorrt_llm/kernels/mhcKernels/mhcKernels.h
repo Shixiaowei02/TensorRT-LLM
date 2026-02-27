@@ -1,0 +1,81 @@
+/*
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::mhc
+{
+
+void mhcBigFuseLaunch(
+    float const* y_acc,
+    float const* r_acc,
+    __nv_bfloat16 const* residual,
+    float const* hc_scale,
+    float const* hc_base,
+    float* post_mix,
+    float* comb_mix,
+    __nv_bfloat16* layer_input,
+    int M, int K, int hidden_size,
+    float rms_eps, float hc_pre_eps,
+    float hc_sinkhorn_eps, float hc_post_mult_value,
+    int sinkhorn_repeat,
+    cudaStream_t stream);
+
+void mhcSqrsumLaunch(
+    __nv_bfloat16 const* x,
+    float* r,
+    int M, int K,
+    cudaStream_t stream);
+
+void mhcGemmSqrsumFmaLaunch(
+    __nv_bfloat16 const* x,
+    float const* w_t,
+    float* y,
+    float* r,
+    int M, int N, int K,
+    int num_k_blocks, int k_chunk,
+    bool zero_outputs,
+    cudaStream_t stream);
+
+void mhcHcHeadApplyLaunch(
+    float const* mixes,
+    float const* sqrsum,
+    __nv_bfloat16 const* x,
+    __nv_bfloat16* out,
+    float const* scale,
+    float const* base,
+    int M, int mult, int hidden_size, int K,
+    float norm_eps, float eps,
+    cudaStream_t stream);
+
+void mhcPostMappingLaunch(
+    __nv_bfloat16 const* residual,
+    __nv_bfloat16 const* x,
+    float const* post_mix,
+    float const* comb_mix,
+    __nv_bfloat16* out,
+    int B, int hidden_size,
+    cudaStream_t stream);
+
+} // namespace kernels::mhc
+
+TRTLLM_NAMESPACE_END
