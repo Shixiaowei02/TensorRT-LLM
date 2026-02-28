@@ -98,8 +98,8 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
-    TORCH_CHECK(
-        indices.size(1) >= index_topk, "indices.size(1) must be >= index_topk, got ", indices.size(1), " < ", index_topk);
+    TORCH_CHECK(indices.size(1) >= index_topk, "indices.size(1) must be >= index_topk, got ", indices.size(1), " < ",
+        index_topk);
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];

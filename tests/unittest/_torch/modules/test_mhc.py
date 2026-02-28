@@ -345,7 +345,9 @@ def print_timing_stats():
                 slowest = max(med_times.values())
                 print("\n  Speedup (median, vs slowest):")
                 for backend in sorted(med_times.keys()):
-                    speedup = slowest / med_times[backend] if med_times[backend] > 0 else float("inf")
+                    speedup = (
+                        slowest / med_times[backend] if med_times[backend] > 0 else float("inf")
+                    )
                     print(f"    {backend:12s}: {speedup:.2f}x")
 
         print("\n" + "=" * 100)
@@ -364,9 +366,14 @@ def test_ncu_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     """
     test_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
     mod = mHC(
-        mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=test_data["sinkhorn_repeat"],
-        dtype=None, eps=test_data["hc_pre_eps"], norm_eps=test_data["rms_eps"],
-        post_mult_value=test_data["hc_post_mult_value"], backend=backend,
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=test_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=test_data["hc_pre_eps"],
+        norm_eps=test_data["rms_eps"],
+        post_mult_value=test_data["hc_post_mult_value"],
+        backend=backend,
     ).cuda()
     mod.fn.copy_(test_data["fn"])
     mod.scale.copy_(test_data["hc_scale"])

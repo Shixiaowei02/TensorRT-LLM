@@ -192,7 +192,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
-    def _build_pool_mapping_tensors(self, _: KvCacheConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
         swa_pool_ptr = self.impl.get_mem_pool_base_address(
             self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY

@@ -1140,7 +1140,11 @@ class MewtwoDecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         self.hc_attn = mHC(
-            config.hc_mult, config.hidden_size, config.hc_sinkhorn_iters, dtype=torch.float32
+            config.hc_mult,
+            config.hidden_size,
+            config.hc_sinkhorn_iters,
+            dtype=torch.float32,
+            backend="cuda",
         )
 
         layer_idx_for_attention = layer_idx
@@ -1160,7 +1164,11 @@ class MewtwoDecoderLayer(DecoderLayer):
         self.enable_fusion &= not self.enable_attention_dp
 
         self.hc_ffn = mHC(
-            config.hc_mult, config.hidden_size, config.hc_sinkhorn_iters, dtype=torch.float32
+            config.hc_mult,
+            config.hidden_size,
+            config.hc_sinkhorn_iters,
+            dtype=torch.float32,
+            backend="cuda",
         )
 
         # FIXME: incompatible with mixed quantization mode
@@ -1583,7 +1591,7 @@ class MewtwoModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.hc_head = HCHead(config.hc_mult, config.hidden_size, backend="vanilla")
+        self.hc_head = HCHead(config.hc_mult, config.hidden_size, backend="cuda")
 
         self.layers = nn.ModuleList(
             [

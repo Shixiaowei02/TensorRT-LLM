@@ -12,7 +12,6 @@ cuBLAS wrapper (cpp/tensorrt_llm/thop/mhcOp.cpp):
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Python API — low-level (kernel-level interfaces)
 # ---------------------------------------------------------------------------
@@ -37,11 +36,22 @@ def mhc_big_fuse_cuda(
     sinkhorn_repeat: int,
 ):
     torch.ops.trtllm.mhc_big_fuse(
-        y_acc, r_acc, residual, hc_scale, hc_base,
-        post_mix, comb_mix, layer_input,
-        M, K, hidden_size,
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat,
+        y_acc,
+        r_acc,
+        residual,
+        hc_scale,
+        hc_base,
+        post_mix,
+        comb_mix,
+        layer_input,
+        M,
+        K,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
     )
 
 
@@ -99,8 +109,15 @@ def mhc_gemm_rms_fma_cuda(
     r_acc = torch.empty((M,), dtype=torch.float32, device=x.device)
 
     torch.ops.trtllm.mhc_gemm_sqrsum_fma(
-        x, w_t, y_acc, r_acc,
-        M, N, K, num_k_blocks, k_chunk,
+        x,
+        w_t,
+        y_acc,
+        r_acc,
+        M,
+        N,
+        K,
+        num_k_blocks,
+        k_chunk,
     )
 
     return y_acc, r_acc
@@ -150,9 +167,7 @@ def mhc_pre_mapping_fused(
 
     post_mix = torch.empty((M, n), dtype=torch.float32, device=x.device)
     comb_mix = torch.empty((M, n2), dtype=torch.float32, device=x.device)
-    layer_input = torch.empty(
-        (M, hidden_size), dtype=torch.bfloat16, device=x.device
-    )
+    layer_input = torch.empty((M, hidden_size), dtype=torch.bfloat16, device=x.device)
 
     mhc_big_fuse_cuda(
         y_acc.contiguous(),
@@ -163,9 +178,14 @@ def mhc_pre_mapping_fused(
         post_mix,
         comb_mix,
         layer_input,
-        M, K, hidden_size,
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat,
+        M,
+        K,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
     )
 
     return post_mix, comb_mix, layer_input
@@ -205,8 +225,13 @@ def mhc_post_mapping_cuda(
     out = torch.empty((B, n, hidden_size), dtype=torch.bfloat16, device=x.device)
 
     torch.ops.trtllm.mhc_post_mapping(
-        residual, x, post_mix, comb_mix, out,
-        B, hidden_size,
+        residual,
+        x,
+        post_mix,
+        comb_mix,
+        out,
+        B,
+        hidden_size,
     )
 
     return out
@@ -250,16 +275,29 @@ def mhc_hc_head_cuda(
     base = base.to(torch.float32).contiguous()
 
     mixes, sqrsum = mhc_gemm_rms_fma_cuda(
-        x_flat, None, M, mult, K, w_t=fn_t,
+        x_flat,
+        None,
+        M,
+        mult,
+        K,
+        w_t=fn_t,
     )
 
     out = torch.empty((M, hidden_size), dtype=torch.bfloat16, device=x.device)
 
     torch.ops.trtllm.mhc_hc_head_apply(
-        mixes, sqrsum, x.reshape(M, mult, hidden_size).contiguous(), out,
-        scale, base,
-        M, mult, hidden_size, K,
-        float(norm_eps), float(eps),
+        mixes,
+        sqrsum,
+        x.reshape(M, mult, hidden_size).contiguous(),
+        out,
+        scale,
+        base,
+        M,
+        mult,
+        hidden_size,
+        K,
+        float(norm_eps),
+        float(eps),
     )
 
     return out

@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float
@@ -245,7 +246,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cache_name="cu_seq_lens_cuda",
             capture_graph=capture_graph,
         )
-        self.cu_seq_lens = torch.empty_like(self.cu_seq_lens_cuda, device="cpu", pin_memory=True)
+        self.cu_seq_lens = torch.empty_like(
+            self.cu_seq_lens_cuda, device="cpu", pin_memory=prefer_pinned()
+        )
         self.cu_seq_lens[0] = 0
 
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
@@ -261,7 +264,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.new_comp_kv_lens = {
             compress_ratio: torch.empty_like(
-                self.new_comp_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=True
+                self.new_comp_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -279,7 +282,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.cu_new_comp_kv = {
             compress_ratio: torch.empty_like(
-                self.cu_new_comp_kv_cuda[compress_ratio], device="cpu", pin_memory=True
+                self.cu_new_comp_kv_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -299,7 +302,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.compressed_kv_lens = {
             compress_ratio: torch.empty_like(
-                self.compressed_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=True
+                self.compressed_kv_lens_cuda[compress_ratio],
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -317,7 +322,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.past_kv_lens = {
             compress_ratio: torch.empty_like(
-                self.past_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=True
+                self.past_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -335,7 +340,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.compressed_position_ids = {
             compress_ratio: torch.empty_like(
-                self.compressed_position_ids_cuda[compress_ratio], device="cpu", pin_memory=True
+                self.compressed_position_ids_cuda[compress_ratio],
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -393,7 +400,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.host_cache_buffer_block_offsets = {
             compress_ratio: torch.empty_like(
-                self.cache_buffer_block_offsets[compress_ratio], device="cpu", pin_memory=True
+                self.cache_buffer_block_offsets[compress_ratio],
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -410,7 +419,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         self.host_block_tables = {
             attention_type: torch.empty_like(
-                self.block_tables[attention_type], device="cpu", pin_memory=True
+                self.block_tables[attention_type], device="cpu", pin_memory=prefer_pinned()
             )
             for attention_type in self.attention_type_set
         }

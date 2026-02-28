@@ -10,10 +10,17 @@ from tensorrt_llm.deep_gemm import tf32_hc_prenorm_gemm
 try:
     from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_apply_residual as mhc_apply_residual_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_gemm_rms_scale as mhc_gemm_rms_scale_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_post_mapping as mhc_post_mapping_cutile,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_cutile import (
         mhc_pre_mapping_fused as mhc_pre_mapping_fused_cutile,
     )
+
     _cutile_available = True
 except Exception as _e:
     _cutile_available = False
@@ -23,11 +30,14 @@ except Exception as _e:
     mhc_pre_mapping_fused_cutile = None
 
 try:
+    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import mhc_post as mhc_post_tilelang
     from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
-        mhc_post as mhc_post_tilelang,
         mhc_pre_big_fuse as mhc_pre_big_fuse_tilelang,
+    )
+    from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
         mhc_pre_gemm_sqrsum as mhc_pre_gemm_sqrsum_tilelang,
     )
+
     _tilelang_available = True
 except Exception as _e:
     _tilelang_available = False
@@ -36,11 +46,11 @@ except Exception as _e:
     mhc_pre_gemm_sqrsum_tilelang = None
 
 try:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import mhc_hc_head_cuda, mhc_post_mapping_cuda
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
-        mhc_hc_head_cuda,
-        mhc_post_mapping_cuda,
         mhc_pre_mapping_fused as mhc_pre_mapping_fused_cuda,
     )
+
     _cuda_available = True
 except Exception as _e:
     _cuda_available = False
