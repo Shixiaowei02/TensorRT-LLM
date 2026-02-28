@@ -1666,6 +1666,72 @@ class Indexer(nn.Module):
                                                     k_cache, flat_indices_fp8,
                                                     flat_indices_scale)
 
+    def _gather_k_cache_for_chunk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        chunk: IndexerPrefillChunkMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather K values from indexer cache for a specific chunk.
+
+        Uses pre-computed extended slot mappings that cover cached + current batch context tokens.
+        chunk.k_token_start/k_token_end directly index into the extended slot mapping.
+
+        Args:
+            metadata: Attention metadata
+            chunk: Chunk metadata with k_token_start/end as indices into extended slot mapping
+
+        Returns:
+            k_fp8: FP8 quantized k tensor, shape [num_k_tokens, head_dim]
+            k_scale: Scaling factors, shape [num_k_tokens, 1]
+        """
+        assert metadata.slot_mapping_fp8_fullkv is not None, \
+            "_gather_k_cache_for_chunk requires extended slot mappings (only available with cached tokens)"
+
+        k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
+            self.layer_idx)
+
+        head_dim = self.head_dim
+        scale_size = 4  # float32 = 4 bytes
+
+        # Extract slot mappings using chunk's k_token_start/end
+        # These indices point directly into the extended slot mapping array
+        k_token_start = chunk.k_token_start
+        k_token_end = chunk.k_token_end
+        num_k_tokens = k_token_end - k_token_start
+
+        slot_mapping_fp8_chunk = metadata.slot_mapping_fp8_fullkv[
+            k_token_start:k_token_end]
+        slot_mapping_scale_chunk = metadata.slot_mapping_scale_fullkv[
+            k_token_start:k_token_end]
+
+        # Vectorized gather using pre-computed slot mappings
+        # Gather FP8 data
+        byte_offsets_fp8 = torch.arange(
+            head_dim, device=k_cache.device).unsqueeze(0)  # [1, head_dim]
+        gather_indices_fp8 = slot_mapping_fp8_chunk.unsqueeze(
+            1) + byte_offsets_fp8  # [num_k_tokens, head_dim]
+        assert (gather_indices_fp8
+                >= k_cache.numel()).sum() == 0, "Out-of-bounds access detected"
+        gather_indices_fp8 = _unravel_indices(gather_indices_fp8, k_cache.shape)
+        k_fp8_bytes = k_cache[gather_indices_fp8]
+        k_fp8 = k_fp8_bytes.view(torch.float8_e4m3fn).view(
+            num_k_tokens, head_dim)
+
+        # Gather scale data
+        byte_offsets_scale = torch.arange(
+            scale_size, device=k_cache.device).unsqueeze(0)  # [1, 4]
+        gather_indices_scale = slot_mapping_scale_chunk.unsqueeze(
+            1) + byte_offsets_scale  # [num_k_tokens, 4]
+        assert (gather_indices_scale
+                >= k_cache.numel()).sum() == 0, "Out-of-bounds access detected"
+        gather_indices_scale = _unravel_indices(gather_indices_scale,
+                                                k_cache.shape)
+        k_scale_bytes = k_cache[gather_indices_scale]
+        k_scale = k_scale_bytes.view(torch.float32).view(num_k_tokens, 1)
+
+        return k_fp8, k_scale
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
