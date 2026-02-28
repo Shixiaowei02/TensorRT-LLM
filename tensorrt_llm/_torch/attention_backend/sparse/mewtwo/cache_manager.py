@@ -1,11 +1,15 @@
-import math
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2, Role
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    get_size_in_bytes,
+    prefer_pinned,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
@@ -19,7 +23,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     HostCacheTierConfig,
     LayerId,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
 from .mewtwo import (
@@ -67,18 +70,20 @@ class MewtwoCacheManager(KVCacheManagerV2):
     ) -> None:
         # Mewtwo specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "Mewtwo only supports SELFKONLY"
-        assert num_kv_heads == 1, "Mewtwo only supports MQA, num_kv_heads must be 1"
+        assert num_kv_heads == 1, "Mewtwo only supports num_kv_heads == 1"
         assert len(sparse_attn_config.compress_ratios) == num_layers, (
             "The length of compress ratios must be equal to the number of layers"
         )
-        # use tokens_per_block == 128 to ensure token is contiguous in the compressed cache
-        # TODO(jiaganc): remove this after cache manager supports per layer tokens_per_block
-        assert tokens_per_block == 128, "Mewtwo requires tokens_per_block == 128"
         assert dtype in [DataType.BF16, DataType.FP8], (
             f"Unsupported dtype: {dtype}, only support BF16 and FP8"
         )
-        assert compressor_dtype in [DataType.FLOAT, DataType.FP8], (
-            f"Unsupported compressor dtype: {compressor_dtype}, only support FP32 and FP8"
+        assert compressor_dtype == DataType.FLOAT, (
+            f"Unsupported compressor dtype: {compressor_dtype}, only support FP32/TF32"
+        )
+
+        assert tokens_per_block in [128, 256], (
+            f"MewtwoCacheManager requires tokens_per_block in [128, 256], got {tokens_per_block}. "
+            f"Set kv_cache_config.tokens_per_block to 128 or 256."
         )
 
         self.index_head_dim = sparse_attn_config.index_head_dim
@@ -115,53 +120,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True  # Mewtwo must has VSWA
-        # delete the manager created in super().__init__()
-        del self.impl
-
-        # Create the KVCacheManagerPy
-        self._create_cache_manager(
-            tokens_per_block=tokens_per_block,
-            kv_cache_config=kv_cache_config,
-            vocab_size=vocab_size,
-        )
-
-        # Used by the KVCacheManagerV2
-        self.num_pools = len(self.impl.layer_grouping)
-        self.layer_to_pool_mapping_dict = {
-            layer_id: self.impl.get_layer_group_id(layer_id)
-            for layer_id in range(self._num_manager_layers)
-        }
-        # Mapping from (pool_id, req_idx, kv) to block indices
-        # layer/attn in the same pool will share the same block indices
-        self.host_kv_cache_block_offsets = torch.empty(
-            (
-                self.num_pools,
-                (max_batch_size + 1) * max_beam_width,
-                1,
-                self.max_blocks_per_seq,
-            ),
-            dtype=torch.int32,
-            pin_memory=True,
-            device="cpu",
-        )
-        # TODO(jiaganc): get_num_available_tokens will hang in some cases, skip this to workaround
-        # max_num_tokens = self.get_num_available_tokens()
-        # if max_seq_len > max_num_tokens:
-        #     logger.warning(
-        #         f"max_seq_len {max_seq_len} is greater than max_num_tokens {max_num_tokens} that can be allocated"
-        #         f" in kv cache manager, setting max_seq_len to {max_num_tokens}"
-        #     )
-        # self.max_seq_len = min(max_seq_len, max_num_tokens)
-        self.max_seq_len = max_seq_len
 
         # Mewtwo expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
         self._assert_layer_pool_scale()
 
-        swa_pool_ptr = self.impl.get_mem_pool_base_address(
+        # For Mewtwo Attention, the base pointer for SWA pool
+        self.swa_pool_ptr = self.impl.get_mem_pool_base_address(
             self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY
         )
-        self.swa_pool_ptr = swa_pool_ptr
 
         self.compress_pool_ptrs = {}
         if 4 in self._compress_ratios:  # indexer compressor
@@ -178,31 +145,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 ],
                 Role.KEY,
             )
-
-        swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
-
-        def _get_layer_offset(layer_idx: int) -> int:
-            buffer_ptr = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[layer_idx, MewtwoAttentionType.SWA], Role.KEY
-            )
-            return (buffer_ptr - swa_pool_ptr) // swa_bytes_per_block
-
-        # Tensors for compatibility with AttentionOp, only contains swa attention.
-        # Assume the SWA of all layers share the same pool.
-        # shape: [1, 2]
-        self.kv_cache_pool_pointers = torch.tensor(
-            [[swa_pool_ptr, 0]],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        )
-        # shape: [num_local_layers, 2]
-        self.kv_cache_pool_mapping = torch.tensor(
-            [[0, _get_layer_offset(layer_idx)] for layer_idx in range(self.num_local_layers)],
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
 
     def get_buffers(self, layer_idx: int, attn_type: MewtwoAttentionType) -> torch.Tensor:
         """
@@ -250,6 +192,36 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
+    def _build_pool_mapping_tensors(self, _: KvCacheConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+        swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
+        swa_pool_ptr = self.impl.get_mem_pool_base_address(
+            self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY
+        )
+
+        def _get_layer_offset(layer_idx: int) -> int:
+            buffer_ptr = self.impl.get_mem_pool_base_address(
+                self._layer_attn_to_layer_id[layer_idx, MewtwoAttentionType.SWA], Role.KEY
+            )
+            return (buffer_ptr - swa_pool_ptr) // swa_bytes_per_block
+
+        # Tensors for compatibility with AttentionOp, only contains swa attention.
+        # Assume the SWA of all layers share the same pool.
+        # shape: [1, 2]
+        kv_cache_pool_pointers = torch.tensor(
+            [[swa_pool_ptr, 0]],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        # shape: [num_local_layers, 2]
+        kv_cache_pool_mapping = torch.tensor(
+            [[0, _get_layer_offset(layer_idx)] for layer_idx in range(self.num_local_layers)],
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
     def get_cache_indices(
         self,
         request_id: int,
@@ -273,57 +245,23 @@ class MewtwoCacheManager(KVCacheManagerV2):
         scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
         return [idx * scale if idx != -1 else -1 for idx in base_indices]
 
-    def _create_cache_manager(
+    def _get_cache_quota(self, max_tokens: int) -> int:
+        quota = int(max_tokens * self.get_cache_bytes_per_token())
+        # Add extra quota to ensure sufficient space for small max_tokens cases.
+        quota += len(MewtwoAttentionType) * (2 << 20)
+        return quota
+
+    def _build_cache_config(
         self,
-        tokens_per_block: int,
         kv_cache_config: KvCacheConfig,
-        vocab_size: int,
-    ) -> None:
+        *,
+        tokens_per_block: int,
+        vocab_size: int | None,
+        cache_tiers: List[GpuCacheTierConfig | HostCacheTierConfig],
+    ) -> KVCacheManagerConfigPy:
         """
-        Create the cache manager for Mewtwo.
+        Create the cache manager config for Mewtwo.
         """
-        # Calculate the quota for KV cache
-        quota = float("inf")
-        if kv_cache_config.max_tokens is not None:
-            quota = int(
-                math.ceil(
-                    kv_cache_config.max_tokens
-                    * self._get_cache_bytes_per_token()
-                    / kv_cache_config.max_util_for_resume
-                )
-            )
-            # Add extra quota to ensure sufficient space for small max_tokens cases.
-            quota += len(MewtwoAttentionType) * (2 << 20)
-            if kv_cache_config.free_gpu_memory_fraction is not None:
-                logger.warning(
-                    f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens}"
-                    f"and {kv_cache_config.free_gpu_memory_fraction}, the smaller value will be used."
-                )
-        if (
-            kv_cache_config.max_gpu_total_bytes is not None
-            and kv_cache_config.max_gpu_total_bytes > 0
-        ):
-            if quota > int(kv_cache_config.max_gpu_total_bytes):
-                logger.warning(
-                    f"max_gpu_total_bytes {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB is smaller than "
-                    f"the calculated quota {quota / (1 << 30)}GiB, clamping quota to "
-                    f"{kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB"
-                )
-            quota = min(quota, int(kv_cache_config.max_gpu_total_bytes))
-
-        assert quota != float("inf"), (
-            "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
-        )
-
-        logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
-
-        cache_tiers = [GpuCacheTierConfig(quota=quota)]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
-            cache_tiers.append(HostCacheTierConfig(quota=kv_cache_config.host_cache_size))
-            logger.info(
-                f"KV cache manager v2 host cache quota set to {kv_cache_config.host_cache_size / (1 << 30)}GiB"
-            )
-
         layers: List[AttentionLayerConfig] = []
         layer_attn_to_layer_id: Dict[Tuple[int, MewtwoAttentionType], LayerId] = {}
 
@@ -386,16 +324,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
-        config = KVCacheManagerConfigPy(
+        return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             layers=layers,
         )
-        # these two attributes are used by the KVCacheManagerV2
-        self.kv_cache_manager_py_config = config
-        self.impl = KVCacheManagerPy(config)
 
     def _assert_layer_pool_scale(self) -> None:
         attn_ratio_to_pool_id = defaultdict[MewtwoAttentionType, dict[int, int]](lambda: {})
@@ -469,10 +404,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
         return token_bytes * block_size
 
-    def _get_cache_bytes_per_token(self) -> int:
-        """
-        Get the average cache bytes per token for Mewtwo. This helper function is used to estimate the cache quota.
-        """
+    def get_cache_bytes_per_token(self) -> int:
+        """Get the average cache bytes per token for Mewtwo."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
         return self._estimate_bytes_per_token(
@@ -480,6 +413,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+        )
+
+    def get_layer_bytes_per_token(
+        self,
+        local_layer_idx: int,
+        data_role: Role,
+    ) -> int:
+        raise NotImplementedError(
+            "Mewtwo doesn't support get_layer_bytes_per_token, use _get_attn_bytes_per_block"
         )
 
     @staticmethod

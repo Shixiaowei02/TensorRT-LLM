@@ -28,7 +28,10 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 import torch
 import triton
@@ -1632,6 +1635,10 @@ class MewtwoModel(DecoderModel):
 
 @register_auto_model("MewtwoForCausalLM")
 class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfig]):
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return {"kv_cache_config": {"tokens_per_block": 128}}
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
         # Note: Currently the usage of mapping is all over the place making its usage brittle
