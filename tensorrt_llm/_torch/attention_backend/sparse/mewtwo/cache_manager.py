@@ -71,8 +71,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # Mewtwo specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "Mewtwo only supports SELFKONLY"
         assert num_kv_heads == 1, "Mewtwo only supports num_kv_heads == 1"
-        assert len(sparse_attn_config.compress_ratios) == num_layers, (
-            "The length of compress ratios must be equal to the number of layers"
+        assert len(sparse_attn_config.compress_ratios) >= num_layers, (
+            "The length of compress ratios must be >= the number of layers"
         )
         assert dtype in [DataType.BF16, DataType.FP8], (
             f"Unsupported dtype: {dtype}, only support BF16 and FP8"
@@ -88,11 +88,24 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
         self.index_head_dim = sparse_attn_config.index_head_dim
         self._compress_ratios = sparse_attn_config.compress_ratios
-        self._window_size = sparse_attn_config.window_size
+        # When MTP is enabled, enlarge the sliding window sizes by
+        # max_draft_len so that rewinding rejected draft tokens can still
+        # reach the KV entries that would otherwise have been evicted by the
+        # sliding-window policy.
+        spec_config = kwargs.get("spec_config", None)
+        self._max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
+        self._window_size = sparse_attn_config.window_size + self._max_draft_len
         self._compressor_dtype = compressor_dtype
-        self.compressed_block_sizes = [
-            tokens_per_block // self._compress_ratios[i] for i in range(num_layers)
-        ]
+        # If MTP is enabled, append compress ratios for MTP virtual layers.
+        # MTP adds (max_draft_len - 1) extra layers that mirror the last real
+        # layer's attention pattern.  Only NEW entries are appended; existing
+        # per-layer ratios are never modified, so a real layer with ratio==1
+        # stays SWA-only.
+        if self._max_draft_len > 0:
+            self._compress_ratios = self._compress_ratios + [self._compress_ratios[-1]] * (
+                self._max_draft_len - 1
+            )
+        self.compressed_block_sizes = [tokens_per_block // ratio for ratio in self._compress_ratios]
 
         # indexer kv cache use blockwise FP8 quantization
         self._indexer_dtype = DataType.FP8
@@ -301,8 +314,10 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 # compressed attention pool
                 _add_layer(layer, MewtwoAttentionType.COMPRESS, None)
                 # compressor state, managed as a sliding window attention cache,
-                # including compressor kv states and compressor score states
-                compressor_window = state_factor * compress_ratio
+                # including compressor kv states and compressor score states.
+                # Add max_draft_len so rewind after rejected draft tokens can
+                # still reach past states.
+                compressor_window = state_factor * compress_ratio + self._max_draft_len
                 _add_layer(layer, MewtwoAttentionType.COMPRESSOR_STATE, compressor_window)
                 _add_layer(layer, MewtwoAttentionType.COMPRESSOR_SCORE, compressor_window)
 
@@ -312,7 +327,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 _add_layer(layer, MewtwoAttentionType.INDEXER_COMPRESS, None)
                 # indexer has its own compressor, so a separate compressor state
                 # similarly, indexer compressor state is managed as a sliding window attention cache
-                indexer_compressor_window = state_factor * compress_ratio
+                indexer_compressor_window = state_factor * compress_ratio + self._max_draft_len
                 _add_layer(
                     layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE, indexer_compressor_window
                 )

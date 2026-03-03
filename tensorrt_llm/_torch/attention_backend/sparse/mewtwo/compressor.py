@@ -175,7 +175,6 @@ class Compressor(nn.Module):
             )
 
         if num_generations > 0:
-            num_gen_tokens = metadata.num_tokens - num_ctx_tokens
             kv_compress_cutile(
                 kv_score=kv_score[num_ctx_tokens:],
                 ape=self.ape,
@@ -193,7 +192,7 @@ class Compressor(nn.Module):
                 head_dim=self.head_dim,
                 overlap=self.overlap,
                 page_size=state_tokens_per_block,
-                next_n=num_gen_tokens // num_generations,
+                next_n=metadata.num_gen_tokens_per_seq,
             )
 
         # If there are no compressed tokens, there should be no generation requests.

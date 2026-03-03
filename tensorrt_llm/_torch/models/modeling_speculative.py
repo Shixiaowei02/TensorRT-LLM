@@ -807,6 +807,9 @@ class MTPForCausalLM(nn.Module):
             case "nemotron_h":
                 from .modeling_nemotron_h import NemotronHMTP
                 mtp_layer = NemotronHMTP
+            case "mewtwo":
+                from .modeling_mewtwo import MewtwoMTP
+                mtp_layer = MewtwoMTP
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
@@ -858,6 +861,12 @@ class MTPDraftModel(nn.Module):
                                      layer_idx,
                                      aux_stream_dict,
                                      is_separate_draft_engine=False)
+        elif model_type == "mewtwo":
+            from .modeling_mewtwo import MewtwoMTP
+            mtp_layer = MewtwoMTP(model_config,
+                                  layer_idx,
+                                  aux_stream_dict,
+                                  is_separate_draft_engine=True)
         else:
             raise ValueError(
                 f"MTPDraftModel does not support model_type: {model_type}")

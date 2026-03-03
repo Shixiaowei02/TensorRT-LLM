@@ -716,6 +716,11 @@ class MewtwoAttention(MLA):
         config = model_config.pretrained_config
         assert config.qk_rope_head_dim == 64, "MewtwoAttention only supports qk_rope_head_dim=64"
         assert config.kv_lora_rank == 448, "MewtwoAttention only supports kv_lora_rank=448"
+        predicted_tokens_per_seq = (
+            model_config.spec_config.tokens_per_gen_step
+            if model_config.spec_config is not None
+            else 1
+        )
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -725,7 +730,7 @@ class MewtwoAttention(MLA):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
-            predicted_tokens_per_seq=1,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
             pos_embd_params=PositionalEmbeddingParams(

@@ -1123,6 +1123,27 @@ class MTPEagleWorker(MTPWorker):
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
         self._is_mamba_hybrid_cache = None
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        # Save kv_lens_cuda values separately instead of routing through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+
     @torch.compile(options={"max-autotune": True})
     def update_draft_tokens(self, next_draft_tokens, new_draft_token,
                             hidden_states, gather_ids, inputs):
@@ -1266,46 +1287,54 @@ class MTPEagleWorker(MTPWorker):
                 hidden_states, position_ids = self.update_draft_tokens(
                     next_draft_tokens, new_draft_token, hidden_states,
                     gather_ids, inputs)
-                # update attn_metadata
-                if i == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
-                    # cannot run generation if there is no kv cache
-                    has_kv_cache = inputs[
-                        "attn_metadata"].kv_cache_manager is not None
-                    if has_kv_cache:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
-                        attn_metadata.num_contexts = 0
-                    # update kv_lens_cuda
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            self.mtp_num_modules -
-                            num_accepted_tokens[num_contexts:])
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                    # update metadata for flash mla
-                    if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
-                        reorder_block_ids_per_seq = torch.cat([
-                            attn_metadata.
-                            kv_block_ids_per_seq[num_contexts:batch_size],
-                            attn_metadata.kv_block_ids_per_seq[:num_contexts]
-                        ])
-                        attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
-                            reorder_block_ids_per_seq, non_blocking=True)
-                    # update metadata
-                    # some attention metadata needs to be updated when changing seq_lens/kv_lens
-                    attn_metadata.update_for_spec_dec()
-                    # Disable spec-dec mode for subsequent iterations (i>0)
-                    # as draft model only infer 1 token for the subsequent inference.
-                    attn_metadata.use_spec_decoding = False
-                elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                    # update kv_lens_cuda
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+                # Update attn_metadata for subsequent MTP layers.
+                # Skip on the last layer — no subsequent layer exists.
+                if i < self.mtp_num_modules - 1:
+                    if i == 0:
+                        attn_metadata._seq_lens[:batch_size].fill_(1)
+                        attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+                        attn_metadata.on_update()
+                        # cannot run generation if there is no kv cache
+                        has_kv_cache = (inputs["attn_metadata"].kv_cache_manager
+                                        is not None)
+                        if has_kv_cache:
+                            attn_metadata.host_request_types[:attn_metadata.
+                                                             num_contexts].fill_(
+                                                                 1)
+                            attn_metadata.num_contexts = 0
+                        # update kv_lens_cuda
+                        if hasattr(attn_metadata, 'kv_lens_cuda'):
+                            kv_lens = attn_metadata.kv_lens_cuda
+                            kv_lens[num_contexts:batch_size] -= (
+                                self.mtp_num_modules -
+                                num_accepted_tokens[num_contexts:])
+                            kv_lens[:num_contexts] += 1
+                        # update metadata for flash mla
+                        if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
+                            reorder_block_ids_per_seq = torch.cat([
+                                attn_metadata.
+                                kv_block_ids_per_seq[num_contexts:batch_size],
+                                attn_metadata.
+                                kv_block_ids_per_seq[:num_contexts],
+                            ])
+                            attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
+                                reorder_block_ids_per_seq, non_blocking=True)
+                        # some attention metadata needs to be updated
+                        # when changing seq_lens/kv_lens
+                        attn_metadata.update_for_spec_dec()
+                        # Disable spec-dec mode for subsequent iterations (i>0)
+                        # as draft model only infer 1 token for the subsequent inference.
+                        attn_metadata.use_spec_decoding = False
+                    elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
-                    # update metadata
-                    # some attention metadata needs to be updated when changing kv_lens
-                    attn_metadata.update_for_spec_dec()
+                        @torch.compile(options={"max-autotune": True})
+                        def update_kv_lens(kv_lens_cuda, batch_size):
+                            kv_lens_cuda[:batch_size] += 1
+
+                        update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
+                        # some attention metadata needs to be updated
+                        # when changing kv_lens
+                        attn_metadata.update_for_spec_dec()
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,

@@ -478,16 +478,12 @@ class KVCacheManager(BaseResourceManager):
             assert len(
                 blocks_per_window
             ) == 1, "Only one window size is supported for non-self KV cache"
-            # For sliding window (window < max_seq_len), keep the window size in blocks_per_window
-            # Only rewrite when not using sliding window (window >= max_seq_len)
-            # TODO(yuhangh): revert this after KVCacheManagerV2 is enabled
-            if self.max_attention_window_vec[0] >= self.max_seq_len:
-                memory_pools = blocks_per_window[
-                    self.max_attention_window_vec[0]]
-                blocks_per_window = {self.max_seq_len: memory_pools}
-                logger.info(
-                    f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
-                )
+            # rewrite the attention window size in blocks_per_window
+            memory_pools = blocks_per_window[self.max_attention_window_vec[0]]
+            blocks_per_window = {self.max_seq_len: memory_pools}
+            logger.info(
+                f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
+            )
 
         # Set up temp_attention_window_inputs
         temp_attention_window_inputs = self._set_temp_attention_window_inputs()
@@ -2649,9 +2645,8 @@ class KVCacheManagerV2(BaseResourceManager):
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
             for pool_idx in range(self.num_pools):
-                buffer = self.host_kv_cache_block_offsets[pool_idx, index *
-                                                          self.max_beam_width +
-                                                          i, 0]
+                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
+                    pool_idx, index * self.max_beam_width + i, 0]
                 kv_cache.set_base_page_index_buf(i, pool_idx,
                                                  memoryview(buffer.numpy()))
         return kv_cache
