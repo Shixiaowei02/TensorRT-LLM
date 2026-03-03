@@ -656,6 +656,8 @@ class TrtllmAttentionWrapper:
                 global_layer_idx=self.global_layer_idx,
             )
         else:
+            # WAR on potential illegal sparse attention top_k indices
+            self.sparse_attn_indices = 0 * self.sparse_attn_indices + 1 if self.sparse_attn_indices is not None else None
             thop.attention(
                 q,
                 k,
