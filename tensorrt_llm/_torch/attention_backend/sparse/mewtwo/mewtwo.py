@@ -596,8 +596,11 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
-        # For indexer k cache
-        self.prepare_for_indexer_k_cache()
+        has_sparse_layers = MEWTWO_SPARSE_RATIO in self.compress_ratio_set
+
+        # For indexer k cache (only needed when sparse layers exist)
+        if has_sparse_layers:
+            self.prepare_for_indexer_k_cache()
 
         # For block offsets
         self.prepare_for_block_tables()
@@ -605,8 +608,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For mewtwo indices
         self.prepare_for_mewtwo_indices()
 
-        # Prepare metadata for indexer
-        MewtwoIndexer.prepare(metadata=self)
+        # Prepare metadata for indexer (only needed when sparse layers exist)
+        if has_sparse_layers:
+            MewtwoIndexer.prepare(metadata=self)
 
         # Prepare buffers for the compressor
         # prepare cu_seq_lens_cuda and cu_seq_lens
