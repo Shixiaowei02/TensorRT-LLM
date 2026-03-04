@@ -431,6 +431,8 @@ class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # gate_forward kernel requires float32 input scores
+        logits = logits.to(torch.float32)
         m = logits.shape[0]
         out_weights = torch.empty(m,
                                   self._top_k,
@@ -471,7 +473,8 @@ class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
 
     @property
     def routing_method_type(self):
-        return RoutingMethodType.Mewtwo
+        # Return DeepSeekV3 because C++ MoE kernels don't recognize Mewtwo routing type
+        return RoutingMethodType.DeepSeekV3
 
 
 class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
@@ -758,6 +761,8 @@ ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                        BaseMoeRoutingMethod,
                                        RoutingMethodType.MiniMax2:
                                        MiniMaxM2MoeRoutingMethod,
+                                       RoutingMethodType.Mewtwo:
+                                       MewtwoMoeRoutingMethod,
                                    }
 
 

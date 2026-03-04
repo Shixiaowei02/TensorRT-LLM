@@ -26,7 +26,6 @@ from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
-from ..attention_backend.sparse.mewtwo import MewtwoCacheManager
 from ..model_config import ModelConfig
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
@@ -807,17 +806,11 @@ class KvCacheCreator:
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model and draft model (if applicable)."""
         resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
-        # TODO(jiaganc): a workaround because v2 doesn't release memory at shutdown
-        if isinstance(resources[ResourceManagerType.KV_CACHE_MANAGER],
-                      MewtwoCacheManager):
-            del resources[ResourceManagerType.KV_CACHE_MANAGER].impl
         del resources[ResourceManagerType.KV_CACHE_MANAGER]
         draft_kv_cache_manager = resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
         if draft_kv_cache_manager:
             draft_kv_cache_manager.shutdown()
-            if isinstance(draft_kv_cache_manager, MewtwoCacheManager):
-                del draft_kv_cache_manager.impl
         del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
