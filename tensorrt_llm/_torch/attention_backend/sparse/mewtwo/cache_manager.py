@@ -3,7 +3,8 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.resource_manager import GPU_LEVEL, KVCacheManagerV2, Role
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -133,6 +134,21 @@ class MewtwoCacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True  # Mewtwo must has VSWA
+
+        # TODO: Remove this override once KVCacheManagerV2 natively supports
+        # get_max_resource_count / get_needed_resource_to_completion.
+        # Currently V2 stubs return 1 and 0, which disables scheduler capacity
+        # checking and causes OOM in prepare_resources.
+        bytes_per_token = self.get_cache_bytes_per_token()
+        if bytes_per_token > 0:
+            quota = self.impl.get_quota(GPU_LEVEL)
+            usable_quota = quota * kv_cache_config.max_util_for_resume
+            self._max_tokens_for_scheduling = int(usable_quota / bytes_per_token)
+        else:
+            self._max_tokens_for_scheduling = max_seq_len * max_batch_size
+        logger.info(
+            f"Mewtwo cache manager max tokens for scheduling: {self._max_tokens_for_scheduling}"
+        )
 
         # Mewtwo expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
@@ -429,6 +445,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
             compress_ratios,
             has_fp8_kv_cache,
         )
+
+    # TODO: Remove the following two overrides once KVCacheManagerV2
+    # natively implements get_max_resource_count / get_needed_resource_to_completion.
+    def get_max_resource_count(self) -> int:
+        return self._max_tokens_for_scheduling
+
+    # TODO: take SWA into consideration
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        return request.orig_prompt_len + request.max_new_tokens + self.num_extra_kv_tokens
 
     def get_layer_bytes_per_token(
         self,
