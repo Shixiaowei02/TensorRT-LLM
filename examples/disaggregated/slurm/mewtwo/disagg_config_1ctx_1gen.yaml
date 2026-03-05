@@ -1,0 +1,11 @@
+hostname: 0.0.0.0
+port: ${PROXY_PORT}
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+    - "${CTX_NODE}:${CTX_PORT}"
+generation_servers:
+  num_instances: 1
+  urls:
+    - "${GEN_NODE}:${GEN_PORT}"

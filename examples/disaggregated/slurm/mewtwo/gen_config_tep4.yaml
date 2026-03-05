@@ -1,0 +1,14 @@
+load_format: dummy
+enable_attention_dp: true
+moe_expert_parallel_size: 4
+moe_config:
+  backend: DEEPGEMM
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  tokens_per_block: 128
+cuda_graph_config: {}
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+  transceiver_runtime: PYTHON
