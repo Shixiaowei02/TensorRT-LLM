@@ -158,7 +158,7 @@ class Compressor(nn.Module):
                 kv_score=kv_score[:num_ctx_tokens],
                 ape=self.ape,
                 kv_lens=kv_lens[:num_contexts],
-                start_pos=None,
+                start_pos=metadata.cached_token_lens_cuda[:num_contexts],
                 cu_seq_lens=metadata.cu_seq_lens_cuda,
                 cu_new_comp_kv=cu_new_comp_kv[: num_contexts + 1],
                 kv_comp=kv_comp,

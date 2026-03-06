@@ -1543,6 +1543,7 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+@pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize(
     "chunk_size,seq_lens_list,chunking_type",
     [
@@ -1558,7 +1559,8 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
                 ], "two_level"),  # Mixed: request 2 needs Q-blocks
     ],
 )
-def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
+def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type,
+                                 compress_ratio):
     """
     Tests for indexer chunked prefill:
     1. Request-level chunking: Multiple small requests packed together
@@ -1600,10 +1602,18 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     total_tokens = seq_lens.sum().item()
     max_seq_len = seq_lens.max().item()
 
-    print(f"\n=== Test Config: {chunking_type} ===")
+    # Compute compressed KV token counts
+    kv_lens_compressed = seq_lens // compress_ratio
+    total_kv_tokens = kv_lens_compressed.sum().item()
+
+    print(
+        f"\n=== Test Config: {chunking_type}, compress_ratio={compress_ratio} ==="
+    )
     print(f"  Batch: {batch_size}, Chunk size: {chunk_size}")
     print(f"  Sequence lengths: {seq_lens_list}")
-    print(f"  Total tokens: {total_tokens}, Max seq len: {max_seq_len}")
+    print(
+        f"  Total tokens: {total_tokens}, Total KV tokens: {total_kv_tokens}, Max seq len: {max_seq_len}"
+    )
 
     # Identify large requests for two-level chunking
     if chunking_type == "two_level":
@@ -1639,7 +1649,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     q = torch.randn((total_tokens, heads, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
-    k = torch.randn((total_tokens, head_dim),
+    k = torch.randn((total_kv_tokens, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
     weights = torch.randn((total_tokens, heads),
@@ -1669,6 +1679,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         num_tokens=total_tokens,
         indexer_max_chunk_size=chunk_size,
         indexer_head_dim=head_dim,
+        compress_ratio=compress_ratio,
     )
 
     Indexer.prepare(metadata_chunked)
@@ -1708,6 +1719,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         num_tokens=total_tokens,
         indexer_max_chunk_size=max_model_len,
         indexer_head_dim=head_dim,
+        compress_ratio=compress_ratio,
     )
 
     Indexer.prepare(metadata_baseline)

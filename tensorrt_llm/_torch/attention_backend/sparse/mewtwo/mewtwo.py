@@ -437,6 +437,15 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
+        # cached_token_lens_cuda: number of tokens already cached per request
+        self.cached_token_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences,),
+            cache_name="cached_token_lens_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
     def prepare_for_block_tables(self):
         """
         Prepare block tables for cache buffers.
@@ -566,6 +575,10 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_requests = self.num_contexts + self.num_generations
         num_gen_tokens = self.num_tokens - self.num_ctx_tokens
 
+        self.cached_token_lens_cuda[:num_requests].copy_(
+            cached_token_lens[:num_requests].to(torch.int32), non_blocking=True
+        )
+
         # Cache buffer data pointers
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
@@ -641,7 +654,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.compressed_kv_lens_cuda[compress_ratio][:num_requests].copy_(
                 self.compressed_kv_lens[compress_ratio][:num_requests], non_blocking=True
             )
-            num_ctx_compressed_tokens = num_comp_kv_lens[: self.num_contexts].sum().item()
+            num_ctx_compressed_tokens = new_comp_kv_lens[: self.num_contexts].sum().item()
             # To support CUDA graph, generation requests should use a constant number of compressed tokens.
             num_gen_compressed_tokens = self.num_generations * math.ceil(
                 num_gen_tokens_per_seq / compress_ratio

@@ -271,6 +271,7 @@ def compute_cu_seqlen_kv_bounds_with_cache(
     # Total KV lengths per request
     if kv_lens is None:
         kv_lens = seq_lens if cached_token_lens is None else cached_token_lens + seq_lens  # [num_contexts]
+        kv_lens = kv_lens // compress_ratio
 
     # Cumulative KV offsets: where each request's KV sequence starts in global KV space
     cu_kv_offsets = torch.cat([
@@ -346,6 +347,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     use_expanded_buffers_for_mtp: bool = False
     # Compression ratio for KV tokens
     compress_ratios: List[int] = [1]
+    # Number of compressed KV tokens for context requests
+    num_ctx_kv_tokens: int = 0
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -1274,24 +1277,32 @@ class Indexer(nn.Module):
                 metadata.host_ctx_cached_token_indptr[req_idx + 1] -
                 metadata.host_ctx_cached_token_indptr[req_idx]).item()
 
+            # Total compressed KV tokens for this request
+            req_kv_len = (num_cached + token_end_in_req) // compress_ratio
+
             # For intra-request chunks: Q block attends to all previous K in the request
             # Q tokens [token_start_in_req:token_end_in_req] within the request's current tokens
-            # K tokens [0:num_cached + token_end_in_req] within the request (causal attention)
+            # K tokens [0:req_kv_len] in compressed KV space
             cu_seqlen_ks = torch.zeros(num_q_tokens,
                                        dtype=torch.int32,
                                        device='cpu')
-            cu_seqlen_ke = torch.arange(token_start_in_req + 1,
-                                        token_end_in_req + 1,
-                                        dtype=torch.int32,
-                                        device='cpu') + num_cached
+            cu_seqlen_ke = (torch.arange(token_start_in_req + 1,
+                                         token_end_in_req + 1,
+                                         dtype=torch.int32,
+                                         device='cpu') +
+                            num_cached) // compress_ratio
 
             # Q token range in batch (indices into context tokens in the current batch)
             token_start = req_cum_start + token_start_in_req
             token_end = req_cum_start + token_end_in_req
 
-            # K token range: index into full KV slot mapping (cached + current batch context tokens)
-            kv_offset_in_extended = metadata.host_ctx_kv_indptr[req_idx].item()
-            total_kv_for_req = num_cached + token_end_in_req
+            # K token range: index into full KV slot mapping in compressed KV space
+            # For req_idx=0 the offset is 0; for other indices compute compressed cumulative offset
+            kv_offset_in_extended = sum(
+                (metadata.host_ctx_kv_indptr[j + 1] -
+                 metadata.host_ctx_kv_indptr[j]).item() // compress_ratio
+                for j in range(req_idx))
+            total_kv_for_req = req_kv_len
             k_token_start = kv_offset_in_extended
             k_token_end = kv_offset_in_extended + total_kv_for_req
 
@@ -1335,8 +1346,11 @@ class Indexer(nn.Module):
             token_end = token_start + num_q_tokens
 
             # K token range: index into full kv slot mapping (cached + current ctx tokens within the batch)
-            kv_offset_in_extended = metadata.host_ctx_kv_indptr[
-                first_req_idx].item()
+            # Must use compressed offsets
+            kv_offset_in_extended = sum(
+                (metadata.host_ctx_kv_indptr[j + 1] -
+                 metadata.host_ctx_kv_indptr[j]).item() // compress_ratio
+                for j in range(first_req_idx))
             total_kv_len = sum(req_kv_lens)
             k_token_start = kv_offset_in_extended
             k_token_end = kv_offset_in_extended + total_kv_len
@@ -1426,7 +1440,6 @@ class Indexer(nn.Module):
         head_dim = indexer_params.head_dim
         scale_size = indexer_params.scale_size
         block_stride = indexer_params.block_stride
-        start_positions = indexer_params.cached_kv_tokens
         scale_base_offset = tokens_per_block * head_dim  # Offset to scale region in block
 
         # When MLA chunked prefill is active, it already handles chunking
@@ -1435,7 +1448,6 @@ class Indexer(nn.Module):
                                    and
                                    metadata.runtime_features.chunked_prefill)
         if has_mla_chunked_prefill:
-            assert indexer_params.compress_ratio == 1, "MLA chunked prefill only supports compression ratio of 1 for now."
             chunk_specs = [(i, 0, seq_lens[i].item(),
                             seq_lens[:i].sum().item() if i > 0 else 0)
                            for i in range(num_contexts)]
@@ -1449,7 +1461,7 @@ class Indexer(nn.Module):
             # Use indexer's own chunking logic to prevent L^2 complexity of indexer MQA logits computation for long sequences.
             # This is only used when MLA chunked prefill is not enabled.
             chunk_groups = split_prefill_chunks(
-                seq_lens,
+                seq_lens[:num_contexts],
                 metadata.indexer_max_chunk_size,
                 start_idx=0,
             )
@@ -1468,11 +1480,9 @@ class Indexer(nn.Module):
         # When chunked prefill or KVCache reuse is enabled, we need to gather the full KV for indexer's logit computation.
         # Indexer's own chunking does not need full KV gathering, instead it gathers only the current chunk with loop-based gathering.
         if metadata.enable_context_mla_with_cached_kv:
-            assert indexer_params.compress_ratio == 1, "Full KV gathering only supports compression ratio of 1 for now."
-            total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
-            total_kv_per_request = seq_lens[:
-                                            num_contexts] + start_positions[:
-                                                                            num_contexts]
+            # Use kv_lens which correctly computes (raw_past + seq_lens) // compress_ratio.
+            total_kv_per_request = indexer_params.kv_lens[:num_contexts]
+            total_kv_len = total_kv_per_request.sum().item()
             host_slot_mapping_fp8_fullkv = torch.empty(
                 total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
             host_slot_mapping_scale_fullkv = torch.empty(
@@ -1583,18 +1593,27 @@ class Indexer(nn.Module):
         # Only support compression ratio of 4 and 1 for now
         compress_ratio = 4 if 4 in metadata.compress_ratios else 1
 
+        # For the indexer's K cache pool, the physical block size is
+        # tokens_per_block // compress_ratio (= compressed_block_sizes).
+        indexer_tokens_per_block = tokens_per_block // compress_ratio
+
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
             num_generations=num_generations,
             num_ctx_tokens=num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=quant_block_size,
-            tokens_per_block=tokens_per_block,
+            tokens_per_block=indexer_tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=request_ids,
             num_past_tokens=num_past_tokens,
             seq_lens=seq_lens,
         )
+        # Store compressed KV token count for context requests
+        metadata.num_ctx_kv_tokens = indexer_params.new_kv_tokens[:
+                                                                  num_contexts].sum(
+                                                                  ).item()
+
         # Prepare for update_k_cache
         Indexer.prepare_for_update_k_cache(metadata, indexer_params)
 
@@ -1831,13 +1850,14 @@ class Indexer(nn.Module):
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
+                num_ctx_kv_tokens = metadata.num_ctx_kv_tokens
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
                 logits = fp8_mqa_logits(
                     q_fp8[:num_ctx_tokens, ...],
-                    (k_fp8[:num_ctx_tokens, ...], k_scale[:num_ctx_tokens,
-                                                          ...]),
+                    (k_fp8[:num_ctx_kv_tokens, ...], k_scale[:num_ctx_kv_tokens,
+                                                             ...]),
                     weights[:num_ctx_tokens, ...],
                     cu_seqlen_ks,
                     cu_seqlen_ke,
