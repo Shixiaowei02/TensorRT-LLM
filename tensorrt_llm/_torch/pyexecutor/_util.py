@@ -617,6 +617,11 @@ class KvCacheCreator:
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
             return False
+        if self._sparse_attention_config is not None:
+            logger.info(
+                "Sparse attention is enabled, separate draft KV cache is not supported."
+            )
+            return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
