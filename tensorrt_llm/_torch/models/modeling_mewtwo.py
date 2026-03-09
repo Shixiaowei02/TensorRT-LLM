@@ -1292,32 +1292,20 @@ class MewtwoDecoderLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: MewtwoTrtllmAttentionMetadata,
-        residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            post_mix, res_mix, hidden_states = self.hc_attn.pre_mapping(hidden_states)
-            # hidden_shapes = hidden_states.shape[:-1]
-            # hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-            # position_ids = position_ids.view(-1, position_ids.shape[-1])
-            hidden_states = self.input_layernorm(hidden_states)
-            hidden_states = self.self_attn(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.disable_attn_allreduce)
-                ),
-                **kwargs,
-            )
-            # hidden_states = hidden_states.view(*hidden_shapes, -1)
-        else:
-            raise NotImplementedError(
-                "MewtwoMoE does not support pre-layernorm with residual connection yet."
-            )
+    ) -> torch.Tensor:
+        residual = hidden_states
+        post_mix, res_mix, hidden_states = self.hc_attn.pre_mapping(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
+            **kwargs,
+        )
         hidden_states = self.hc_attn.post_mapping(
             x=hidden_states, residual=residual, post_layer_mix=post_mix, comb_res_mix=res_mix
         )
@@ -1333,10 +1321,10 @@ class MewtwoDecoderLayer(DecoderLayer):
             spec_metadata=spec_metadata,
             input_ids=input_ids,
         )
-        # hidden_states = hidden_states.view(*hidden_shapes, -1)
-        return self.hc_ffn.post_mapping(
+        hidden_states = self.hc_ffn.post_mapping(
             x=hidden_states, residual=residual, post_layer_mix=post_mix, comb_res_mix=res_mix
-        ), None
+        )
+        return hidden_states
 
     def forward_MoE(
         self,
@@ -1610,6 +1598,10 @@ class MewtwoModel(DecoderModel):
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
 
+    def __pp_init__(self):
+        self.epilogue.append(self.hc_head)
+        super().__pp_init__()
+
     def forward(
         self,
         attn_metadata: MewtwoTrtllmAttentionMetadata,
@@ -1627,16 +1619,24 @@ class MewtwoModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        residual = None
+        mapping = self.model_config.mapping
+        if mapping.has_pp() and not mapping.is_first_pp_rank():
+            hidden_states = torch.empty(
+                inputs_embeds.shape[0],
+                self.hc_mult,
+                inputs_embeds.shape[1],
+                dtype=inputs_embeds.dtype,
+                device=inputs_embeds.device,
+            )
+        else:
+            hidden_states = inputs_embeds
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
-            hidden_states, residual = decoder_layer(
+            hidden_states = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
-                residual=residual,
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
             )

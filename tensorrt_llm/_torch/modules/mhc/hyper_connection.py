@@ -476,3 +476,7 @@ class HCHead(nn.Module):
                 eps=self.eps,
             )
             return y.to(dtype)
+
+    def skip_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Skip HCHead computation for pipeline parallelism on non-last ranks."""
+        return x

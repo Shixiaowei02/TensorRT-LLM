@@ -155,23 +155,25 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self._assert_layer_pool_scale()
 
         # For Mewtwo Attention, the base pointer for SWA pool
+        # Use first PP layer instead of hardcoded 0 for pipeline parallelism.
+        first_pp_layer = self.pp_layers[0]
         self.swa_pool_ptr = self.impl.get_mem_pool_base_address(
-            self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY
+            self._layer_attn_to_layer_id[first_pp_layer, MewtwoAttentionType.SWA], Role.KEY
         )
 
         self.compress_pool_ptrs = {}
-        if 4 in self._compress_ratios:  # indexer compressor
+        # Find first PP layer with each compress ratio for pool pointer lookup.
+        pp_compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        if 4 in pp_compress_ratios:  # indexer compressor
+            first_layer_with_4 = self.pp_layers[pp_compress_ratios.index(4)]
             self.compress_pool_ptrs[4] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[
-                    self._compress_ratios.index(4), MewtwoAttentionType.COMPRESS
-                ],
+                self._layer_attn_to_layer_id[first_layer_with_4, MewtwoAttentionType.COMPRESS],
                 Role.KEY,
             )
-        if 128 in self._compress_ratios:  # compressor
+        if 128 in pp_compress_ratios:  # compressor
+            first_layer_with_128 = self.pp_layers[pp_compress_ratios.index(128)]
             self.compress_pool_ptrs[128] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[
-                    self._compress_ratios.index(128), MewtwoAttentionType.COMPRESS
-                ],
+                self._layer_attn_to_layer_id[first_layer_with_128, MewtwoAttentionType.COMPRESS],
                 Role.KEY,
             )
 
@@ -222,14 +224,17 @@ class MewtwoCacheManager(KVCacheManagerV2):
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        swa_bytes_per_block = self._get_attn_bytes_per_block(MewtwoAttentionType.SWA, 0)
+        first_pp_layer = self.pp_layers[0]
+        swa_bytes_per_block = self._get_attn_bytes_per_block(
+            MewtwoAttentionType.SWA, first_pp_layer
+        )
         swa_pool_ptr = self.impl.get_mem_pool_base_address(
-            self._layer_attn_to_layer_id[0, MewtwoAttentionType.SWA], Role.KEY
+            self._layer_attn_to_layer_id[first_pp_layer, MewtwoAttentionType.SWA], Role.KEY
         )
 
-        def _get_layer_offset(layer_idx: int) -> int:
+        def _get_layer_offset(pp_layer: int) -> int:
             buffer_ptr = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[layer_idx, MewtwoAttentionType.SWA], Role.KEY
+                self._layer_attn_to_layer_id[pp_layer, MewtwoAttentionType.SWA], Role.KEY
             )
             return (buffer_ptr - swa_pool_ptr) // swa_bytes_per_block
 
@@ -244,7 +249,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
         # shape: [num_local_layers, 2]
         kv_cache_pool_mapping = torch.tensor(
-            [[0, _get_layer_offset(layer_idx)] for layer_idx in range(self.num_local_layers)],
+            [[0, _get_layer_offset(pp_layer)] for pp_layer in self.pp_layers],
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
@@ -409,6 +414,18 @@ class MewtwoCacheManager(KVCacheManagerV2):
         assert len(swa_pool_ids) == 1, "All swa attentions must be in the same pool"
         assert len(swa_scales) == 1, "All swa attentions must have the same scale"
 
+        # Ensure all compress ratios have SWA entries, not just PP-local ones.
+        # The attention metadata uses compress_ratio=1 as a hardcoded SWA key,
+        # but with pipeline parallelism a PP stage may not have any layers with
+        # ratio 1. Since all SWA layers share the same pool, we populate entries
+        # for every compress ratio in the model.
+        swa_pool_id = next(iter(swa_pool_ids))
+        swa_scale = next(iter(swa_scales))
+        for ratio in set(self._compress_ratios):
+            if ratio not in attn_ratio_to_pool_id[MewtwoAttentionType.SWA]:
+                attn_ratio_to_pool_id[MewtwoAttentionType.SWA][ratio] = swa_pool_id
+                attn_ratio_to_scale[MewtwoAttentionType.SWA][ratio] = swa_scale
+
         self._attn_ratio_to_pool_id = attn_ratio_to_pool_id
         self._attn_ratio_to_scale = attn_ratio_to_scale
 
@@ -525,7 +542,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             num_seqs,
             MewtwoAttentionType.SWA,
             # all compress ratios have SWA attention and they are in the same pool
-            self._compress_ratios[0],
+            self._compress_ratios[self.pp_layers[0]],
         )
         dst_tensor[0, :num_seqs, :, :] = offsets[:, None, :]
 

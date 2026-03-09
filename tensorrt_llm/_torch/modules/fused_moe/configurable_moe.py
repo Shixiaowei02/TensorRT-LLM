@@ -916,7 +916,7 @@ class ConfigurableMoE(MoE):
                 [val[idx_chunk] for val in all_rank_chunk_size_list]
                 for idx_chunk in range(num_chunks)
             ]
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
+            chunk_size_list = all_rank_chunk_size_list[self.mapping.tp_rank]
 
             # For alltoall, replace 0 with 1 (avoid empty tensor)
             if self.enable_alltoall:
