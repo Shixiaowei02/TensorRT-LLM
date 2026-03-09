@@ -94,8 +94,7 @@ class mHC(nn.Module):
         sinkhorn_eps: float = 1e-6,
         post_mult_value: float = 1.0,
         n_splits: int = 1,
-        backend: str = "tilelang",
-        cuda_use_mma: bool = False,
+        backend: str = "cuda",
     ):
         super().__init__()
         self.mult = mult
@@ -108,7 +107,6 @@ class mHC(nn.Module):
         self.post_mult_value = post_mult_value
         self.n_splits = n_splits
         self.backend = backend
-        self.cuda_use_mma = cuda_use_mma
         self.mix_hc = (2 + self.mult) * self.mult
         self.hc_dim = self.mult * self.hidden_size
 
@@ -242,7 +240,6 @@ class mHC(nn.Module):
                 self.sinkhorn_eps,
                 self.post_mult_value,
                 self.sinkhorn_iters,
-                use_mma=self.cuda_use_mma,
             )
 
             post_mix = post_mix.view(*outer_shape, self.mult, 1)
@@ -393,7 +390,7 @@ class HCHead(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         norm_eps: float = 1e-6,
-        backend: str = "cutile",
+        backend: str = "cuda",
     ):
         super().__init__()
         self.mult = mult

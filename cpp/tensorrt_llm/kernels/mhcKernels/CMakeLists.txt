@@ -21,3 +21,4 @@ add_library(mhcKernels_src OBJECT ${SRC_CPP} ${SRC_CU})
 
 set_property(TARGET mhcKernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET mhcKernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_compile_options(mhcKernels_src PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)

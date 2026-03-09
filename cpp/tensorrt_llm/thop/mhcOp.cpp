@@ -18,7 +18,6 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cublas_v2.h>
 #include <torch/extension.h>
 
 namespace tk = tensorrt_llm::kernels::mhc;
@@ -29,7 +28,7 @@ namespace
 void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residual, torch::Tensor hc_scale,
     torch::Tensor hc_base, torch::Tensor post_mix, torch::Tensor comb_mix, torch::Tensor layer_input, int64_t M,
     int64_t K, int64_t hidden_size, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
-    double hc_post_mult_value, int64_t sinkhorn_repeat)
+    double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t num_splits)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -39,15 +38,7 @@ void mhcBigFuseOp(torch::Tensor y_acc, torch::Tensor r_acc, torch::Tensor residu
         reinterpret_cast<__nv_bfloat16*>(layer_input.data_ptr<at::BFloat16>()), static_cast<int>(M),
         static_cast<int>(K), static_cast<int>(hidden_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        stream);
-}
-
-void mhcSqrsumOp(torch::Tensor x, torch::Tensor r, int64_t M, int64_t K)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    tk::mhcSqrsumLaunch(reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr<at::BFloat16>()), r.data_ptr<float>(),
-        static_cast<int>(M), static_cast<int>(K), stream);
+        static_cast<int>(num_splits), stream);
 }
 
 void mhcGemmSqrsumFmaOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch::Tensor r, int64_t M, int64_t N,
@@ -58,21 +49,6 @@ void mhcGemmSqrsumFmaOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, torch
     tk::mhcGemmSqrsumFmaLaunch(reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr<at::BFloat16>()), w.data_ptr<float>(),
         y.data_ptr<float>(), r.data_ptr<float>(), static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
         static_cast<int>(num_k_blocks), static_cast<int>(k_chunk), num_k_blocks > 1, stream);
-}
-
-void mhcGemmOp(torch::Tensor x, torch::Tensor w, torch::Tensor y, int64_t M, int64_t N, int64_t K)
-{
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(handle, at::cuda::getCurrentCUDAStream());
-
-    float alpha = 1.0f, beta = 0.0f;
-
-    auto status
-        = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
-            &alpha, w.data_ptr(), CUDA_R_16BF, static_cast<int>(N), x.data_ptr(), CUDA_R_16BF, static_cast<int>(K),
-            &beta, y.data_ptr(), CUDA_R_32F, static_cast<int>(N), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "cublasGemmEx failed with status ", static_cast<int>(status));
 }
 
 void mhcHcHeadApplyOp(torch::Tensor mixes, torch::Tensor sqrsum, torch::Tensor x, torch::Tensor out,
@@ -110,19 +86,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(a!) post_mix, Tensor(b!) comb_mix, Tensor(c!) layer_input, "
         "int M, int K, int hidden_size, "
         "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
-        "float hc_post_mult_value, int sinkhorn_repeat) -> ()");
-
-    m.def("mhc_sqrsum(Tensor x, Tensor(a!) r, int M, int K) -> ()");
+        "float hc_post_mult_value, int sinkhorn_repeat, int num_splits) -> ()");
 
     m.def(
         "mhc_gemm_sqrsum_fma("
         "Tensor x, Tensor w, Tensor(a!) y, Tensor(b!) r, "
         "int M, int N, int K, int num_k_blocks, int k_chunk) -> ()");
-
-    m.def(
-        "mhc_gemm("
-        "Tensor x, Tensor w, Tensor(a!) y, "
-        "int M, int N, int K) -> ()");
 
     m.def(
         "mhc_hc_head_apply("
@@ -141,9 +110,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mhc_big_fuse", &mhcBigFuseOp);
-    m.impl("mhc_sqrsum", &mhcSqrsumOp);
     m.impl("mhc_gemm_sqrsum_fma", &mhcGemmSqrsumFmaOp);
-    m.impl("mhc_gemm", &mhcGemmOp);
     m.impl("mhc_hc_head_apply", &mhcHcHeadApplyOp);
     m.impl("mhc_post_mapping", &mhcPostMappingOp);
 }

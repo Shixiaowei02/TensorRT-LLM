@@ -1,14 +1,56 @@
 # Copied and modified from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_mhc
-import time
 from collections import defaultdict
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
 
-# Global dictionary to store timing statistics
-timing_stats = defaultdict(lambda: {"total_time": 0.0, "count": 0, "times": []})
+BENCH_WARMUP = 50
+BENCH_ITERS = 200
+
+timing_stats = defaultdict(dict)
+
+
+# ---------------------------------------------------------------------------
+# Profiling helpers (from bench_dg_vs_fma_nsys.py)
+# ---------------------------------------------------------------------------
+
+
+def profile_fn(fn, warmup=BENCH_WARMUP, iters=BENCH_ITERS):
+    """Return dict of {kernel_name: avg_us} for all CUDA kernels."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    result = {}
+    for evt in prof.key_averages():
+        if evt.self_device_time_total > 0:
+            result[evt.key] = evt.self_device_time_total / evt.count
+    return result
+
+
+def sum_kernel_times(timings, filters):
+    """Sum times for kernel names matching any filter substring."""
+    total = 0.0
+    for name, us in timings.items():
+        if any(f in name for f in filters):
+            total += us
+    return total
+
+
+def sum_all_kernel_times(timings):
+    """Sum all GPU kernel times."""
+    return sum(timings.values())
+
+
+# ---------------------------------------------------------------------------
+# Test data generators
+# ---------------------------------------------------------------------------
 
 
 def generate_pre_data(
@@ -101,6 +143,11 @@ def generate_head_data(
     }
 
 
+# ---------------------------------------------------------------------------
+# Correctness + profiling tests
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("n", [1, 32, 64, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
@@ -112,7 +159,6 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         hidden_size=hidden_size,
     )
 
-    # Create vanilla reference for comparison
     ref_module = mHC(
         mult=hc_mult,
         hidden_size=hidden_size,
@@ -141,34 +187,16 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
 
-    # Warm up both vanilla and test modules
-    for _ in range(50):
-        ref_module.pre_mapping(test_data["residual"])
-        test_module.pre_mapping(test_data["residual"])
-    torch.cuda.synchronize()
+    residual = test_data["residual"]
 
-    # Timing with 500 iterations
-    for _ in range(500):
-        start_time = time.perf_counter()
-        post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(test_data["residual"])
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start_time
+    t = profile_fn(lambda: test_module.pre_mapping(residual))
+    total_us = sum_all_kernel_times(t)
+    timing_stats[("pre_mapping", n, hidden_size)][backend] = total_us
 
-        # Record timing with shape information
-        test_key = f"pre_mapping_{backend}_{n}_{hidden_size}"
-        timing_stats[test_key]["total_time"] += elapsed
-        timing_stats[test_key]["count"] += 1
-        timing_stats[test_key]["times"].append(elapsed)
-
-    # Compare outputs with vanilla backend
     if backend != "vanilla":
-        post_mix_vanilla, comb_mix_vanilla, layer_input_vanilla = ref_module.pre_mapping(
-            test_data["residual"]
-        )
-        # cutile/deepgemm backends use tf32 MMA which has larger rounding diffs
+        post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(residual)
+        post_mix_vanilla, comb_mix_vanilla, layer_input_vanilla = ref_module.pre_mapping(residual)
         torch.testing.assert_close(post_mix_vanilla, post_mix_ref, rtol=1e-4, atol=1e-3)
-        # comb_mix goes through Sinkhorn normalization (exp → iterated row/col
-        # normalize) which amplifies small tf32 rounding differences.
         torch.testing.assert_close(comb_mix_vanilla, comb_mix_ref, rtol=1e-3, atol=5e-3)
         torch.testing.assert_close(layer_input_vanilla, layer_input_ref, rtol=1e-4, atol=1e-3)
 
@@ -184,34 +212,16 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         hidden_size=hidden_size,
     )
 
-    # Create vanilla reference for comparison
     ref_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend="vanilla")
-
     test_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend=backend)
 
-    # Warm up both vanilla and test modules
-    for _ in range(50):
-        ref_module.post_mapping(**test_data)
-        test_module.post_mapping(**test_data)
-    torch.cuda.synchronize()
+    t = profile_fn(lambda: test_module.post_mapping(**test_data))
+    total_us = sum_all_kernel_times(t)
+    timing_stats[("post_mapping", n, hidden_size)][backend] = total_us
 
-    # Timing with 500 iterations
-    for _ in range(500):
-        start_time = time.perf_counter()
-        output = test_module.post_mapping(**test_data)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start_time
-
-        # Record timing with shape information
-        test_key = f"post_mapping_{backend}_{n}_{hidden_size}"
-        timing_stats[test_key]["total_time"] += elapsed
-        timing_stats[test_key]["count"] += 1
-        timing_stats[test_key]["times"].append(elapsed)
-
-    # Compare outputs with vanilla backend
     if backend != "vanilla":
+        output = test_module.post_mapping(**test_data)
         output_ref = ref_module.post_mapping(**test_data)
-        # bf16 I/O kernels have FMA ordering differences vs vanilla fp32 path
         if backend in ("tilelang", "cuda"):
             torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
         else:
@@ -239,27 +249,12 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
 
-    # Warm up both vanilla and test modules
-    for _ in range(50):
-        ref_module(test_data["x"])
-        test_module(test_data["x"])
-    torch.cuda.synchronize()
+    t = profile_fn(lambda: test_module(test_data["x"]))
+    total_us = sum_all_kernel_times(t)
+    timing_stats[("hc_head", m, hidden_size)][backend] = total_us
 
-    # Timing with 500 iterations
-    for _ in range(500):
-        start_time = time.perf_counter()
-        output = test_module(test_data["x"])
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start_time
-
-        # Record timing with shape information
-        test_key = f"hc_head_{backend}_{m}_{hidden_size}"
-        timing_stats[test_key]["total_time"] += elapsed
-        timing_stats[test_key]["count"] += 1
-        timing_stats[test_key]["times"].append(elapsed)
-
-    # Compare outputs with vanilla backend
     if backend != "vanilla":
+        output = test_module(test_data["x"])
         output_ref = ref_module(test_data["x"])
         if backend in ("tilelang", "cuda"):
             torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
@@ -267,130 +262,309 @@ def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
             torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=2e-3)
 
 
+# ---------------------------------------------------------------------------
+# Low-level pre_mapping pipeline benchmark: DG / DG-s16 / FMA / TL
+# ---------------------------------------------------------------------------
+
+HC_MULT = 4
+HIDDEN_SIZE = 4096
+_N = HC_MULT * (HC_MULT + 1 + 1)  # 24
+_K = HC_MULT * HIDDEN_SIZE  # 16384
+_NUM_SPLITS = 16
+_SINKHORN_REPEAT = 20
+
+
+def _try_import_backends():
+    """Return (tf32_hc_prenorm_gemm|None, mhc_gemm_rms_fma_cuda|None,
+    mhc_big_fuse_cuda|None, tl_gemm_sqrsum|None, tl_big_fuse|None)."""
+    tf32_hc_prenorm_gemm = None
+    try:
+        from deep_gemm import tf32_hc_prenorm_gemm
+    except ImportError:
+        try:
+            from tensorrt_llm.deep_gemm import tf32_hc_prenorm_gemm
+        except ImportError:
+            pass
+
+    mhc_gemm_rms_fma_cuda = mhc_big_fuse_cuda = None
+    try:
+        from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
+            mhc_big_fuse_cuda,
+            mhc_gemm_rms_fma_cuda,
+        )
+    except Exception:
+        pass
+
+    tl_gemm_sqrsum = tl_big_fuse = None
+    try:
+        from tensorrt_llm._torch.modules.mhc.mhc_tilelang import mhc_pre_big_fuse as tl_big_fuse
+        from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
+            mhc_pre_gemm_sqrsum as tl_gemm_sqrsum,
+        )
+    except Exception:
+        pass
+
+    return (
+        tf32_hc_prenorm_gemm,
+        mhc_gemm_rms_fma_cuda,
+        mhc_big_fuse_cuda,
+        tl_gemm_sqrsum,
+        tl_big_fuse,
+    )
+
+
+def run_bench_pre_mapping(M: int) -> dict:
+    """Low-level kernel benchmark for one M: profiles GEMM + BigFuse per backend.
+    Returns dict like {"DG": (gemm_us, fuse_us), "FMA": (...), ...}.
+    """
+    device = "cuda"
+    (
+        tf32_hc_prenorm_gemm,
+        mhc_gemm_rms_fma_cuda,
+        mhc_big_fuse_cuda,
+        tl_gemm_sqrsum,
+        tl_big_fuse,
+    ) = _try_import_backends()
+
+    w_nk = torch.randn(_N, _K, dtype=torch.float32, device=device) * 0.01
+    hc_scale = torch.randn(3, dtype=torch.float32, device=device)
+    hc_base = torch.randn(_N, dtype=torch.float32, device=device)
+    x = (torch.randn(M, _K, dtype=torch.float32, device=device) * 0.01).bfloat16()
+    residual = (
+        torch.randn(M, HC_MULT, HIDDEN_SIZE, dtype=torch.float32, device=device) / HIDDEN_SIZE
+    ).bfloat16()
+
+    times = {}
+
+    if tf32_hc_prenorm_gemm is not None and mhc_big_fuse_cuda is not None:
+        y = torch.empty(M, _N, dtype=torch.float32, device=device)
+        r = torch.empty(M, dtype=torch.float32, device=device)
+        pm = torch.empty(M, HC_MULT, dtype=torch.float32, device=device)
+        cm = torch.empty(M, HC_MULT * HC_MULT, dtype=torch.float32, device=device)
+        li = torch.empty(M, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+
+        def dg_fn():
+            tf32_hc_prenorm_gemm(x, w_nk, y, r)
+            mhc_big_fuse_cuda(
+                y,
+                r,
+                residual,
+                hc_scale,
+                hc_base,
+                pm,
+                cm,
+                li,
+                M,
+                _K,
+                HIDDEN_SIZE,
+                1e-6,
+                1e-6,
+                1e-6,
+                1.0,
+                _SINKHORN_REPEAT,
+                num_splits=1,
+            )
+
+        t = profile_fn(dg_fn)
+        times["DG"] = (sum_kernel_times(t, ["hc_prenorm_gemm"]), sum_kernel_times(t, ["BigFuse"]))
+
+        y_s = torch.empty(_NUM_SPLITS, M, _N, dtype=torch.float32, device=device)
+        r_s = torch.empty(_NUM_SPLITS, M, dtype=torch.float32, device=device)
+        pm_s = torch.empty(M, HC_MULT, dtype=torch.float32, device=device)
+        cm_s = torch.empty(M, HC_MULT * HC_MULT, dtype=torch.float32, device=device)
+        li_s = torch.empty(M, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+
+        def dg_s16_fn():
+            tf32_hc_prenorm_gemm(x, w_nk, y_s, r_s, num_splits=_NUM_SPLITS)
+            mhc_big_fuse_cuda(
+                y_s,
+                r_s,
+                residual,
+                hc_scale,
+                hc_base,
+                pm_s,
+                cm_s,
+                li_s,
+                M,
+                _K,
+                HIDDEN_SIZE,
+                1e-6,
+                1e-6,
+                1e-6,
+                1.0,
+                _SINKHORN_REPEAT,
+                num_splits=_NUM_SPLITS,
+            )
+
+        t = profile_fn(dg_s16_fn)
+        times["DG-s16"] = (
+            sum_kernel_times(t, ["hc_prenorm_gemm"]),
+            sum_kernel_times(t, ["BigFuse"]),
+        )
+
+    if mhc_gemm_rms_fma_cuda is not None and mhc_big_fuse_cuda is not None:
+        pm_f = torch.empty(M, HC_MULT, dtype=torch.float32, device=device)
+        cm_f = torch.empty(M, HC_MULT * HC_MULT, dtype=torch.float32, device=device)
+        li_f = torch.empty(M, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+
+        def fma_fn():
+            y_f, r_f = mhc_gemm_rms_fma_cuda(x, None, M, _N, _K, w_t=w_nk)
+            mhc_big_fuse_cuda(
+                y_f,
+                r_f,
+                residual,
+                hc_scale,
+                hc_base,
+                pm_f,
+                cm_f,
+                li_f,
+                M,
+                _K,
+                HIDDEN_SIZE,
+                1e-6,
+                1e-6,
+                1e-6,
+                1.0,
+                _SINKHORN_REPEAT,
+                num_splits=1,
+            )
+
+        t = profile_fn(fma_fn)
+        times["FMA"] = (sum_kernel_times(t, ["GemmSqrsumFma"]), sum_kernel_times(t, ["BigFuse"]))
+
+    if tl_gemm_sqrsum is not None and tl_big_fuse is not None:
+        y_tl = torch.empty(1, M, _N, dtype=torch.float32, device=device)
+        r_tl = torch.empty(1, M, dtype=torch.float32, device=device)
+        pm_tl = torch.empty(M, HC_MULT, dtype=torch.float32, device=device)
+        cm_tl = torch.empty(M, HC_MULT * HC_MULT, dtype=torch.float32, device=device)
+        li_tl = torch.empty(M, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+
+        t_gemm = profile_fn(lambda: tl_gemm_sqrsum(x, w_nk, y_tl[0], r_tl[0], _N, _K))
+        t_fuse = profile_fn(
+            lambda: tl_big_fuse(
+                y_tl,
+                r_tl,
+                hc_scale,
+                hc_base,
+                residual,
+                pm_tl,
+                cm_tl,
+                li_tl,
+                HIDDEN_SIZE,
+                1e-6,
+                1e-6,
+                1e-6,
+                1.0,
+                _SINKHORN_REPEAT,
+                n_splits=1,
+                hc_mult=HC_MULT,
+            )
+        )
+        times["TL"] = (sum_all_kernel_times(t_gemm), sum_all_kernel_times(t_fuse))
+
+    return times
+
+
+def _print_bench_timing_table(bench_entries: dict):
+    """Print the pre_mapping pipeline (GEMM + BigFuse) benchmark table."""
+    if not bench_entries:
+        return
+    all_cols = []
+    for v in bench_entries.values():
+        for c in v:
+            if c not in all_cols:
+                all_cols.append(c)
+    print("\nPRE_MAPPING PIPELINE (GEMM + BigFuse)")
+    header = f"  {'M':>6s}"
+    for c in all_cols:
+        header += f"  {c:>16s}"
+    header += f"  {'best':>8s}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for key in sorted(bench_entries):
+        _, M, _ = key
+        times = bench_entries[key]
+        totals = {c: times[c][0] + times[c][1] for c in times}
+        best = min(totals, key=totals.get) if totals else "N/A"
+        row = f"  {M:6d}"
+        for c in all_cols:
+            if c in times:
+                g, f = times[c]
+                row += f"  {g + f:8.1f}({g:4.1f}+{f:4.1f})"
+            else:
+                row += f"  {'N/A':>16s}"
+        row += f"  {best:>8s}"
+        print(row)
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped fixture: print timing table at end (pytest only)
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="session", autouse=True)
 def print_timing_stats():
-    """Fixture to print timing statistics at the end of test session."""
+    """Print collected GPU profiler timings at end of session."""
     yield
 
-    if timing_stats:
-        print("\n" + "=" * 100)
-        print("Backend Performance Statistics (Time in microseconds)")
-        print("=" * 100)
+    if not timing_stats:
+        return
 
-        # Group by test type and shape
-        test_shape_groups = {}
-        for key in timing_stats.keys():
-            parts = key.split("_")
-            # Extract test type (pre_mapping, post_mapping, hc_head) and shape params
-            if "pre_mapping" in key:
-                test_type = "pre_mapping"
-                shape_str = f"{parts[-2]}_{parts[-1]}"
-                shape_label = f"(n={parts[-2]}, hidden={parts[-1]})"
-            elif "post_mapping" in key:
-                test_type = "post_mapping"
-                shape_str = f"{parts[-2]}_{parts[-1]}"
-                shape_label = f"(n={parts[-2]}, hidden={parts[-1]})"
-            elif "hc_head" in key:
-                test_type = "hc_head"
-                shape_str = f"{parts[-2]}_{parts[-1]}"
-                shape_label = f"(m={parts[-2]}, hidden={parts[-1]})"
-            else:
-                continue
+    print("\n" + "=" * 90)
+    print("GPU Kernel Timing (torch.profiler, microseconds)")
+    print("=" * 90)
 
-            backend = parts[-3]
+    # --- Per-backend correctness/perf tests (pre_mapping, post_mapping, hc_head) ---
+    for test_type in ("pre_mapping", "post_mapping", "hc_head"):
+        entries = {
+            k: v for k, v in timing_stats.items() if isinstance(k, tuple) and k[0] == test_type
+        }
+        if not entries:
+            continue
 
-            group_key = (test_type, shape_str, shape_label)
-            if group_key not in test_shape_groups:
-                test_shape_groups[group_key] = {}
-            test_shape_groups[group_key][backend] = timing_stats[key]
+        dim_label = "m" if test_type == "hc_head" else "n"
+        print(f"\n{test_type.upper()}")
 
-        # Sort by test type, then by shape
-        for test_type, shape_str, shape_label in sorted(test_shape_groups.keys()):
-            print(f"\n{test_type.upper()} {shape_label}:")
-            print("-" * 100)
+        all_backends = sorted({b for d in entries.values() for b in d})
+        header = f"  {dim_label:>6s}  hidden"
+        for b in all_backends:
+            header += f"  {b:>10s}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
 
-            backends = test_shape_groups[(test_type, shape_str, shape_label)]
-            for backend in sorted(backends.keys()):
-                stats = backends[backend]
-                times = sorted(stats["times"])
-                n = len(times)
-                lo, hi = n // 10, n - n // 10
-                trimmed = times[lo:hi] if hi > lo else times
+        for key in sorted(entries):
+            _, dim_val, hidden = key
+            row = f"  {dim_val:6d}  {hidden:6d}"
+            for b in all_backends:
+                us = entries[key].get(b)
+                row += f"  {us:10.1f}" if us is not None else f"  {'N/A':>10s}"
+            print(row)
 
-                avg_time = sum(trimmed) / len(trimmed)
-                med_time = trimmed[len(trimmed) // 2]
-                min_time = trimmed[0]
-                max_time = trimmed[-1]
+    # --- Low-level pipeline bench table (only populated when run via main()) ---
+    bench_entries = {
+        k: v for k, v in timing_stats.items() if isinstance(k, tuple) and k[0] == "bench_pre"
+    }
+    _print_bench_timing_table(bench_entries)
 
-                # Convert to microseconds
-                print(
-                    f"  {backend:12s}: "
-                    f"median={med_time * 1e6:8.1f}us  "
-                    f"avg={avg_time * 1e6:8.1f}us  "
-                    f"min={min_time * 1e6:8.1f}us  "
-                    f"max={max_time * 1e6:8.1f}us  "
-                    f"runs={n} (trimmed {len(trimmed)})"
-                )
-
-            # Speedup using median of trimmed times
-            med_times = {}
-            for backend in backends.keys():
-                times = sorted(backends[backend]["times"])
-                n = len(times)
-                lo, hi = n // 10, n - n // 10
-                trimmed = times[lo:hi] if hi > lo else times
-                med_times[backend] = trimmed[len(trimmed) // 2]
-
-            if len(backends) > 1:
-                slowest = max(med_times.values())
-                print("\n  Speedup (median, vs slowest):")
-                for backend in sorted(med_times.keys()):
-                    speedup = (
-                        slowest / med_times[backend] if med_times[backend] > 0 else float("inf")
-                    )
-                    print(f"    {backend:12s}: {speedup:.2f}x")
-
-        print("\n" + "=" * 100)
+    print("\n" + "=" * 90)
 
 
-@pytest.mark.parametrize("n", [8])
-@pytest.mark.parametrize("hidden_size", [4096])
-@pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
-def test_ncu_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
-    """Profiling-only test: warmup outside profiler range, single call inside.
-
-    Usage:
-      ncu --set full --nvtx --nvtx-include "mhc_profile/" -o ncu_pre_<backend> \
-        pytest test_mhc.py -k "ncu_pre_mapping and <backend>" --no-header -rN
+def main():
+    """Run pre_mapping pipeline benchmark (GEMM + BigFuse) for various M.
+    Invoked when running: python test_mhc.py
     """
-    test_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
-    mod = mHC(
-        mult=hc_mult,
-        hidden_size=hidden_size,
-        sinkhorn_iters=test_data["sinkhorn_repeat"],
-        dtype=None,
-        eps=test_data["hc_pre_eps"],
-        norm_eps=test_data["rms_eps"],
-        post_mult_value=test_data["hc_post_mult_value"],
-        backend=backend,
-    ).cuda()
-    mod.fn.copy_(test_data["fn"])
-    mod.scale.copy_(test_data["hc_scale"])
-    mod.base.copy_(test_data["hc_base"])
+    torch.manual_seed(42)
+    bench_M = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    bench_stats = {}
+    for M in bench_M:
+        bench_stats[("bench_pre", M, HIDDEN_SIZE)] = run_bench_pre_mapping(M)
 
-    for _ in range(50):
-        mod.pre_mapping(test_data["residual"])
-    torch.cuda.synchronize()
-
-    torch.cuda.cudart().cudaProfilerStart()
-    torch.cuda.nvtx.range_push("mhc_profile")
-    mod.pre_mapping(test_data["residual"])
-    torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.cudart().cudaProfilerStop()
+    print("\n" + "=" * 90)
+    print("GPU Kernel Timing (torch.profiler, microseconds) — benchmark only")
+    print("=" * 90)
+    _print_bench_timing_table(bench_stats)
+    print("\n" + "=" * 90)
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    pytest.main()
+    main()
