@@ -1586,7 +1586,7 @@ class Indexer(nn.Module):
         num_ctx_tokens = metadata.num_ctx_tokens
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
-        head_dim = metadata.index_head_dim
+        head_dim = metadata.indexer_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         quant_block_size = metadata.indexer_quant_block_size
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq

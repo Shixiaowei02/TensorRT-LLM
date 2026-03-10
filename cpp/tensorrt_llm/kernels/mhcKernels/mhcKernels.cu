@@ -48,10 +48,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat)
 {
     constexpr int HC_MULT = 4;
-    constexpr int HC_MULT2 = HC_MULT * HC_MULT;           // 16 comb_mix entries
-    constexpr int HC_MULT3 = HC_MULT * (2 + HC_MULT);     // 24 = pre(4) + post(4) + comb(16)
+    constexpr int HC_MULT2 = HC_MULT * HC_MULT;       // 16 comb_mix entries
+    constexpr int HC_MULT3 = HC_MULT * (2 + HC_MULT); // 24 = pre(4) + post(4) + comb(16)
     constexpr int WARP_SIZE = 32;
-    constexpr int BF16_VEC = 8;                            // bf16 elements per uint4 load
+    constexpr int BF16_VEC = 8;                       // bf16 elements per uint4 load
 
     int const token = blockIdx.x;
     int const tid = threadIdx.x;
@@ -111,8 +111,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         // comb_mix init: norm * scale2 + base → cm[4] per lane (one row of 4×4 matrix)
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
-            cm[k] = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2
-                + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+            cm[k] = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
     }
 
     __syncthreads();
@@ -122,9 +121,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // Row normalize via local sum, column normalize via __shfl_xor across 4 lanes.
     if (warp_id == 0 && lane < HC_MULT)
     {
-        constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;  // 0xf for HC_MULT=4
+        constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1; // 0xf for HC_MULT=4
 
-        // Softmax rows: exp → row-normalize + eps
+                                                            // Softmax rows: exp → row-normalize + eps
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
             cm[k] = expf(cm[k]);
@@ -133,7 +132,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         for (int k = 0; k < HC_MULT; k++)
             cm[k] = cm[k] / rs + hc_sinkhorn_eps;
 
-        // Column normalize: sum across lanes (rows) via butterfly shuffle
+            // Column normalize: sum across lanes (rows) via butterfly shuffle
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
         {
@@ -254,8 +253,8 @@ __launch_bounds__(256) __global__ void mhcGemmSqrsumFmaKernel(__nv_bfloat16 cons
     constexpr int BLOCK_SIZE = 256;
     constexpr int WARP_SIZE = 32;
     constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-    constexpr int K_VEC = 4;                           // bf16 elements loaded per thread per iteration
-    constexpr int K_STEP = BLOCK_SIZE * K_VEC;         // K elements consumed per block per iteration
+    constexpr int K_VEC = 4;                   // bf16 elements loaded per thread per iteration
+    constexpr int K_STEP = BLOCK_SIZE * K_VEC; // K elements consumed per block per iteration
 
     int const tid = threadIdx.x;
     int const warp_id = tid / WARP_SIZE;
@@ -369,8 +368,7 @@ __launch_bounds__(256) __global__ void mhcGemmSqrsumFmaKernel(__nv_bfloat16 cons
             {
 #pragma unroll
                 for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-                    acc[g * COLS_PER_GROUP + n]
-                        += __shfl_xor_sync(FULL_WARP_MASK, acc[g * COLS_PER_GROUP + n], off);
+                    acc[g * COLS_PER_GROUP + n] += __shfl_xor_sync(FULL_WARP_MASK, acc[g * COLS_PER_GROUP + n], off);
             }
         }
         if (g == 0 && do_sqr)
@@ -503,7 +501,7 @@ __launch_bounds__(256) __global__ void mhcPostMappingKernel(__nv_bfloat16 const*
             for (int v = 0; v < BF16_VEC; v++)
                 acc[j][v] = pm[j] * xf[v];
 
-        // acc[j][v] += sum_k comb[k][j] * residual[k][v]
+                // acc[j][v] += sum_k comb[k][j] * residual[k][v]
 #pragma unroll
         for (int k = 0; k < HC_MULT; k++)
         {
