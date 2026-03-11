@@ -544,7 +544,20 @@ class MewtwoCacheManager(KVCacheManagerV2):
             # all compress ratios have SWA attention and they are in the same pool
             self._compress_ratios[self.pp_layers[0]],
         )
-        dst_tensor[0, :num_seqs, :, :] = offsets[:, None, :]
+        # Use pinned staging buffer to avoid pageable H2D memcpy
+        if not hasattr(self, "_host_block_offsets_staging"):
+            self._host_block_offsets_staging = torch.empty(
+                dst_tensor.shape[1],
+                dst_tensor.shape[2],
+                dst_tensor.shape[3],
+                dtype=dst_tensor.dtype,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+        self._host_block_offsets_staging[:num_seqs, :, :] = offsets[:, None, :]
+        dst_tensor[0, :num_seqs, :, :].copy_(
+            self._host_block_offsets_staging[:num_seqs, :, :], non_blocking=True
+        )
 
     def get_batch_attn_offset(
         self,

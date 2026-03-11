@@ -445,6 +445,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.cached_token_lens_cpu = torch.empty_like(
+            self.cached_token_lens_cuda, device="cpu", pin_memory=prefer_pinned()
+        )
 
     def prepare_for_block_tables(self):
         """
@@ -494,10 +497,8 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         if token_positions is None:
             num_requests = self.num_seqs
-            cached_token_lens = torch.tensor(
-                self.kv_cache_params.num_cached_tokens_per_seq[:num_requests],
-                dtype=torch.int32,
-                device=device,
+            cached_token_lens = self.cached_token_lens_cpu[:num_requests].to(
+                device, non_blocking=True
             )
             token_positions = torch.zeros(self.num_tokens, dtype=torch.int32, device=device)
             token_idx = 0
@@ -563,23 +564,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 total_count.to(torch.int32)
             )
 
-    def prepare(self):
-        TrtllmAttentionMetadata.prepare(self)
-
-        cached_token_lens = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq,
-            dtype=torch.int,
-            device="cpu",
-        )
-        kv_lens = cached_token_lens + self.seq_lens_kv
-        num_requests = self.num_contexts + self.num_generations
-        num_gen_tokens = self.num_tokens - self.num_ctx_tokens
-
-        self.cached_token_lens_cuda[:num_requests].copy_(
-            cached_token_lens[:num_requests].to(torch.int32), non_blocking=True
-        )
-
-        # Cache buffer data pointers
+    def prepare_for_cache_buffer_data_pointers(self):
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
@@ -605,6 +590,26 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
             self.sparse_mla_base_ptrs[ratio] = min(swa_pool_ptr, compress_pool_ptr)
+
+    def prepare(self):
+        TrtllmAttentionMetadata.prepare(self)
+
+        num_requests = self.num_contexts + self.num_generations
+        num_gen_tokens = self.num_tokens - self.num_ctx_tokens
+
+        self.cached_token_lens_cpu[:num_requests] = torch.tensor(
+            self.kv_cache_params.num_cached_tokens_per_seq[:num_requests],
+            dtype=torch.int32,
+        )
+        cached_token_lens = self.cached_token_lens_cpu
+        kv_lens = cached_token_lens[:num_requests] + self.seq_lens_kv[:num_requests]
+
+        self.cached_token_lens_cuda[:num_requests].copy_(
+            cached_token_lens[:num_requests], non_blocking=True
+        )
+
+        # Cache buffer data pointers
+        self.prepare_for_cache_buffer_data_pointers()
 
         # For indices conversion
         self.prepare_for_indices_conversion()
@@ -640,7 +645,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
         for compress_ratio in self.compress_ratio_set:
             num_comp_kv_lens = kv_lens[:num_requests] // compress_ratio
-            past_comp_kv_lens = cached_token_lens // compress_ratio
+            past_comp_kv_lens = cached_token_lens[:num_requests] // compress_ratio
             new_comp_kv_lens = num_comp_kv_lens - past_comp_kv_lens
             self.new_comp_kv_lens[compress_ratio][:num_requests] = new_comp_kv_lens
             self.new_comp_kv_lens_cuda[compress_ratio][:num_requests].copy_(
@@ -700,7 +705,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 position_ids.extend(list(range(past_kv_lens, past_kv_lens + new_kv_lens)))
             compressed_num_tokens = len(position_ids)
             self.compressed_position_ids[compress_ratio][:compressed_num_tokens] = (
-                torch.tensor(position_ids, dtype=torch.int, device="cuda") * compress_ratio
+                torch.tensor(position_ids, dtype=torch.int) * compress_ratio
             )
             self.compressed_position_ids_cuda[compress_ratio][:compressed_num_tokens].copy_(
                 self.compressed_position_ids[compress_ratio][:compressed_num_tokens],

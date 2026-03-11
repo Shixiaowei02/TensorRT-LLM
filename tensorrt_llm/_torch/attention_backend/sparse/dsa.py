@@ -588,6 +588,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        self.host_req_idx_per_token = torch.empty_like(
+            self.req_idx_per_token, device='cpu', pin_memory=prefer_pinned())
         # Block table for topk_indices conversion (shared for context and generation)
         self.scheduler_metadata_buffer = self.get_empty(
             self.cuda_graph_buffers,
