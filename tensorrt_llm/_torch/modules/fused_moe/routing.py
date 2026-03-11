@@ -189,6 +189,16 @@ class BaseMoeRoutingMethod(nn.Module):
         return self.get_experts_per_token()
 
     @property
+    def requires_separated_routing(self) -> bool:
+        """Whether routing must be computed externally (in Python) rather than
+        fused inside the C++ MoE kernel.
+
+        Override to ``True`` when the routing algorithm (e.g. sqrtsoftplus
+        scoring) is not natively supported by any C++ kernel backend.
+        """
+        return False
+
+    @property
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.Unspecified
 
@@ -470,6 +480,11 @@ class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
     @property
     def top_k(self):
         return self._top_k
+
+    @property
+    def requires_separated_routing(self) -> bool:
+        # C++ MoE kernels don't support Mewtwo's sqrtsoftplus scoring natively.
+        return True
 
     @property
     def routing_method_type(self):

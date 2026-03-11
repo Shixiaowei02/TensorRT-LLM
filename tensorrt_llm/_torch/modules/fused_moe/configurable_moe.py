@@ -635,10 +635,16 @@ class ConfigurableMoE(MoE):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         self._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
+        # ========== Step 2: Apply routing ==========
+        # Routing is done externally (separated) when:
+        # 1. Backend supports load balancer (enables EPLB), OR
+        # 2. Routing method requires external computation (e.g., its scoring
+        #    function is not natively supported by any C++ MoE kernel)
+        _requires_separated_routing = (
+            self.backend._supports_load_balancer() or self.routing_method.requires_separated_routing
+        )
 
-        if self.backend._supports_load_balancer():
-            # Separated routing: ConfigurableMoE calls routing_method
+        if _requires_separated_routing:
             token_selected_experts, token_final_scales = self.routing_method.apply(
                 router_logits, input_ids
             )
@@ -1228,12 +1234,14 @@ class ConfigurableMoE(MoE):
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:
-            # Determine router_logits based on whether routing has been done
-            # If backend doesn't support load balancer, routing is done before communication
-            # In that case, router_logits should be None (routing already done)
+            # Pass router_logits only when routing is fused into the kernel.
+            # When routing was done externally (load balancer enabled or routing
+            # method requires separated routing), pass None.
             router_logits_arg = None
-            if not self.backend._supports_load_balancer():
-                # For fused routing backends, router_logits is only needed if routing hasn't been done yet
+            if (
+                not self.backend._supports_load_balancer()
+                and not self.routing_method.requires_separated_routing
+            ):
                 router_logits_arg = router_logits
 
             kwargs["router_logits"] = router_logits_arg
