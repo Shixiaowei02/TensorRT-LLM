@@ -1801,6 +1801,12 @@ class Indexer(nn.Module):
                     self.layer_idx)
 
                 for chunk in metadata.indexer_prefill_chunks:
+                    # Skip chunks with no compressed KV tokens (e.g., warmup
+                    # sequences shorter than compress_ratio produce zero KV).
+                    if chunk.k_token_start >= chunk.k_token_end:
+                        topk_indices_buffer[
+                            chunk.token_start:chunk.token_end, :].fill_(-1)
+                        continue
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d, metadata.slot_mapping_fp8_fullkv,
@@ -1850,6 +1856,9 @@ class Indexer(nn.Module):
                         topk_indices_buffer[
                             chunk.token_start:chunk.token_end, :topk_indices.
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
+            elif metadata.num_ctx_kv_tokens == 0:
+                # No compressed KV tokens — fill with -1 (no valid indices)
+                topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 num_ctx_kv_tokens = metadata.num_ctx_kv_tokens

@@ -231,8 +231,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
             )
             self.impl.adjust(avg_history_length, avg_capacity)
             # Recompute max_seq_len after adjust() since pool ratios changed.
-            max_num_tokens = max_context_tokens + max_batch_size * (self._max_draft_len + 1)
-            self.max_seq_len = min(max_seq_len, max_num_tokens)
+            max_num_tokens = self.get_num_available_tokens(token_num_upper_bound=max_seq_len)
+            self.max_seq_len = min(max_num_tokens, max_seq_len)
             logger.info(
                 f"[Mewtwo] after adjust: max_seq_len={self.max_seq_len}, "
                 f"max_num_tokens={max_num_tokens}, original max_seq_len={max_seq_len}"
