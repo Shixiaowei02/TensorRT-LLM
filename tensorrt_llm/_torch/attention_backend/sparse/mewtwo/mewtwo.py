@@ -9,8 +9,9 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, Trtllm
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils import fp8_utils
 
-from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float
+from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float, rotate_activation
 from ..kernel import mewtwo_local_to_global_indices
 from .compressor import Compressor
 
@@ -839,14 +840,26 @@ class MewtwoIndexer(Indexer):
         )
 
     def _qk_projection_and_rope(self, qr: torch.Tensor, position_ids: torch.Tensor):
-        """Project Q and apply RoPE"""
+        """Project Q and apply RoPE.
+
+        Returns q with layout [num_tokens, n_heads, head_dim] where
+        head_dim = nope_dim + rope_dim, RoPE already applied in-place.
+        """
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
-        num_tokens = q.shape[0]
-        q_nope, q_pe = q.split([self.head_dim - self.rope_dim, self.rope_dim], dim=-1)
-        q_pe = self.rotary_emb(position_ids, [q_pe.reshape(num_tokens, -1)])[0]
-        q_pe = q_pe.view(num_tokens, self.n_heads, self.rope_dim)
-        return q_pe, q_nope
+        # Fused in-place RoPE on the rope portion of each head
+        nope_dim = self.head_dim - self.rope_dim
+        torch.ops.trtllm.mla_rope_inplace(
+            q,
+            position_ids.view(-1),
+            self.rotary_emb.rotary_cos_sin,
+            self.n_heads,
+            nope_dim,
+            self.rope_dim,
+            False,
+            self.rotary_emb.is_neox,
+        )
+        return q
 
     def forward(
         self,
@@ -867,9 +880,12 @@ class MewtwoIndexer(Indexer):
             self.aux_stream,
         )
 
-        # quantize q
-        q_pe, q_nope = q
-        q_fp8, q_scale = self._prep_q_or_k(q_pe, q_nope)
+        # Rotate + quantize (layout matches compressor K: [nope|pe])
+        q = rotate_activation(q)
+        q = q.view(-1, self.head_dim)
+        q_fp8, q_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
+            q, use_ue8m0=self.scale_fmt == "ue8m0"
+        )
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
         q_scale = q_scale.view(-1, self.n_heads, 1)
 

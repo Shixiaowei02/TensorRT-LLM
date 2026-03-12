@@ -129,6 +129,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         tokens_per_block: int,
         max_seq_len: int,
         vocab_size: int,
+        mapping: Mapping,
         dtype: DataType = DataType.BF16,
         compressor_dtype: DataType = DataType.FLOAT,
         sparse_attn_config: MewtwoSparseAttentionConfig,
@@ -196,6 +197,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             vocab_size=vocab_size,
+            mapping=mapping,
             dtype=dtype,
             **kwargs,
         )
@@ -262,6 +264,16 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 self._layer_attn_to_layer_id[first_layer_with_128, MewtwoAttentionType.COMPRESS],
                 Role.KEY,
             )
+        # Use pinned staging buffer to avoid pageable H2D memcpy
+        max_num_sequences = max_batch_size * mapping.pp_size
+        self._host_block_offsets_staging = torch.empty(
+            (max_num_sequences + 1) * max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
 
     def get_buffers(self, layer_idx: int, attn_type: MewtwoAttentionType) -> torch.Tensor:
         """
@@ -669,16 +681,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
             # all compress ratios have SWA attention and they are in the same pool
             self._compress_ratios[self.pp_layers[0]],
         )
-        # Use pinned staging buffer to avoid pageable H2D memcpy
-        if not hasattr(self, "_host_block_offsets_staging"):
-            self._host_block_offsets_staging = torch.empty(
-                dst_tensor.shape[1],
-                dst_tensor.shape[2],
-                dst_tensor.shape[3],
-                dtype=dst_tensor.dtype,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
         self._host_block_offsets_staging[:num_seqs, :, :] = offsets[:, None, :]
         dst_tensor[0, :num_seqs, :, :].copy_(
             self._host_block_offsets_staging[:num_seqs, :, :], non_blocking=True

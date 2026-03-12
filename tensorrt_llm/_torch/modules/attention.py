@@ -1649,17 +1649,12 @@ class MLA(nn.Module):
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
 
-        # RoPE for attention results
-        attn_out_nope, attn_out_pe = attn_out_latent.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Reshape to 2D for RoPE: [num_tokens, num_heads, rope_head_dim] -> [num_tokens, num_heads * rope_head_dim]
-        attn_out_pe = attn_out_pe.reshape(num_tokens, -1)
-        attn_out_pe = self.inverse_rotary_emb(position_ids, [attn_out_pe])[0]
-        # Reshape back to 3D: [num_tokens, num_heads * rope_head_dim] -> [num_tokens, num_heads, rope_head_dim]
-        attn_out_pe = attn_out_pe.view(num_tokens, self.num_heads_tp,
-                                       self.qk_rope_head_dim)
-        attn_out_latent = maybe_compiled_cat([attn_out_nope, attn_out_pe],
-                                             dim=-1)
+        # Fused in-place inverse RoPE on the rope portion of each head
+        torch.ops.trtllm.mla_rope_inplace(
+            attn_out_latent, position_ids.view(-1),
+            self.inverse_rotary_emb.rotary_cos_sin, self.num_heads_tp,
+            self.qk_nope_head_dim, self.qk_rope_head_dim, True,
+            self.inverse_rotary_emb.is_neox)
 
         # Output projections
         o_lora = torch.empty(

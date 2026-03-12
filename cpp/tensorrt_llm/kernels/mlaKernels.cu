@@ -1186,6 +1186,151 @@ INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
 
+// In-place MLA RoPE: apply RoPE to the last rope_dim elements of each [nope_dim + rope_dim] head.
+// Uses 16-byte vectorized load/store (VecType) and mmha::rotary_embedding_transform for the
+// interleaved path. Each thread handles ELTS_PER_VEC elements (8 bf16 = 4 rotation pairs).
+// Grid: (num_tokens, ceil(num_heads / HPB)), Block: (VECS_PER_ROPE, HPB)
+// cos_sin_cache layout: [max_positions, 2, half_rope] float (cos block then sin block)
+template <typename T, bool IS_INVERSE, bool IS_NEOX, int HEADS_PER_BLOCK>
+__global__ void mlaRoPEInplaceKernel(T* __restrict__ data, int32_t const* __restrict__ position_ids,
+    float const* __restrict__ cos_sin_cache, int num_heads, int nope_dim, int rope_dim)
+{
+    using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
+    constexpr int BYTES_PER_ELT = sizeof(T);
+    constexpr int BYTES_PER_LOAD = 16;
+    constexpr int ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
+
+    int const tid = threadIdx.x;
+    int const half_rope = rope_dim / 2;
+    // Neox: each thread handles one VecT from each half → half_rope elements per half
+    // Interleaved: each thread handles one VecT of interleaved pairs → rope_dim elements
+    int const vecs_per_rope
+        = IS_NEOX ? (half_rope * BYTES_PER_ELT / BYTES_PER_LOAD) : (rope_dim * BYTES_PER_ELT / BYTES_PER_LOAD);
+    int const head_idx = blockIdx.y * HEADS_PER_BLOCK + threadIdx.y;
+    if (head_idx >= num_heads || tid >= vecs_per_rope)
+        return;
+
+    int const head_size = nope_dim + rope_dim;
+    T* head_ptr = data + (static_cast<int64_t>(blockIdx.x) * num_heads + head_idx) * head_size;
+
+    int const pos = position_ids[blockIdx.x];
+    int const elem_offset = tid * ELTS_PER_VEC;
+    // cos at [pos, 0, ...], sin at [pos, 1, ...]
+    float const* cos_ptr = cos_sin_cache + pos * 2 * half_rope + elem_offset;
+    float const* sin_ptr = cos_ptr + half_rope;
+
+    if constexpr (IS_NEOX)
+    {
+        // Neox: first half = x1[0..half), second half = x2[0..half) — two separate 16-byte loads
+        VecT v1 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+        VecT v2 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + half_rope + elem_offset]);
+
+        // Each GPTJEltT holds 2 consecutive elements from the same half.
+        // For neox, we rotate (v1[j], v2[j]) independently for each element j.
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& e1 = reinterpret_cast<GPTJEltT*>(&v1)[i];
+            GPTJEltT& e2 = reinterpret_cast<GPTJEltT*>(&v2)[i];
+
+            // Construct (x1, x2) pairs and rotate — 2 pairs per GPTJElt
+            float2 coef0{cos_ptr[i * 2], IS_INVERSE ? -sin_ptr[i * 2] : sin_ptr[i * 2]};
+            float2 coef1{cos_ptr[i * 2 + 1], IS_INVERSE ? -sin_ptr[i * 2 + 1] : sin_ptr[i * 2 + 1]};
+
+            float2 p1 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[0]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[0])},
+                coef0);
+            float2 p2 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[1]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[1])},
+                coef1);
+
+            reinterpret_cast<T*>(&e1)[0] = static_cast<T>(p1.x);
+            reinterpret_cast<T*>(&e1)[1] = static_cast<T>(p2.x);
+            reinterpret_cast<T*>(&e2)[0] = static_cast<T>(p1.y);
+            reinterpret_cast<T*>(&e2)[1] = static_cast<T>(p2.y);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v1;
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + half_rope + elem_offset]) = v2;
+    }
+    else
+    {
+        // Interleaved: (x1, x2) adjacent pairs — matches GPTJ layout, single 16-byte load
+        VecT v = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+
+        // For interleaved, cos_ptr/sin_ptr index by pair (half the element count)
+        float const* cos_pair = cos_sin_cache + pos * 2 * half_rope + (elem_offset / 2);
+        float const* sin_pair = cos_pair + half_rope;
+
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& elt = reinterpret_cast<GPTJEltT*>(&v)[i];
+            float2 coef{cos_pair[i], IS_INVERSE ? -sin_pair[i] : sin_pair[i]};
+            elt = mmha::rotary_embedding_transform(elt, coef);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v;
+    }
+}
+
+template <typename T>
+void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos_sin_cache, int num_tokens,
+    int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(rope_dim % 4 == 0, "rope_dim must be divisible by 4");
+    constexpr int BYTES_PER_LOAD = 16;
+    int const elt_size = static_cast<int>(sizeof(T));
+
+    auto launch = [&](auto inverse_tag, auto neox_tag)
+    {
+        constexpr bool INV = decltype(inverse_tag)::value;
+        constexpr bool NEOX = decltype(neox_tag)::value;
+        // Neox loads from two halves → threads = half_rope elements / ELTS_PER_VEC
+        // Interleaved loads contiguous → threads = rope_dim elements / ELTS_PER_VEC
+        int const active_elts = NEOX ? (rope_dim / 2) : rope_dim;
+        int const vecs_per_rope = active_elts * elt_size / BYTES_PER_LOAD;
+
+        constexpr int kMaxBlockSize = 256;
+        constexpr int kMaxHeadsPerBlock = 16;
+        int const hpb = std::max(1, std::min({kMaxBlockSize / vecs_per_rope, num_heads, kMaxHeadsPerBlock}));
+        dim3 grid(num_tokens, (num_heads + hpb - 1) / hpb);
+
+        if (hpb <= 4)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 4><<<grid, dim3(vecs_per_rope, 4), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else if (hpb <= 8)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 8><<<grid, dim3(vecs_per_rope, 8), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 16><<<grid, dim3(vecs_per_rope, 16), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+    };
+
+    if (inverse && is_neox)
+        launch(std::true_type{}, std::true_type{});
+    else if (inverse && !is_neox)
+        launch(std::true_type{}, std::false_type{});
+    else if (!inverse && is_neox)
+        launch(std::false_type{}, std::true_type{});
+    else
+        launch(std::false_type{}, std::false_type{});
+}
+
+#define INSTANTIATE_MLA_ROPE_INPLACE(T)                                                                                \
+    template void invokeMLARoPEInplace<T>(T * data, int32_t const* position_ids, float const* cos_sin_cache,           \
+        int num_tokens, int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream);
+
+INSTANTIATE_MLA_ROPE_INPLACE(__nv_bfloat16);
+INSTANTIATE_MLA_ROPE_INPLACE(half);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
