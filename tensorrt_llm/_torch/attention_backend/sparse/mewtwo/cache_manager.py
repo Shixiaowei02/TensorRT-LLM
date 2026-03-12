@@ -1,9 +1,9 @@
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.resource_manager import GPU_LEVEL, KVCacheManagerV2, Role
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -38,7 +38,72 @@ from .mewtwo import (
 )
 
 
+def _get_adjust_len(
+    max_input_len: int,
+    max_seq_len: int,
+    max_num_context: int,
+    num_generation: int,
+) -> Tuple[int, int]:
+    total_requests = max_num_context + num_generation
+    assert total_requests > 0, "max_num_context + num_generation must be positive"
+
+    avg_history_length = round(num_generation * max_seq_len / total_requests)
+    avg_capacity = round(
+        (max_num_context * max_input_len + num_generation * max_seq_len) / total_requests
+    )
+    return avg_history_length, avg_capacity
+
+
+def _estimate_bytes_per_token(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratios: List[int],
+    has_fp8_kv_cache,
+    attn_types: set[MewtwoAttentionType] | None = None,
+) -> int:
+    total_bytes = 0
+    for ratio in compress_ratios:
+        for attn in MewtwoAttentionType:
+            if attn_types is not None and attn not in attn_types:
+                continue
+            if compress_ratio_has_attention(ratio, attn):
+                total_bytes += _get_attn_bytes_per_token(
+                    head_dim,
+                    index_head_dim,
+                    ratio,
+                    attn,
+                    has_fp8_kv_cache,
+                )
+    return total_bytes
+
+
+def _get_attn_bytes_per_token(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratio: int,
+    attn_type: MewtwoAttentionType,
+    has_fp8_kv_cache: bool,
+) -> int:
+    token_bytes = get_token_bytes(
+        head_dim,
+        index_head_dim,
+        compress_ratio,
+        attn_type,
+        has_fp8_kv_cache,
+    )
+    if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+        token_bytes //= compress_ratio
+    return token_bytes
+
+
 class MewtwoCacheManager(KVCacheManagerV2):
+    fixed_size_attention = {
+        MewtwoAttentionType.SWA,
+        MewtwoAttentionType.COMPRESSOR_STATE,
+        MewtwoAttentionType.COMPRESSOR_SCORE,
+        MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
+        MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+    }
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains pool pointers swa pool, shape: [1, 2]
     # It assume the KVCacheManagerPy has only one pool for swa attention.
@@ -67,6 +132,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         dtype: DataType = DataType.BF16,
         compressor_dtype: DataType = DataType.FLOAT,
         sparse_attn_config: MewtwoSparseAttentionConfig,
+        max_input_len: Optional[int] = None,
         **kwargs,
     ) -> None:
         # Mewtwo specific attributes initialization
@@ -95,7 +161,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # sliding-window policy.
         spec_config = kwargs.get("spec_config", None)
         self._max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
-        self._window_size = sparse_attn_config.window_size + self._max_draft_len
+        self._swa_window_size = sparse_attn_config.window_size
         self._compressor_dtype = compressor_dtype
         # If MTP is enabled, append compress ratios for MTP virtual layers.
         # MTP adds (max_draft_len - 1) extra layers that mirror the last real
@@ -135,20 +201,40 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
         self.is_vswa = True  # Mewtwo must has VSWA
 
-        # TODO: Remove this override once KVCacheManagerV2 natively supports
-        # get_max_resource_count / get_needed_resource_to_completion.
-        # Currently V2 stubs return 1 and 0, which disables scheduler capacity
-        # checking and causes OOM in prepare_resources.
-        bytes_per_token = self.get_cache_bytes_per_token()
-        if bytes_per_token > 0:
-            quota = self.impl.get_quota(GPU_LEVEL)
-            usable_quota = quota * kv_cache_config.max_util_for_resume
-            self._max_tokens_for_scheduling = int(usable_quota / bytes_per_token)
-        else:
-            self._max_tokens_for_scheduling = max_seq_len * max_batch_size
-        logger.info(
-            f"Mewtwo cache manager max tokens for scheduling: {self._max_tokens_for_scheduling}"
+        # TODO(jiaganc): this is a workaround to call adjust()
+        # Derive max_context_tokens from max_num_tokens:
+        # max_num_tokens = max_context_tokens + max_batch_size * (max_draft_len + 1)
+        max_num_tokens = kwargs.get("max_num_tokens", None)
+        max_context_tokens = (
+            max_num_tokens - max_batch_size * (self._max_draft_len + 1)
+            if max_num_tokens is not None
+            else None
         )
+        if max_input_len is not None and max_context_tokens is not None and max_context_tokens > 0:
+            assert max_input_len > 0, "max_input_len must be positive"
+            cap = max_batch_size * (max_input_len + self._max_draft_len + 1)
+            if max_context_tokens > cap:
+                logger.warning(
+                    f"max_context_tokens ({max_context_tokens}) exceeds "
+                    f"max_batch_size * max_input_len ({cap}), capping to {cap}"
+                )
+                max_context_tokens = cap
+            max_num_context = max_context_tokens // max_input_len
+            num_generation = max_batch_size - max_num_context
+            avg_history_length, avg_capacity = _get_adjust_len(
+                max_input_len,
+                max_seq_len,
+                max_num_context,
+                num_generation,
+            )
+            self.impl.adjust(avg_history_length, avg_capacity)
+            # Recompute max_seq_len after adjust() since pool ratios changed.
+            max_num_tokens = max_context_tokens + max_batch_size * (self._max_draft_len + 1)
+            self.max_seq_len = min(max_seq_len, max_num_tokens)
+            logger.info(
+                f"[Mewtwo] after adjust: max_seq_len={self.max_seq_len}, "
+                f"max_num_tokens={max_num_tokens}, original max_seq_len={max_seq_len}"
+            )
 
         # Mewtwo expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
@@ -223,6 +309,16 @@ class MewtwoCacheManager(KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
+    def _get_window_size(self, compress_ratio: int, attn_type: MewtwoAttentionType) -> int:
+        if attn_type == MewtwoAttentionType.SWA:
+            base_window_size = self._swa_window_size
+        elif attn_type in self.fixed_size_attention:
+            state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+            base_window_size = state_factor * compress_ratio
+        else:
+            raise ValueError(f"Unsupported fixed-size attention type: {attn_type}")
+        return base_window_size + self._max_draft_len
+
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         first_pp_layer = self.pp_layers[0]
         swa_bytes_per_block = self._get_attn_bytes_per_block(
@@ -276,8 +372,11 @@ class MewtwoCacheManager(KVCacheManagerV2):
         layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         base_indices = self.kv_cache_map[request_id].get_base_page_indices(pool_id).tolist()
-        scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
-        return [idx * scale if idx != -1 else -1 for idx in base_indices]
+        converter = self.impl.get_page_index_converter(layer_id, Role.KEY)
+        result = []
+        for idx in base_indices:
+            result.extend(converter(idx))
+        return result
 
     def _get_cache_quota(self, max_tokens: int) -> int:
         quota = int(max_tokens * self.get_cache_bytes_per_token())
@@ -324,12 +423,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
             compress_ratio = self._compress_ratios[layer]
             is_compress = is_compress_layer(compress_ratio)
             is_sparse = is_sparse_layer(compress_ratio)
-            is_overlap = is_overlap_compressor(compress_ratio)
-
-            state_factor = 2 if is_overlap else 1
 
             # sliding window attention pool
-            _add_layer(layer, MewtwoAttentionType.SWA, self._window_size)
+            _add_layer(
+                layer,
+                MewtwoAttentionType.SWA,
+                self._get_window_size(compress_ratio, MewtwoAttentionType.SWA),
+            )
 
             if is_compress:
                 # compressed attention pool
@@ -338,7 +438,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 # including compressor kv states and compressor score states.
                 # Add max_draft_len so rewind after rejected draft tokens can
                 # still reach past states.
-                compressor_window = state_factor * compress_ratio + self._max_draft_len
+                compressor_window = self._get_window_size(
+                    compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE
+                )
                 _add_layer(layer, MewtwoAttentionType.COMPRESSOR_STATE, compressor_window)
                 _add_layer(layer, MewtwoAttentionType.COMPRESSOR_SCORE, compressor_window)
 
@@ -348,7 +450,9 @@ class MewtwoCacheManager(KVCacheManagerV2):
                 _add_layer(layer, MewtwoAttentionType.INDEXER_COMPRESS, None)
                 # indexer has its own compressor, so a separate compressor state
                 # similarly, indexer compressor state is managed as a sliding window attention cache
-                indexer_compressor_window = state_factor * compress_ratio + self._max_draft_len
+                indexer_compressor_window = self._get_window_size(
+                    compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE
+                )
                 _add_layer(
                     layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE, indexer_compressor_window
                 )
@@ -382,7 +486,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
             compress_ratio = self._compress_ratios[layer_idx]
             layer_id = self._layer_attn_to_layer_id[layer_idx, attn_type]
             pool_id = self.layer_to_pool_mapping_dict[layer_id]
-            scale = self.impl.get_page_index_scale(layer_id, Role.KEY)
+            converter = self.impl.get_page_index_converter(layer_id, Role.KEY)
+            scale = converter.scale
 
             # check if the pool id is consistent
             if compress_ratio in attn_ratio_to_pool_id[attn_type]:
@@ -456,21 +561,65 @@ class MewtwoCacheManager(KVCacheManagerV2):
         """Get the average cache bytes per token for Mewtwo."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return self._estimate_bytes_per_token(
+        return _estimate_bytes_per_token(
             self.head_dim,
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
         )
 
-    # TODO: Remove the following two overrides once KVCacheManagerV2
-    # natively implements get_max_resource_count / get_needed_resource_to_completion.
     def get_max_resource_count(self) -> int:
-        return self._max_tokens_for_scheduling
+        # Keep scheduler capacity tied to physical GPU KV quota in bytes.
+        return int(self.impl.get_quota(GPU_LEVEL))
 
-    # TODO: take SWA into consideration
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        return request.orig_prompt_len + request.max_new_tokens + self.num_extra_kv_tokens
+    def _is_context_request(self, request: llm_request.LlmRequest) -> bool:
+        if getattr(request, "is_context_init_state", False):
+            return True
+        return getattr(request, "state", None) == llm_request.LlmRequestState.CONTEXT_INIT
+
+    def _is_generation_request(self, request: llm_request.LlmRequest) -> bool:
+        if (
+            getattr(request, "is_generation_in_progress_state", False)
+            or getattr(request, "is_generation_to_complete_state", False)
+            or getattr(request, "is_disagg_generation_init_state", False)
+        ):
+            return True
+        return getattr(request, "state", None) in (
+            llm_request.LlmRequestState.GENERATION_IN_PROGRESS,
+            llm_request.LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+
+    def _get_context_bytes(self, request: llm_request.LlmRequest) -> int:
+        prompt_len = max(0, getattr(request, "prompt_len", request.orig_prompt_len))
+        total_tokens = prompt_len + self.num_extra_kv_tokens
+        return total_tokens * self.get_cache_bytes_per_token()
+
+    def _get_generation_bytes(self, request: llm_request.LlmRequest) -> int:
+        prompt_len = max(0, getattr(request, "prompt_len", request.orig_prompt_len))
+        max_new_tokens = max(0, request.max_new_tokens)
+        total_tokens = prompt_len + max_new_tokens + self.num_extra_kv_tokens
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        total_bytes = 0
+        for layer in self.pp_layers:
+            compress_ratio = self._compress_ratios[layer]
+            for attn_type in MewtwoAttentionType:
+                if not compress_ratio_has_attention(compress_ratio, attn_type):
+                    continue
+                token_bytes = _get_attn_bytes_per_token(
+                    self.head_dim, self.index_head_dim, compress_ratio, attn_type, has_fp8_kv_cache
+                )
+                attn_tokens = total_tokens
+                if attn_type in self.fixed_size_attention:
+                    attn_tokens = self._get_window_size(compress_ratio, attn_type)
+                total_bytes += attn_tokens * token_bytes
+        return total_bytes
+
+    def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
+        if self._is_generation_request(request):
+            return self._get_generation_bytes(request)
+        if self._is_context_request(request):
+            return self._get_context_bytes(request)
+        raise ValueError(f"Unsupported request state: {request.state}")
 
     def get_layer_bytes_per_token(
         self,
@@ -480,30 +629,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
         raise NotImplementedError(
             "Mewtwo doesn't support get_layer_bytes_per_token, use _get_attn_bytes_per_block"
         )
-
-    @staticmethod
-    def _estimate_bytes_per_token(
-        head_dim: int,
-        index_head_dim: int,
-        compress_ratios: List[int],
-        has_fp8_kv_cache,
-    ) -> int:
-        total_bytes = 0
-        for ratio in compress_ratios:
-            for attn in MewtwoAttentionType:
-                if compress_ratio_has_attention(ratio, attn):
-                    attn_bytes = get_token_bytes(
-                        head_dim,
-                        index_head_dim,
-                        ratio,
-                        attn,
-                        has_fp8_kv_cache,
-                    )
-                    # compressed attention will be compressed by the compress ratio
-                    if attn in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
-                        attn_bytes //= ratio
-                    total_bytes += attn_bytes
-        return total_bytes
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
@@ -610,7 +735,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             has_fp8_kv_cache = quant_config.quant_mode.has_fp8_kv_cache()
         else:
             has_fp8_kv_cache = False
-        return MewtwoCacheManager._estimate_bytes_per_token(
+        return _estimate_bytes_per_token(
             head_dim,
             index_head_dim,
             compress_ratios,

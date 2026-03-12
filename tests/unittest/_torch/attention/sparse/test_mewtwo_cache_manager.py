@@ -684,7 +684,7 @@ class TestMewtwoCacheManager:
 
         # Simulate the prefill phrase
         scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests = requests
+        scheduled_batch.context_requests_last_chunk = requests
         cache_manager.prepare_resources(scheduled_batch)
 
         # Write context to cache
