@@ -8,7 +8,6 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import rotate_activation
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.utils import maybe_compiled_cat
 from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import compressed_kv_scatter_cutile, kv_compress_cutile, kv_compress_prefill_cutile
@@ -203,21 +202,12 @@ class Compressor(nn.Module):
             else:
                 return kv_comp
 
-        # Post-processing: RMSNorm -> RoPE -> Hadamard rotation
-        kv_comp = self.norm(kv_comp)
-        kv_comp_nope, kv_comp_pe = kv_comp.split([self.nope_head_dim, self.rope_head_dim], dim=-1)
-
-        kv_comp_pe = self.rotary_emb(
-            metadata.compressed_position_ids_cuda[self.compress_ratio][: kv_comp_pe.shape[0]],
-            [kv_comp_pe],
-        )
-        kv_comp = maybe_compiled_cat([kv_comp_nope, kv_comp_pe[0]], dim=-1)
-        kv_comp = rotate_activation(kv_comp)
-
         # Scatter to cache with appropriate quantization
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
 
         if self.kv_cache_dtype == "fp8_blockwise":
+            # FP8 modes still use the unfused pipeline
+            kv_comp = self._postprocess(kv_comp, metadata)
             return self._scatter_fp8_blockwise(
                 kv_comp,
                 num_comp_tokens,
@@ -229,6 +219,7 @@ class Compressor(nn.Module):
                 max_comp_kv_lens,
             )
         elif self.kv_cache_dtype == "fp8_pertensor":
+            kv_comp = self._postprocess(kv_comp, metadata)
             return self._scatter_fp8_pertensor(
                 kv_comp,
                 num_comp_tokens,
@@ -240,18 +231,44 @@ class Compressor(nn.Module):
                 max_comp_kv_lens,
             )
         else:
-            compressed_kv_scatter_cutile(
-                kv_comp,
-                num_comp_tokens,
-                cu_new_comp_kv,
-                start_pos,
-                kv_cache,
-                block_table,
-                compress_tokens_per_block,
-                self.head_dim,
-                max_comp_kv_lens,
-            )
+            total_tokens = kv_comp.shape[0]
+            if total_tokens > 0 and max_comp_kv_lens > 0:
+                position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
+                torch.ops.trtllm.compressor_fused_postprocess_scatter(
+                    kv_comp,
+                    self.norm.weight,
+                    self.norm.variance_epsilon,
+                    self.rotary_emb.rotary_cos_sin.float().contiguous(),
+                    position_ids.to(torch.int32).contiguous(),
+                    self.nope_head_dim,
+                    self.rope_head_dim,
+                    kv_cache,
+                    num_comp_tokens,
+                    cu_new_comp_kv,
+                    start_pos,
+                    block_table,
+                    compress_tokens_per_block,
+                    self.head_dim,
+                    total_tokens,
+                )
             return kv_comp
+
+    def _postprocess(self, kv_comp: torch.Tensor, metadata) -> torch.Tensor:
+        """Apply RMSNorm, RoPE, and Hadamard transform to compressed tokens."""
+        kv_comp = self.norm(kv_comp)
+        position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][: kv_comp.shape[0]]
+        torch.ops.trtllm.mla_rope_inplace(
+            kv_comp.unsqueeze(1),
+            position_ids.view(-1),
+            self.rotary_emb.rotary_cos_sin,
+            1,
+            self.nope_head_dim,
+            self.rope_head_dim,
+            False,
+            self.rotary_emb.is_neox,
+        )
+        kv_comp = rotate_activation(kv_comp)
+        return kv_comp
 
     def _scatter_fp8_blockwise(
         self,

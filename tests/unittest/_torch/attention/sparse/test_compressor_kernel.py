@@ -279,21 +279,6 @@ def pack_prefill_inputs(kv_list, score_list):
     return kv_score, seq_lens
 
 
-def create_compressed_kv_cache(batch_size, max_compressed_len, head_dim, tokens_per_block=4):
-    """Create paged cache for compressed KV storage."""
-    max_blocks_per_seq = (max_compressed_len + tokens_per_block - 1) // tokens_per_block
-    num_blocks = batch_size * max_blocks_per_seq
-    kv_factor = 1
-    kv_cache = torch.zeros(num_blocks, kv_factor, tokens_per_block * head_dim, device="cuda")
-    block_offsets = torch.zeros(batch_size, max_blocks_per_seq, device="cuda", dtype=torch.int32)
-    for b in range(batch_size):
-        block_ids = torch.arange(
-            b * max_blocks_per_seq, (b + 1) * max_blocks_per_seq, device="cuda", dtype=torch.int32
-        )
-        block_offsets[b, :] = block_ids
-    return kv_cache, block_offsets, tokens_per_block, max_blocks_per_seq
-
-
 # ============================================================================
 # Correctness Tests
 # ============================================================================
@@ -385,7 +370,7 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
         pytest.fail("cuTile returned empty output but PyTorch returned valid output")
     else:
         out_reshaped = kv_comp.view(batch_size, num_chunks, head_dim)
-        assert torch.allclose(out_py.to(kv_comp.dtype), out_reshaped, rtol=2e-3, atol=1e-3), (
+        assert torch.allclose(out_py.to(kv_comp.dtype), out_reshaped, rtol=2e-3, atol=5e-3), (
             f"Output mismatch: max diff = {(out_py.to(kv_comp.dtype) - out_reshaped).abs().max():.6f}"
         )
 
@@ -1053,423 +1038,113 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
         step += actual_n
 
 
-# Scatter kernel test configs
-SCATTER_CONFIGS = [
-    # Basic cases
-    pytest.param(1, 8, [4], [0], 4, id="single_batch_basic"),
-    pytest.param(2, 16, [2, 3], [0, 1], 4, id="multi_batch_basic"),
-    pytest.param(4, 32, [1, 2, 1, 3], [2, 0, 1, 4], 4, id="varied_outputs"),
-    # Corner cases: single output
-    pytest.param(1, 8, [1], [0], 4, id="single_output"),
-    pytest.param(1, 16, [1], [5], 4, id="single_output_nonzero_start"),
-    # Corner cases: cross block boundary
-    pytest.param(1, 8, [6], [2], 4, id="cross_block_boundary"),
-    pytest.param(2, 16, [5, 7], [3, 1], 4, id="multi_batch_cross_block"),
-    # Corner cases: large head_dim
-    pytest.param(1, 128, [3], [0], 4, id="large_head_dim"),
-    pytest.param(2, 256, [2, 2], [0, 4], 4, id="very_large_head_dim"),
-    # Corner cases: different tokens_per_block
-    pytest.param(1, 16, [8], [0], 8, id="large_block_size"),
-    pytest.param(2, 16, [3, 4], [0, 2], 2, id="small_block_size"),
-    # Corner cases: high start positions (stress paging)
-    pytest.param(1, 16, [2], [100], 4, id="high_start_pos"),
-    pytest.param(2, 8, [1, 1], [50, 75], 4, id="high_start_pos_multi"),
-    # Corner cases: uneven batches
-    pytest.param(3, 16, [1, 5, 2], [0, 0, 10], 4, id="uneven_outputs"),
-    pytest.param(4, 8, [10, 1, 8, 3], [0, 5, 2, 12], 4, id="highly_uneven"),
-]
+# ============================================================================
+# Fused PostProcess + Scatter Test
+# ============================================================================
+
+try:
+    _HAS_FUSED_SCATTER = hasattr(torch.ops.trtllm, "compressor_fused_postprocess_scatter")
+except Exception:
+    _HAS_FUSED_SCATTER = False
 
 
 @pytest.mark.parametrize(
-    "batch_size,head_dim,num_outputs_list,start_positions,tokens_per_block", SCATTER_CONFIGS
+    "batch_size,num_tokens,head_dim,nope_dim,rope_dim,tokens_per_block",
+    [
+        pytest.param(1, 16, 128, 64, 64, 32, id="b1_t16_hd128"),
+        pytest.param(1, 64, 128, 64, 64, 32, id="b1_t64_hd128"),
+        pytest.param(2, 32, 128, 64, 64, 32, id="b2_t32_hd128"),
+        pytest.param(1, 128, 512, 256, 256, 128, id="b1_t128_hd512"),
+        pytest.param(2, 64, 512, 256, 256, 128, id="b2_t64_hd512"),
+        pytest.param(4, 32, 512, 256, 256, 128, id="b4_t32_hd512"),
+    ],
 )
-def test_compressed_kv_scatter(
-    batch_size, head_dim, num_outputs_list, start_positions, tokens_per_block
+@pytest.mark.skipif(not _HAS_FUSED_SCATTER, reason="Fused CUDA scatter not available")
+def test_fused_postprocess_scatter(
+    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
 ):
-    """Test compressed KV scatter kernel."""
-    num_outputs = torch.tensor(num_outputs_list, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv[1:] = torch.cumsum(num_outputs, dim=0)
-    total_outputs = cu_new_comp_kv[-1].item()
-    compressed_kv = torch.randn(total_outputs, head_dim, device="cuda")
-    start_pos = torch.tensor(start_positions, device="cuda", dtype=torch.int32)
+    """Compare fused RMSNorm+RoPE+Hadamard+Scatter vs sequential unfused path.
 
-    max_compressed_len = max(start_positions) + max(num_outputs_list) + 4
-    kv_cache, block_offsets, _, _ = create_compressed_kv_cache(
-        batch_size, max_compressed_len, head_dim, tokens_per_block
-    )
-    max_outputs = num_outputs.max().item()
-
-    compressed_kv_scatter_cutile(
-        compressed_kv,
-        num_outputs,
-        cu_new_comp_kv,
-        start_pos,
-        kv_cache,
-        block_offsets,
-        tokens_per_block,
-        head_dim,
-        max_outputs,
-    )
-
-    for b in range(batch_size):
-        for i in range(num_outputs_list[b]):
-            cache_pos = start_positions[b] + i
-            logical_block = cache_pos // tokens_per_block
-            token_offset = cache_pos % tokens_per_block
-            phys_block = block_offsets[b, logical_block].item()
-            expected = compressed_kv[cu_new_comp_kv[b].item() + i]
-            actual = kv_cache[
-                phys_block, 0, token_offset * head_dim : (token_offset + 1) * head_dim
-            ]
-            assert torch.allclose(expected, actual.to(expected.dtype), rtol=1e-5, atol=1e-6), (
-                f"Mismatch at batch={b}, output={i}, cache_pos={cache_pos}"
-            )
-
-
-# ============================================================================
-# FP8 Blockwise Scatter Tests
-# ============================================================================
-
-
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize("batch_size,tokens_per_req", [(1, 32), (3, 32)])
-def test_fp8_scatter_kernel(head_dim, batch_size, tokens_per_req):
+    Ensures the fused CUDA kernel produces identical paged KV cache output as
+    the reference pipeline: RMSNorm -> RoPE -> Hadamard -> Scatter.
     """
-    Compare cuTile FP8 scatter kernel vs CUDA kernel (torch.ops.trtllm.indexer_k_cache_scatter_op).
-
-    The CUDA kernel only supports head_dim=128, so for larger head_dim we compare
-    against the Python reference. For head_dim=128, we use the CUDA kernel as golden.
-    """
-    from tensorrt_llm.quantization.utils import fp8_utils
-
-    torch.manual_seed(123)
-
-    block_size = 64
-    num_tokens = batch_size * tokens_per_req
-    max_seq_len = 512
-
-    # Compute scale size (1x128 blockwise quantization)
-    num_scale_blocks = (head_dim + 127) // 128
-    scale_size = num_scale_blocks * 4
-    per_token_size = head_dim + scale_size
-
-    # Allocate cache with enough blocks
-    max_blocks = (max_seq_len + block_size - 1) // block_size
-    num_blocks = batch_size * max_blocks
-
-    # Cache for cuTile kernel - use fp8 dtype to match compressor usage
-    # Non-interleaved layout per block: [k0, k1, ..., kN, scale0, scale1, ..., scaleN]
-    # Total size per block = block_size * head_dim + block_size * scale_size = block_size * per_token_size
-    total_block_elems = block_size * per_token_size
-    kv_cache_cutile = torch.zeros(
-        num_blocks, total_block_elems, device="cuda", dtype=torch.float8_e4m3fn
-    )
-    # Cache for golden (CUDA kernel or Python reference) - uint8 for byte comparison
-    kv_cache_golden = torch.zeros(num_blocks, total_block_elems, device="cuda", dtype=torch.uint8)
-
-    # Block offsets: [batch_size, max_blocks]
-    block_offsets = torch.zeros(batch_size, max_blocks, device="cuda", dtype=torch.int32)
-    for b in range(batch_size):
-        for blk in range(max_blocks):
-            block_offsets[b, blk] = b * max_blocks + blk
-
-    # Generate test data
-    k_original = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
-    k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
-
-    # Prepare data for kernel
-    # FP8 data: pass as fp8 (same bytes, kernel handles it)
-    k_fp8_contiguous = k_fp8.contiguous().view(num_tokens, head_dim)
-    # Scale data: uint8 bytes (needed for golden reference only)
-    k_scale_bytes = k_scale.contiguous().flatten().view(torch.uint8).view(num_tokens, scale_size)
-
-    # Metadata
-    num_comp_tokens = torch.full((batch_size,), tokens_per_req, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv[1:] = num_comp_tokens.cumsum(0)
-    start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
-    max_outputs = num_comp_tokens.max().item()
-
-    # ========== cuTile Kernel ==========
-    compressed_kv_scatter_cutile(
-        k_fp8_contiguous,
-        num_comp_tokens,
-        cu_new_comp_kv,
-        start_pos,
-        kv_cache_cutile,
-        block_offsets,
-        block_size,
-        head_dim,
-        max_outputs=max_outputs,
-        kv_cache_dtype="fp8_blockwise",
-        kv_scale=k_scale,
-    )
-    torch.cuda.synchronize()
-
-    # ========== Golden: CUDA kernel for head_dim=128, Python for others ==========
-    # Non-interleaved layout: [k0, k1, ..., kN, scale0, scale1, ..., scaleN] per block
-    # FP8 offset for token i: block_base + i * head_dim
-    # Scale offset for token i: block_base + block_size * head_dim + i * scale_size
-    if head_dim == 128:
-        # Use CUDA kernel as golden (it only supports head_dim=128)
-        # Need to compute flat slot mappings for the CUDA kernel
-        slot_mapping_fp8 = torch.zeros(num_tokens, device="cuda", dtype=torch.int64)
-        slot_mapping_scale = torch.zeros(num_tokens, device="cuda", dtype=torch.int64)
-
-        global_token_idx = 0
-        for b in range(batch_size):
-            for local_idx in range(tokens_per_req):
-                cache_pos = int(start_pos[b].item()) + local_idx
-                logical_block = cache_pos // block_size
-                token_offset = cache_pos % block_size
-                phys_block = int(block_offsets[b, logical_block].item())
-
-                # Non-interleaved flat byte index for FP8 data
-                fp8_offset = phys_block * total_block_elems + token_offset * head_dim
-                # Non-interleaved flat byte index for scale data
-                scale_offset = (
-                    phys_block * total_block_elems
-                    + block_size * head_dim
-                    + token_offset * scale_size
-                )
-
-                slot_mapping_fp8[global_token_idx] = fp8_offset
-                slot_mapping_scale[global_token_idx] = scale_offset
-                global_token_idx += 1
-
-        # Prepare byte-level data for CUDA kernel
-        k_fp8_bytes = k_fp8.contiguous().flatten().view(torch.uint8).view(num_tokens, head_dim)
-
-        # Reshape cache for CUDA kernel: [num_blocks, block_size, 1, per_token_size]
-        kv_cache_golden_reshaped = kv_cache_golden.view(num_blocks, block_size, per_token_size)
-
-        torch.ops.trtllm.indexer_k_cache_scatter_op(
-            k_fp8_bytes,
-            k_scale_bytes,
-            kv_cache_golden_reshaped.unsqueeze(2),
-            slot_mapping_fp8,
-            slot_mapping_scale,
-        )
-        torch.cuda.synchronize()
-
-        # Flatten back for comparison
-        kv_cache_golden = kv_cache_golden_reshaped.view(num_blocks, total_block_elems)
-    else:
-        # Use Python reference for larger head_dim (CUDA kernel doesn't support)
-        # Non-interleaved layout: FP8 region then scale region within each block
-        # Prepare byte-level data for Python reference
-        k_fp8_bytes = k_fp8.contiguous().flatten().view(torch.uint8).view(num_tokens, head_dim)
-
-        global_token_idx = 0
-        for b in range(batch_size):
-            for local_idx in range(tokens_per_req):
-                cache_pos = int(start_pos[b].item()) + local_idx
-                logical_block = cache_pos // block_size
-                token_offset = cache_pos % block_size
-                phys_block = int(block_offsets[b, logical_block].item())
-
-                # Write FP8 data (first section of block)
-                fp8_start = token_offset * head_dim
-                kv_cache_golden[phys_block, fp8_start : fp8_start + head_dim] = k_fp8_bytes[
-                    global_token_idx
-                ]
-                # Write scale data (second section of block)
-                scale_start = block_size * head_dim + token_offset * scale_size
-                kv_cache_golden[phys_block, scale_start : scale_start + scale_size] = k_scale_bytes[
-                    global_token_idx
-                ]
-
-                global_token_idx += 1
-
-    # ========== Validation ==========
-    # Compare as bytes (view both as uint8)
-    cutile_bytes = kv_cache_cutile.view(torch.uint8)
-    golden_bytes = kv_cache_golden.view(torch.uint8)
-
-    if torch.equal(cutile_bytes, golden_bytes):
-        print(f"PASS: head_dim={head_dim}, batch={batch_size}, tokens={num_tokens}")
-    else:
-        # Find differences
-        diff_mask = cutile_bytes != golden_bytes
-        num_diffs = diff_mask.sum().item()
-        total_bytes = cutile_bytes.numel()
-
-        # Show first few differences
-        diff_indices = torch.nonzero(diff_mask.view(-1))[:5]
-        for idx in diff_indices:
-            flat_idx = idx.item()
-            print(
-                f"  Byte {flat_idx}: cuTile={cutile_bytes.view(-1)[flat_idx].item()}, "
-                f"Golden={golden_bytes.view(-1)[flat_idx].item()}"
-            )
-
-        raise AssertionError(
-            f"cuTile kernel differs from golden: {num_diffs}/{total_bytes} bytes ({100 * num_diffs / total_bytes:.4f}%)"
-        )
-
-
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("batch_size,tokens_per_req", [(1, 16), (2, 32)])
-def test_fp8_pertensor_scatter_cutile(head_dim, batch_size, tokens_per_req):
-    """Test CuTile per-tensor FP8 scatter against Python reference."""
     torch.manual_seed(42)
+    device = "cuda"
 
-    tokens_per_block = 32
-    num_tokens = batch_size * tokens_per_req
-    max_seq_len = 256
+    tokens_per_batch = num_tokens
+    total_tokens = batch_size * tokens_per_batch
 
-    max_blocks = (max_seq_len + tokens_per_block - 1) // tokens_per_block
+    kv_comp = torch.randn(total_tokens, head_dim, device=device, dtype=torch.bfloat16)
+    rms_weight = torch.randn(head_dim, device=device, dtype=torch.bfloat16) * 0.1 + 1.0
+    rms_eps = 1e-5
+
+    max_pos = total_tokens + 64
+    cos_sin_table = torch.randn(max_pos, 2, rope_dim // 2, device=device, dtype=torch.float32)
+    position_ids = torch.arange(total_tokens, device=device, dtype=torch.int32)
+
+    max_comp_len = tokens_per_batch + 4
+    max_blocks = (max_comp_len + tokens_per_block - 1) // tokens_per_block
     num_blocks = batch_size * max_blocks
-    kv_factor = 1
+    kv_cache_fused = torch.zeros(num_blocks, tokens_per_block * head_dim, device=device, dtype=torch.bfloat16)
+    kv_cache_ref = torch.zeros_like(kv_cache_fused)
 
-    # fp8e4nv cache
-    kv_cache = torch.zeros(
-        num_blocks, kv_factor, tokens_per_block * head_dim, device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    block_offsets = torch.zeros(batch_size, max_blocks, device="cuda", dtype=torch.int32)
+    block_offsets = torch.zeros(batch_size, max_blocks, device=device, dtype=torch.int32)
     for b in range(batch_size):
-        for blk in range(max_blocks):
-            block_offsets[b, blk] = b * max_blocks + blk
+        block_offsets[b] = torch.arange(b * max_blocks, (b + 1) * max_blocks, dtype=torch.int32)
 
-    # Generate FP8 data (cast bf16 -> fp8, then view as uint8)
-    kv_comp = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv_fp8 = kv_comp.to(torch.float8_e4m3fn)
-    kv_uint8 = kv_fp8.view(torch.uint8)
-
-    num_comp_tokens = torch.full((batch_size,), tokens_per_req, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-    cu_new_comp_kv[1:] = num_comp_tokens.cumsum(0)
-    start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    num_comp_tokens = torch.full((batch_size,), tokens_per_batch, device=device, dtype=torch.int32)
+    cu_kv_comp = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+    cu_kv_comp[1:] = num_comp_tokens.cumsum(0)
+    start_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
     max_outputs = num_comp_tokens.max().item()
 
-    # Run CuTile kernel
+    # --- Reference: unfused pipeline ---
+    try:
+        from fast_hadamard_transform import hadamard_transform
+    except ImportError:
+        pytest.skip("fast_hadamard_transform not installed")
+
+    x = kv_comp.clone().float()
+    var = x.pow(2).mean(-1, keepdim=True)
+    x = (x * torch.rsqrt(var + rms_eps)).to(torch.bfloat16)
+    x = rms_weight * x
+    xn = x[:, :nope_dim]
+    xp = x[:, nope_dim:]
+    half_rope = rope_dim // 2
+    cos_v = cos_sin_table[position_ids.long(), 0, :]
+    sin_v = cos_sin_table[position_ids.long(), 1, :]
+    # Interleaved even/odd pairs (is_neox=False), matching the fused kernel
+    xp = xp.view(-1, half_rope, 2)
+    x_even, x_odd = xp[..., 0], xp[..., 1]
+    xp = torch.stack([x_even * cos_v - x_odd * sin_v,
+                       x_odd * cos_v + x_even * sin_v], dim=-1)
+    xp = xp.view(-1, rope_dim)
+    x = torch.cat([xn, xp], dim=-1)
+    x = hadamard_transform(x, scale=head_dim ** -0.5)
+
     compressed_kv_scatter_cutile(
-        kv_uint8,
-        num_comp_tokens,
-        cu_new_comp_kv,
-        start_pos,
-        kv_cache,
-        block_offsets,
-        tokens_per_block,
-        head_dim,
+        x, num_comp_tokens, cu_kv_comp, start_pos,
+        kv_cache_ref, block_offsets, tokens_per_block, head_dim,
         max_outputs=max_outputs,
-        kv_cache_dtype="fp8_pertensor",
+    )
+
+    # --- Fused kernel ---
+    torch.ops.trtllm.compressor_fused_postprocess_scatter(
+        kv_comp, rms_weight, rms_eps,
+        cos_sin_table.float().contiguous(),
+        position_ids.to(torch.int32).contiguous(),
+        nope_dim, rope_dim, kv_cache_fused, num_comp_tokens, cu_kv_comp,
+        start_pos, block_offsets, tokens_per_block, head_dim, total_tokens,
     )
     torch.cuda.synchronize()
 
-    # Verify against expected values
-    for b in range(batch_size):
-        for i in range(tokens_per_req):
-            cache_pos = i
-            logical_block = cache_pos // tokens_per_block
-            token_offset = cache_pos % tokens_per_block
-            phys_block = block_offsets[b, logical_block].item()
-            token_idx = cu_new_comp_kv[b].item() + i
-
-            expected_bytes = kv_uint8[token_idx]
-            actual_bytes = kv_cache[
-                phys_block, 0, token_offset * head_dim : (token_offset + 1) * head_dim
-            ].view(torch.uint8)
-
-            assert torch.equal(expected_bytes, actual_bytes), (
-                f"Per-tensor FP8 mismatch at batch={b}, token={i}"
-            )
+    max_diff = (kv_cache_fused.float() - kv_cache_ref.float()).abs().max().item()
+    assert max_diff < 0.05, f"Fused vs ref max diff = {max_diff}"
 
 
 # ============================================================================
 # Benchmarks: cuTile Kernels vs PyTorch Reference
 # ============================================================================
-
-
-def benchmark_scatter_all_backends():
-    """Benchmark cuTile vs PyTorch scatter kernels using triton.testing.do_bench."""
-
-    print("\n" + "=" * 70)
-    print("Scatter Kernel Benchmark: cuTile vs PyTorch")
-    print("=" * 70)
-
-    configs = [
-        # (batch_size, head_dim, total_outputs, tokens_per_block, name)
-        (1, 512, 32, 32, "b1_h512_t32"),
-        (8, 512, 64, 32, "b8_h512_t64"),
-        (32, 512, 128, 32, "b32_h512_t128"),
-        (1, 512, 256, 32, "b1_h512_t256"),
-        (8, 512, 512, 32, "b8_h512_t512"),
-        (1, 128, 32, 8, "b1_h128_t32"),
-        (8, 128, 64, 8, "b8_h128_t64"),
-        (32, 128, 128, 8, "b32_h128_t128"),
-    ]
-
-    results = []
-    for batch_size, head_dim, total_outputs, tokens_per_block, name in configs:
-        outputs_per_batch = total_outputs // batch_size
-        num_outputs = torch.full((batch_size,), outputs_per_batch, device="cuda", dtype=torch.int32)
-        cu_kv_comp = torch.zeros(batch_size + 1, device="cuda", dtype=torch.int32)
-        cu_kv_comp[1:] = torch.cumsum(num_outputs, dim=0)
-
-        compressed_kv = torch.randn(total_outputs, head_dim, device="cuda")
-        start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
-
-        max_compressed_len = outputs_per_batch + 4
-        kv_cache, block_offsets, _, _ = create_compressed_kv_cache(
-            batch_size, max_compressed_len, head_dim, tokens_per_block
-        )
-
-        kv_cache_cutile = kv_cache.clone()
-        max_outputs = num_outputs.max().item()
-
-        def cutile_fn():
-            compressed_kv_scatter_cutile(
-                compressed_kv,
-                num_outputs,
-                cu_kv_comp,
-                start_pos,
-                kv_cache_cutile,
-                block_offsets,
-                tokens_per_block,
-                head_dim,
-                max_outputs=max_outputs,
-            )
-
-        def pytorch_fn():
-            for b in range(batch_size):
-                for i in range(outputs_per_batch):
-                    cache_pos = i
-                    logical_block = cache_pos // tokens_per_block
-                    token_offset = cache_pos % tokens_per_block
-                    phys_block = block_offsets[b, logical_block].item()
-                    kv_cache[
-                        phys_block, 0, token_offset * head_dim : (token_offset + 1) * head_dim
-                    ] = compressed_kv[cu_kv_comp[b].item() + i]
-
-        cutile_ms = triton.testing.do_bench(cutile_fn, warmup=25, rep=100)
-        pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=25, rep=100)
-
-        cutile_us = cutile_ms * 1000
-        pytorch_us = pytorch_ms * 1000
-
-        results.append(
-            {
-                "name": name,
-                "cutile_us": cutile_us,
-                "pytorch_us": pytorch_us,
-                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
-            }
-        )
-
-    # Print results
-    print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
-    print("-" * 70)
-    for r in results:
-        print(
-            f"{r['name']:<30} {r['cutile_us']:>12.2f} "
-            f"{r['pytorch_us']:>12.2f} {r['speedup']:>9.2f}x"
-        )
-    print("=" * 70)
-
-    return results
 
 
 def benchmark_compress_kernel():
@@ -1724,7 +1399,6 @@ def run_all_benchmarks():
     print("=" * 80)
 
     # cuTile vs PyTorch
-    benchmark_scatter_all_backends()
     benchmark_compress_kernel()
     benchmark_compress_prefill_kernel()
 

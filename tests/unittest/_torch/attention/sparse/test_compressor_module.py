@@ -73,6 +73,7 @@ class DummyAttentionMetadata:
         self.new_comp_kv_lens_cuda = new_comp_kv_lens_cuda
         self.num_total_compressed_tokens = num_total_compressed_tokens
         self.max_num_compressed_tokens = max_num_compressed_tokens
+        self.num_gen_tokens_per_seq = 0  # Set by caller
         self.kv_lens_cuda_runtime = None  # Set by caller
 
 
@@ -820,7 +821,8 @@ class CompressorWrapper:
 
         # Build scheduled batch and call prepare_resources (following test_mewtwo_cache_manager pattern)
         scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests = context_requests
+        for req in context_requests:
+            scheduled_batch.append_context_request(req)
         scheduled_batch.generation_requests = generation_requests
         self.cache_manager.prepare_resources(scheduled_batch)
 
@@ -972,7 +974,7 @@ class CompressorWrapper:
         max_comp_kv_lens = max(max_ctx_comp_kv_lens, max_gen_comp_kv_lens)
 
         # Create position IDs for compressed outputs
-        position_ids = torch.zeros(num_total_compressed_tokens, dtype=torch.int64, device=DEVICE)
+        position_ids = torch.zeros(num_total_compressed_tokens, dtype=torch.int32, device=DEVICE)
         offset = 0
         for b in range(bsz):
             n_out = num_comp[b].item()
@@ -1067,6 +1069,9 @@ class CompressorWrapper:
         )
         # kv_lens_cuda_runtime: [num_seqs] total KV length per sequence (past + current)
         metadata.kv_lens_cuda_runtime = kv_lens
+        metadata.num_gen_tokens_per_seq = (
+            num_gen_tokens // num_generations if num_generations > 0 else 0
+        )
 
         # Update kv_cache reference for test compatibility
         self._update_kv_cache_reference()
@@ -1093,6 +1098,11 @@ class CompressorWrapper:
         total_outputs = cu_new_comp_kv[-1].item()
         if total_outputs == 0:
             return None
+
+        # Fused scatter writes postprocessed data to kv_cache but returns raw
+        # kv_comp. Apply postprocessing here for test comparison with reference.
+        if self.kv_cache_dtype == "default" and kv_comp is not None:
+            kv_comp = self.compressor._postprocess(kv_comp, metadata)
 
         # Split packed output back to per-batch
         outputs = []
@@ -1519,6 +1529,143 @@ def test_fp8_pertensor_compressor(batch, seqlen, ratio):
         "fp8_pertensor",
     )
     assert_fp8_cache_match(comp.kv_cache, golden_cache, "fp8_pertensor", "Per-tensor cache layout")
+
+
+# ============================================================================
+# Fused Kernel Tests (RMSNorm + RoPE + Hadamard + Scatter)
+#
+# The fused CUDA kernel matches the reference model.py pipeline: RMSNorm,
+# RoPE, and Hadamard all in bf16 precision (via toBf16 round-trips in CUDA).
+# This means fused and unfused paths should produce nearly identical results.
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "batch,seqlen,ratio",
+    [
+        (1, 128, 4),
+        (2, 130, 4),
+        (2, 128, 8),
+        (1, 64, 4),
+        (2, 256, 4),
+        (4, 128, 4),
+        (1, 256, 128),
+        (2, 512, 128),
+    ],
+)
+def test_fused_prefill(batch, seqlen, ratio):
+    """Test fused prefill cache against unfused bf16 reference cache.
+
+    Both paths now use bf16 Hadamard so results should match closely.
+    """
+    ref, comp = setup_compressors(ratio, rotate=True)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)[:seqlen]
+    x = torch.randn(batch, seqlen, DIM, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        out_ref = ref(x, 0, freqs)
+        comp.forward(x, 0, freqs)
+
+    if out_ref is not None:
+        num_tokens = out_ref.size(1)
+        for b in range(batch):
+            cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+            cached_comp = read_paged_cache_tokens(
+                comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+            ).unsqueeze(0)
+            assert_similar(cached_ref, cached_comp, f"Fused prefill cache[{b}]")
+
+
+@pytest.mark.parametrize(
+    "prefill,steps,batch,ratio",
+    [
+        (128, 8, 1, 4),
+        (128, 8, 2, 4),
+        (128, 24, 1, 4),
+        (128, 8, 1, 8),
+        (128, 4, 1, 128),
+    ],
+)
+def test_fused_decode(prefill, steps, batch, ratio):
+    """Test fused prefill + decode cache against bf16 reference."""
+    ref, comp = setup_compressors(ratio, rotate=True)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)
+
+    x = torch.randn(batch, prefill, DIM, device=DEVICE, dtype=DTYPE)
+    with torch.no_grad():
+        ref(x, 0, freqs[:prefill])
+        comp.forward(x, 0, freqs[:prefill])
+
+    for step in range(steps):
+        pos = prefill + step
+        x = torch.randn(batch, 1, DIM, device=DEVICE, dtype=DTYPE)
+        with torch.no_grad():
+            out_ref = ref(x, pos, freqs[pos : pos + 1])
+            comp.forward(x, pos, freqs[pos : pos + 1])
+            if out_ref is not None:
+                num_tokens = pos // ratio + 1
+                for b in range(batch):
+                    cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+                    cached_comp = read_paged_cache_tokens(
+                        comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+                    ).unsqueeze(0)
+                    assert_similar(
+                        cached_ref, cached_comp, f"Fused decode cache[{b}] step{step}"
+                    )
+
+
+def test_fused_mixed_batch():
+    """Test fused kernel with mixed context + generation batch."""
+    ratio = 4
+    ref, comp = setup_compressors(ratio, rotate=True)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)
+
+    ctx_len = 8
+    x_ctx = torch.randn(1, ctx_len, DIM, device=DEVICE, dtype=DTYPE)
+    gen_start_pos = 127
+    x_gen = torch.randn(1, 1, DIM, device=DEVICE, dtype=DTYPE)
+    x_gen_prefill = torch.randn(1, gen_start_pos, DIM, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        ref.kv_state.zero_()
+        ref.score_state.fill_(float("-inf"))
+        ref(x_ctx, 0, freqs[:ctx_len])
+
+        # Save ctx cache before gen overwrites positions 0..1
+        num_ctx_comp = ctx_len // ratio
+        cached_ref_ctx = ref.kv_cache[0:1, :num_ctx_comp].clone()
+
+        ref.kv_state.zero_()
+        ref.score_state.fill_(float("-inf"))
+        _ = ref(x_gen_prefill, 0, freqs[:gen_start_pos])
+        ref(x_gen, gen_start_pos, freqs[gen_start_pos : gen_start_pos + 1])
+
+        x_flat = torch.cat([x_ctx.squeeze(0), x_gen.squeeze(0)], dim=0)
+        seq_lens = torch.tensor([ctx_len, 1], dtype=torch.int32, device=DEVICE)
+        start_pos_tensor = torch.tensor([0, gen_start_pos], dtype=torch.int32, device=DEVICE)
+
+        comp.reset_state()
+        comp.forward(
+            x_gen_prefill,
+            0,
+            freqs[:gen_start_pos],
+            batch_indices=torch.tensor([1], device=DEVICE, dtype=torch.int32),
+        )
+        comp.forward(x_flat, start_pos_tensor, freqs, seq_lens=seq_lens)
+
+    # Compare context request cache (first 2 compressed tokens)
+    if num_ctx_comp > 0:
+        cached_ref = cached_ref_ctx
+        cached_comp = read_paged_cache_tokens(
+            comp.kv_cache, comp.block_offsets, 0, num_ctx_comp, comp.tokens_per_block
+        ).unsqueeze(0)
+        assert_similar(cached_ref, cached_comp, "Fused mixed ctx cache")
 
 
 if __name__ == "__main__":
