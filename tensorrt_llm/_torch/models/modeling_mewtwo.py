@@ -1149,7 +1149,6 @@ class MewtwoDecoderLayer(DecoderLayer):
             config.hidden_size,
             config.hc_sinkhorn_iters,
             dtype=torch.float32,
-            backend="cuda",
         )
 
         layer_idx_for_attention = layer_idx
@@ -1173,7 +1172,6 @@ class MewtwoDecoderLayer(DecoderLayer):
             config.hidden_size,
             config.hc_sinkhorn_iters,
             dtype=torch.float32,
-            backend="cuda",
         )
 
         # FIXME: incompatible with mixed quantization mode
@@ -1584,7 +1582,7 @@ class MewtwoModel(DecoderModel):
             dtype=config.torch_dtype,
         )
 
-        self.hc_head = HCHead(config.hc_mult, config.hidden_size, backend="cuda")
+        self.hc_head = HCHead(config.hc_mult, config.hidden_size)
 
         self.layers = nn.ModuleList(
             [

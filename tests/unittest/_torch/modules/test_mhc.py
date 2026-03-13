@@ -1,8 +1,9 @@
-# Copied and modified from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_mhc
+# Tests for Multi-Head Hyper-Connection (mHC) module
 from collections import defaultdict
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
@@ -11,6 +12,82 @@ BENCH_WARMUP = 50
 BENCH_ITERS = 200
 
 timing_stats = defaultdict(dict)
+
+
+# ---------------------------------------------------------------------------
+# Vanilla (PyTorch) reference implementations for correctness testing
+# ---------------------------------------------------------------------------
+
+
+def _sinkhorn_normalize_ref(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    x = x.softmax(-1) + eps
+    x = x / (x.sum(-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        x = x / (x.sum(-1, keepdim=True) + eps)
+        x = x / (x.sum(-2, keepdim=True) + eps)
+    return x
+
+
+def vanilla_pre_mapping(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    mult: int,
+    norm_eps: float,
+    eps: float,
+    sinkhorn_eps: float,
+    post_mult_value: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference pre_mapping implementation in pure PyTorch."""
+    assert mult == x.shape[-2]
+    residual_flat = x.flatten(-2, -1).float()
+    sqrsum = residual_flat.square().sum(-1)
+    mixes = residual_flat @ fn.T * (sqrsum.unsqueeze(-1) / fn.shape[-1] + norm_eps).rsqrt()
+    scale_expanded = torch.cat(
+        [
+            scale[0].expand(mult),
+            scale[1].expand(mult),
+            scale[2].expand(mult * mult),
+        ],
+    )
+    mixes = mixes * scale_expanded + base
+    pre_mix = mixes[:, :mult].sigmoid().unsqueeze(-1) + eps
+    post_mix = (mixes[:, mult : 2 * mult].sigmoid() * post_mult_value).unsqueeze(-1)
+    res_mix = mixes[:, 2 * mult :].view(-1, mult, mult)
+    res_mix = _sinkhorn_normalize_ref(res_mix, repeat=sinkhorn_iters, eps=sinkhorn_eps)
+    layer_input = (x * pre_mix).sum(-2).bfloat16()
+    return post_mix, res_mix, layer_input
+
+
+def vanilla_post_mapping(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Reference post_mapping implementation in pure PyTorch."""
+    term2 = torch.bmm(comb_res_mix.mT, residual.float())
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+def vanilla_hc_head(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    norm_eps: float,
+    eps: float,
+) -> torch.Tensor:
+    """Reference HCHead forward implementation in pure PyTorch."""
+    shape, dtype = x.size(), x.dtype
+    x = x.flatten(-2, -1).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(x, fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + eps
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+    return y.to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -151,27 +228,12 @@ def generate_head_data(
 @pytest.mark.parametrize("n", [1, 32, 64, 128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
-def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
+def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int):
     test_data = generate_pre_data(
         n=n,
         hc_mult=hc_mult,
         hidden_size=hidden_size,
     )
-
-    ref_module = mHC(
-        mult=hc_mult,
-        hidden_size=hidden_size,
-        sinkhorn_iters=test_data["sinkhorn_repeat"],
-        dtype=None,
-        eps=test_data["hc_pre_eps"],
-        norm_eps=test_data["rms_eps"],
-        post_mult_value=test_data["hc_post_mult_value"],
-        backend="vanilla",
-    ).cuda()
-    ref_module.fn.copy_(test_data["fn"])
-    ref_module.scale.copy_(test_data["hc_scale"])
-    ref_module.base.copy_(test_data["hc_base"])
 
     test_module = mHC(
         mult=hc_mult,
@@ -181,7 +243,6 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
         eps=test_data["hc_pre_eps"],
         norm_eps=test_data["rms_eps"],
         post_mult_value=test_data["hc_post_mult_value"],
-        backend=backend,
     ).cuda()
     test_module.fn.copy_(test_data["fn"])
     test_module.scale.copy_(test_data["hc_scale"])
@@ -191,79 +252,80 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
 
     t = profile_fn(lambda: test_module.pre_mapping(residual))
     total_us = sum_all_kernel_times(t)
-    timing_stats[("pre_mapping", n, hidden_size)][backend] = total_us
+    timing_stats[("pre_mapping", n, hidden_size)]["cuda"] = total_us
 
-    if backend != "vanilla":
-        post_mix_ref, comb_mix_ref, layer_input_ref = test_module.pre_mapping(residual)
-        post_mix_vanilla, comb_mix_vanilla, layer_input_vanilla = ref_module.pre_mapping(residual)
-        torch.testing.assert_close(post_mix_vanilla, post_mix_ref, rtol=1e-4, atol=1e-3)
-        torch.testing.assert_close(comb_mix_vanilla, comb_mix_ref, rtol=1e-3, atol=5e-3)
-        torch.testing.assert_close(layer_input_vanilla, layer_input_ref, rtol=1e-4, atol=1e-3)
+    post_mix_cuda, comb_mix_cuda, layer_input_cuda = test_module.pre_mapping(residual)
+    post_mix_ref, comb_mix_ref, layer_input_ref = vanilla_pre_mapping(
+        residual,
+        test_data["fn"],
+        test_data["hc_scale"],
+        test_data["hc_base"],
+        hc_mult,
+        test_data["rms_eps"],
+        test_data["hc_pre_eps"],
+        test_data["hc_sinkhorn_eps"],
+        test_data["hc_post_mult_value"],
+        test_data["sinkhorn_repeat"],
+    )
+    torch.testing.assert_close(post_mix_ref, post_mix_cuda, rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(comb_mix_ref, comb_mix_cuda, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(layer_input_ref, layer_input_cuda, rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.parametrize("n", [64, 128, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
-def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int, backend: str):
+def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int):
     test_data = generate_post_data(
         n=n,
         hc_mult=hc_mult,
         hidden_size=hidden_size,
     )
 
-    ref_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend="vanilla")
-    test_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10, backend=backend)
+    test_module = mHC(mult=hc_mult, hidden_size=hidden_size, sinkhorn_iters=10)
 
     t = profile_fn(lambda: test_module.post_mapping(**test_data))
     total_us = sum_all_kernel_times(t)
-    timing_stats[("post_mapping", n, hidden_size)][backend] = total_us
+    timing_stats[("post_mapping", n, hidden_size)]["cuda"] = total_us
 
-    if backend != "vanilla":
-        output = test_module.post_mapping(**test_data)
-        output_ref = ref_module.post_mapping(**test_data)
-        if backend in ("tilelang", "cuda"):
-            torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
-        else:
-            torch.testing.assert_close(output_ref, output, rtol=1e-3, atol=1e-3)
+    output_cuda = test_module.post_mapping(**test_data)
+    output_ref = vanilla_post_mapping(**test_data)
+    torch.testing.assert_close(output_ref, output_cuda, rtol=1e-2, atol=0.1)
 
 
 @pytest.mark.parametrize("m", [64, 128, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [4096])
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("backend", ["cuda", "cutile", "tilelang"])
-def test_hc_head(m: int, hidden_size: int, hc_mult: int, backend: str):
+def test_hc_head(m: int, hidden_size: int, hc_mult: int):
     test_data = generate_head_data(
         m=m,
         hc_mult=hc_mult,
         hidden_size=hidden_size,
     )
 
-    ref_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend="vanilla").cuda()
-    ref_module.fn.copy_(test_data["hc_fn"])
-    ref_module.scale.copy_(test_data["hc_scale"])
-    ref_module.base.copy_(test_data["hc_base"])
-
-    test_module = HCHead(mult=hc_mult, hidden_size=hidden_size, backend=backend).cuda()
+    test_module = HCHead(mult=hc_mult, hidden_size=hidden_size).cuda()
     test_module.fn.copy_(test_data["hc_fn"])
     test_module.scale.copy_(test_data["hc_scale"])
     test_module.base.copy_(test_data["hc_base"])
 
     t = profile_fn(lambda: test_module(test_data["x"]))
     total_us = sum_all_kernel_times(t)
-    timing_stats[("hc_head", m, hidden_size)][backend] = total_us
+    timing_stats[("hc_head", m, hidden_size)]["cuda"] = total_us
 
-    if backend != "vanilla":
-        output = test_module(test_data["x"])
-        output_ref = ref_module(test_data["x"])
-        if backend in ("tilelang", "cuda"):
-            torch.testing.assert_close(output_ref, output, rtol=1e-2, atol=0.1)
-        else:
-            torch.testing.assert_close(output_ref, output, rtol=1e-4, atol=2e-3)
+    output_cuda = test_module(test_data["x"])
+    output_ref = vanilla_hc_head(
+        test_data["x"],
+        test_data["hc_fn"],
+        test_data["hc_scale"],
+        test_data["hc_base"],
+        norm_eps=1e-6,
+        eps=1e-6,
+    )
+    torch.testing.assert_close(output_ref, output_cuda, rtol=1e-2, atol=0.1)
 
 
 # ---------------------------------------------------------------------------
-# Low-level pre_mapping pipeline benchmark: DG / DG-s16 / FMA / TL
+# Low-level pre_mapping pipeline benchmark: DG / DG-s16 / FMA
 # ---------------------------------------------------------------------------
 
 HC_MULT = 4
@@ -276,7 +338,7 @@ _SINKHORN_REPEAT = 20
 
 def _try_import_backends():
     """Return (tf32_hc_prenorm_gemm|None, mhc_gemm_rms_fma_cuda|None,
-    mhc_big_fuse_cuda|None, tl_gemm_sqrsum|None, tl_big_fuse|None)."""
+    mhc_big_fuse_cuda|None)."""
     tf32_hc_prenorm_gemm = None
     try:
         from deep_gemm import tf32_hc_prenorm_gemm
@@ -295,21 +357,10 @@ def _try_import_backends():
     except Exception:
         pass
 
-    tl_gemm_sqrsum = tl_big_fuse = None
-    try:
-        from tensorrt_llm._torch.modules.mhc.mhc_tilelang import mhc_pre_big_fuse as tl_big_fuse
-        from tensorrt_llm._torch.modules.mhc.mhc_tilelang import (
-            mhc_pre_gemm_sqrsum as tl_gemm_sqrsum,
-        )
-    except Exception:
-        pass
-
     return (
         tf32_hc_prenorm_gemm,
         mhc_gemm_rms_fma_cuda,
         mhc_big_fuse_cuda,
-        tl_gemm_sqrsum,
-        tl_big_fuse,
     )
 
 
@@ -322,8 +373,6 @@ def run_bench_pre_mapping(M: int) -> dict:
         tf32_hc_prenorm_gemm,
         mhc_gemm_rms_fma_cuda,
         mhc_big_fuse_cuda,
-        tl_gemm_sqrsum,
-        tl_big_fuse,
     ) = _try_import_backends()
 
     w_nk = torch.randn(_N, _K, dtype=torch.float32, device=device) * 0.01
@@ -431,36 +480,6 @@ def run_bench_pre_mapping(M: int) -> dict:
 
         t = profile_fn(fma_fn)
         times["FMA"] = (sum_kernel_times(t, ["GemmSqrsumFma"]), sum_kernel_times(t, ["BigFuse"]))
-
-    if tl_gemm_sqrsum is not None and tl_big_fuse is not None:
-        y_tl = torch.empty(1, M, _N, dtype=torch.float32, device=device)
-        r_tl = torch.empty(1, M, dtype=torch.float32, device=device)
-        pm_tl = torch.empty(M, HC_MULT, dtype=torch.float32, device=device)
-        cm_tl = torch.empty(M, HC_MULT * HC_MULT, dtype=torch.float32, device=device)
-        li_tl = torch.empty(M, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
-
-        t_gemm = profile_fn(lambda: tl_gemm_sqrsum(x, w_nk, y_tl[0], r_tl[0], _N, _K))
-        t_fuse = profile_fn(
-            lambda: tl_big_fuse(
-                y_tl,
-                r_tl,
-                hc_scale,
-                hc_base,
-                residual,
-                pm_tl,
-                cm_tl,
-                li_tl,
-                HIDDEN_SIZE,
-                1e-6,
-                1e-6,
-                1e-6,
-                1.0,
-                _SINKHORN_REPEAT,
-                n_splits=1,
-                hc_mult=HC_MULT,
-            )
-        )
-        times["TL"] = (sum_all_kernel_times(t_gemm), sum_all_kernel_times(t_fuse))
 
     return times
 
