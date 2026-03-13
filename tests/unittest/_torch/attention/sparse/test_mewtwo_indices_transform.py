@@ -3,7 +3,7 @@ Tests for Mewtwo Index Transform Kernel.
 """
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import pytest
 import torch
@@ -56,6 +56,25 @@ batch_configs = [
     [128, 233, 876],
     [1158],
 ]
+
+index_transform_cases = [
+    pytest.param(
+        scenario,
+        context_lengths,
+        False,
+        id=f"compress={scenario.compress_ratio}-batch={len(context_lengths)}",
+    )
+    for scenario in scenarios
+    for context_lengths in batch_configs
+]
+index_transform_cases.append(
+    pytest.param(
+        None,
+        None,
+        True,
+        id="large-address-gap-int32-safe",
+    )
+)
 
 
 def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
@@ -156,18 +175,13 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     ]
 
     scheduled_batch = ScheduledRequests()
-    scheduled_batch.context_requests = requests
+    for req in requests:
+        scheduled_batch.append_context_request(req)
     cache_manager.prepare_resources(scheduled_batch)
 
     # Get pointers and offsets
-    swa_pool_ptr = cache_manager.swa_pool_ptr
+    swa_pool_base_ptr = cache_manager.swa_pool_ptr
     swa_buffer_ptr = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
-    # Use min(swa_pool_ptr, compressed_pool_ptr) as base to ensure non-negative indices
-    sparse_mla_base_ptr = swa_pool_ptr
-    if has_compressed and scenario.compress_ratio in cache_manager.compress_pool_ptrs:
-        sparse_mla_base_ptr = min(
-            swa_pool_ptr, cache_manager.compress_pool_ptrs[scenario.compress_ratio]
-        )
 
     # Single token stride for all buffers
     has_fp8_kv_cache = scenario.dtype == DataType.FP8
@@ -178,19 +192,26 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         MewtwoAttentionType.SWA,
         has_fp8_kv_cache,
     )
-    swa_offset = (swa_buffer_ptr - sparse_mla_base_ptr) // token_stride
+    swa_offset = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride
 
     # Get compressed buffer type from scenario property
     compressed_attn_type = scenario.compressed_attn_type
 
     if has_compressed:
+        compress_pool_base_ptr = cache_manager.compress_pool_ptrs[scenario.compress_ratio]
         compressed_buffer_ptr = cache_manager.get_buffers(
             layer_idx, compressed_attn_type
         ).data_ptr()
-        compressed_offset = (compressed_buffer_ptr - sparse_mla_base_ptr) // token_stride
+        compressed_offset = (compressed_buffer_ptr - compress_pool_base_ptr) // token_stride
         tokens_per_block_compressed = scenario.tokens_per_block // scenario.compress_ratio
     else:
-        compressed_buffer_ptr, compressed_offset, tokens_per_block_compressed = (
+        (
+            compress_pool_base_ptr,
+            compressed_buffer_ptr,
+            compressed_offset,
+            tokens_per_block_compressed,
+        ) = (
+            0,
             0,
             0,
             scenario.tokens_per_block,
@@ -277,96 +298,83 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         req_id=req_id,
         block_table_swa=block_table_swa_t,
         swa_local_indices=swa_local_indices,
-        sparse_mla_base_ptr=sparse_mla_base_ptr,
+        swa_pool_base_ptr=swa_pool_base_ptr,
         swa_buffer_ptr=swa_buffer_ptr,
         tokens_per_block=scenario.tokens_per_block,
         token_stride=token_stride,
         block_table_compressed=block_table_compressed_t,
         compressed_local_indices=compressed_local_indices,
+        compress_pool_base_ptr=compress_pool_base_ptr,
         compressed_buffer_ptr=compressed_buffer_ptr,
         compress_ratio=scenario.compress_ratio,
         num_compressed_indices=scenario.compressed_topk if has_compressed else 0,
     )
 
-    # Verify values match using realistic access patterns:
-    # - Global: pool_ptr + global_idx
-    # - Local: buffer_ptr + block_table[block_idx] * tokens_per_block + token_in_block
-    # Output is compact: [valid_swa..., valid_compressed..., -1, -1, ...]
+    # Verify dual-pool non-compact layout:
+    # SWA region [0, window_size) — indices relative to swa_pool_base_ptr
+    # Compress region [window_size, window_size + compressed_topk) — indices relative to compress_pool_base_ptr
+    # Invalid positions padded with -1 at their fixed positions.
+    window_size = scenario.window_size
     num_samples = min(32, total_tokens)
     sample_indices = torch.randperm(total_tokens)[:num_samples].tolist()
 
     for t in sample_indices:
         r = req_ids[t]
-
-        # Count valid SWA and compressed indices from input
-        valid_swa_indices = [
-            i for i in range(scenario.swa_topk) if swa_local_indices[t, i].item() >= 0
-        ]
-        valid_swa_count = len(valid_swa_indices)
-
-        if has_compressed:
-            valid_compressed_indices = [
-                i
-                for i in range(scenario.compressed_topk)
-                if compressed_local_indices[t, i].item() >= 0
-            ]
-            valid_compressed_count = len(valid_compressed_indices)
-        else:
-            valid_compressed_indices = []
-            valid_compressed_count = 0
-
-        total_valid = valid_swa_count + valid_compressed_count
-
-        # Verify output is compact: first total_valid positions are valid, rest are -1
         out_row = global_indices[t]
-        for out_pos in range(out_row.shape[0]):
-            global_idx = out_row[out_pos].item()
-            if out_pos >= total_valid:
-                assert global_idx == -1, f"Token {t} out[{out_pos}]: expected -1, got {global_idx}"
+
+        # Verify SWA region [0, window_size) — at fixed positions, matching input positions
+        for pos in range(scenario.swa_topk):
+            local_idx = swa_local_indices[t, pos].item()
+            global_idx = out_row[pos].item()
+
+            if local_idx < 0:
+                # Invalid input → -1 in output
+                assert global_idx == -1, (
+                    f"Token {t} SWA out[{pos}]: expected -1 for invalid input, got {global_idx}"
+                )
             else:
-                assert global_idx != -1, (
-                    f"Token {t} out[{out_pos}]: expected non-negative index, got -1"
+                # Valid: verify data access
+                assert global_idx >= 0, (
+                    f"Token {t} SWA out[{pos}]: expected valid index, got {global_idx}"
                 )
+                pool_based_idx = global_idx - swa_offset
+                actual = swa_buffer_flat[pool_based_idx]
 
-        # Verify SWA values at compact positions [0, valid_swa_count)
-        for out_pos, input_pos in enumerate(valid_swa_indices):
-            local_idx = swa_local_indices[t, input_pos].item()
-            global_idx = global_indices[t, out_pos].item()
-
-            # Access via global index: pool_ptr + global_idx
-            pool_based_idx = global_idx - swa_offset
-            actual = swa_buffer_flat[pool_based_idx]
-
-            # Access via local index: buffer_ptr + block_table lookup
-            physical_idx = _local_to_physical_idx(
-                local_idx, block_tables_swa[r], scenario.tokens_per_block
-            )
-            expected = swa_buffer_flat[physical_idx]
-
-            torch.testing.assert_close(
-                actual, expected, msg=f"Token {t} SWA out[{out_pos}]: value mismatch"
-            )
-
-        # Verify compressed values at compact positions [valid_swa_count, total_valid)
-        if has_compressed:
-            for i, input_pos in enumerate(valid_compressed_indices):
-                out_pos = valid_swa_count + i
-                local_idx = compressed_local_indices[t, input_pos].item()
-                global_idx = global_indices[t, out_pos].item()
-
-                # Access via global index: pool_ptr + global_idx
-                pool_based_idx = global_idx - compressed_offset
-                actual = compressed_buffer_flat[pool_based_idx]
-
-                # Access via local index: buffer_ptr + block_table lookup
                 physical_idx = _local_to_physical_idx(
-                    local_idx, block_tables_compressed[r], tokens_per_block_compressed
+                    local_idx, block_tables_swa[r], scenario.tokens_per_block
                 )
-                expected = compressed_buffer_flat[physical_idx]
+                expected = swa_buffer_flat[physical_idx]
 
                 torch.testing.assert_close(
-                    actual, expected, msg=f"Token {t} compressed out[{out_pos}]: value mismatch"
+                    actual, expected, msg=f"Token {t} SWA out[{pos}]: value mismatch"
                 )
+
+        # Verify compress region [window_size, window_size + compressed_topk)
+        if has_compressed:
+            for pos in range(scenario.compressed_topk):
+                out_pos = window_size + pos
+                local_idx = compressed_local_indices[t, pos].item()
+                global_idx = out_row[out_pos].item()
+
+                if local_idx < 0:
+                    assert global_idx == -1, (
+                        f"Token {t} compress out[{out_pos}]: expected -1 for invalid, got {global_idx}"
+                    )
+                else:
+                    assert global_idx >= 0, (
+                        f"Token {t} compress out[{out_pos}]: expected valid index, got {global_idx}"
+                    )
+                    pool_based_idx = global_idx - compressed_offset
+                    actual = compressed_buffer_flat[pool_based_idx]
+
+                    physical_idx = _local_to_physical_idx(
+                        local_idx, block_tables_compressed[r], tokens_per_block_compressed
+                    )
+                    expected = compressed_buffer_flat[physical_idx]
+
+                    torch.testing.assert_close(
+                        actual, expected, msg=f"Token {t} compress out[{out_pos}]: value mismatch"
+                    )
 
     # Cleanup
     for req, ctx_len in zip(requests, context_lengths):
@@ -376,11 +384,149 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     cache_manager.shutdown()
 
 
-@pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"compress={x.compress_ratio}")
-@pytest.mark.parametrize("context_lengths", batch_configs, ids=lambda x: f"batch={len(x)}")
-def test_mewtwo_indices_transform(scenario: Scenario, context_lengths: List[int]):
+@pytest.mark.parametrize(
+    "scenario, context_lengths, is_large_gap_case",
+    index_transform_cases,
+)
+def test_mewtwo_indices_transform(
+    scenario: Optional[Scenario],
+    context_lengths: Optional[List[int]],
+    is_large_gap_case: bool,
+):
     """Test Mewtwo index transformation kernel by verifying VALUES."""
+    if is_large_gap_case:
+        _run_large_address_gap_int32_safe_test()
+        return
+
+    assert scenario is not None and context_lengths is not None
     _run_test(scenario, context_lengths)
+
+
+def _run_large_address_gap_int32_safe_test():
+    """
+    Synthetic test: emulate SWA/compress pool pointer deltas that would overflow int32
+    in the old single-base scheme, and verify the new per-pool index outputs remain int32-safe.
+    """
+    device = torch.device("cuda")
+    window_size = 128
+    tokens_per_block = 128
+    compressed_topk = 512
+    compress_ratio = 4
+    tokens_per_block_compressed = tokens_per_block // compress_ratio
+    num_tokens = 8
+    ctx_len = 600
+
+    # Simulate two pools 100+ TB apart — would overflow int32 with single base ptr
+    # Using synthetic offsets that stay int32-safe per-pool
+    fake_swa_pool_base_ptr = 0x7F0000000000  # ~127 TB
+    fake_swa_buffer_ptr = fake_swa_pool_base_ptr + 1024 * 1024  # 1 MB offset
+    fake_compress_pool_base_ptr = 0x100000000  # ~4 GB (100+ TB away from SWA pool)
+    fake_compressed_buffer_ptr = fake_compress_pool_base_ptr + 512 * 1024
+
+    token_stride = 1024  # bytes per token (synthetic)
+    swa_offset = (fake_swa_buffer_ptr - fake_swa_pool_base_ptr) // token_stride
+    compressed_offset = (fake_compressed_buffer_ptr - fake_compress_pool_base_ptr) // token_stride
+
+    # Both offsets should be small (well within int32)
+    assert abs(swa_offset) < 2**31, f"SWA offset overflows int32: {swa_offset}"
+    assert abs(compressed_offset) < 2**31, f"Compress offset overflows int32: {compressed_offset}"
+
+    # Build simple block tables (identity: page i = i)
+    max_blocks_swa = (ctx_len + tokens_per_block - 1) // tokens_per_block
+    max_blocks_compressed = (
+        ctx_len // compress_ratio + tokens_per_block_compressed - 1
+    ) // tokens_per_block_compressed
+    block_table_swa = torch.arange(max_blocks_swa, dtype=torch.int32, device=device).unsqueeze(0)
+    block_table_compressed = torch.arange(
+        max_blocks_compressed, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+
+    req_id = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+
+    # Build SWA indices: positions [ctx_len - num_tokens, ..., ctx_len - 1]
+    positions = list(range(ctx_len - num_tokens, ctx_len))
+    swa_indices_list = []
+    for pos in positions:
+        indices = torch.full((window_size,), -1, dtype=torch.int32, device=device)
+        start = max(0, pos - window_size + 1)
+        valid_count = min(window_size, pos + 1)
+        indices[:valid_count] = torch.arange(
+            start, start + valid_count, dtype=torch.int32, device=device
+        )
+        swa_indices_list.append(indices)
+    swa_local_indices = torch.stack(swa_indices_list)
+
+    # Build compressed indices
+    compressed_indices_list = []
+    for pos in positions:
+        indices = torch.full((compressed_topk,), -1, dtype=torch.int32, device=device)
+        num_valid = (pos + 1) // compress_ratio
+        select_count = min(compressed_topk, num_valid)
+        if select_count > 0:
+            indices[:select_count] = torch.arange(select_count, dtype=torch.int32, device=device)
+        compressed_indices_list.append(indices)
+    compressed_local_indices = torch.stack(compressed_indices_list)
+
+    # Run kernel with separate base pointers
+    global_indices = mewtwo_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=block_table_swa,
+        swa_local_indices=swa_local_indices,
+        swa_pool_base_ptr=fake_swa_pool_base_ptr,
+        swa_buffer_ptr=fake_swa_buffer_ptr,
+        tokens_per_block=tokens_per_block,
+        token_stride=token_stride,
+        block_table_compressed=block_table_compressed,
+        compressed_local_indices=compressed_local_indices,
+        compress_pool_base_ptr=fake_compress_pool_base_ptr,
+        compressed_buffer_ptr=fake_compressed_buffer_ptr,
+        compress_ratio=compress_ratio,
+        num_compressed_indices=compressed_topk,
+    )
+
+    # Verify: all valid SWA indices are int32-safe and relative to swa_pool
+    assert global_indices.dtype == torch.int32, f"Expected int32 output, got {global_indices.dtype}"
+    swa_region = global_indices[:, :window_size]
+    compress_region = global_indices[:, window_size:]
+
+    # Check SWA region: valid entries should be >= 0 and represent swa_offset + page*tpb + token_in_block
+    for t in range(num_tokens):
+        for pos in range(window_size):
+            local_idx = swa_local_indices[t, pos].item()
+            global_idx = swa_region[t, pos].item()
+            if local_idx < 0:
+                assert global_idx == -1, f"Token {t} SWA[{pos}]: invalid input should give -1"
+            else:
+                assert global_idx >= 0, (
+                    f"Token {t} SWA[{pos}]: valid input gave negative index {global_idx}"
+                )
+                # Verify the index is swa_offset + page_idx * tpb + token_in_block
+                block_idx = local_idx // tokens_per_block
+                token_in_block = local_idx % tokens_per_block
+                page_idx = block_table_swa[0, block_idx].item()
+                expected = swa_offset + page_idx * tokens_per_block + token_in_block
+                assert global_idx == expected, (
+                    f"Token {t} SWA[{pos}]: expected {expected}, got {global_idx}"
+                )
+
+    # Check compress region
+    for t in range(num_tokens):
+        for pos in range(compressed_topk):
+            local_idx = compressed_local_indices[t, pos].item()
+            global_idx = compress_region[t, pos].item()
+            if local_idx < 0:
+                assert global_idx == -1
+            else:
+                assert global_idx >= 0
+                block_idx = local_idx // tokens_per_block_compressed
+                token_in_block = local_idx % tokens_per_block_compressed
+                page_idx = block_table_compressed[0, block_idx].item()
+                expected = (
+                    compressed_offset + page_idx * tokens_per_block_compressed + token_in_block
+                )
+                assert global_idx == expected, (
+                    f"Token {t} compress[{pos}]: expected {expected}, got {global_idx}"
+                )
 
 
 if __name__ == "__main__":

@@ -1142,7 +1142,16 @@ int AttentionOp::mlaGeneration(
             tllmRunnerParams.mSparseMlaTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
+            // Dual-pool pointer assignment: the kernel's tmaK_ (primary TMA descriptor) is built from
+            // kvPtr, and tmaKSecondary_ (secondary TMA descriptor) from secondaryKvBasePtr.
+            // In the dual-pool layout, tile 0 (SWA) uses tmaKSecondary_ and remaining tiles use tmaK_.
+            // So kvPtr should point to the pool that non-SWA indices reference (secondary_kv_pool when
+            // provided, i.e., the compress pool), and secondaryKvBasePtr should point to the SWA pool
+            // (kv_cache_pool, which is always the default paged KV pool).
+            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_secondary_kv_pool != nullptr
+                ? mRuntimeSparseAttentionParams.sparse_mla_secondary_kv_pool
+                : mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
+            tllmRunnerParams.secondaryKvBasePtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

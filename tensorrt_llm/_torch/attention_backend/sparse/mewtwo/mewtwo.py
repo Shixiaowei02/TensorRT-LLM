@@ -212,6 +212,10 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def __post_init__(self):
         super().__post_init__()
+        assert self.sparse_attention_config.window_size == 128, (
+            f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
+            f"TileSizeKV of the FMHA kernel. (got {self.sparse_attention_config.window_size})."
+        )
         capture_graph = self.is_cuda_graph
         self.compress_ratio_set = set(self.compress_ratios)
 
@@ -530,34 +534,37 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def prepare_sparse_mla_topk_lens(self, token_positions: torch.Tensor):
         """
-        Prepare sparse_mla_topk_lens: actual number of attached tokens per token.
+        Prepare sparse_mla_topk_lens: number of KV indices per token for FMHA.
 
-        For each compress_ratio:
-        - compress_ratio=1: min(kv_len, window_size)
-        - compress_ratio=4: min(kv_len, window_size) + min(kv_len // 4, sparse_mla_topk)
-        - compress_ratio=128: min(kv_len, window_size) + kv_len // 128
+        Dual-pool layout:
+        - compress_ratio=1: min(kv_len, window_size) — actual valid SWA count
+        - compress_ratio=4: window_size + min(kv_len // 4, sparse_mla_topk)
+          (fixed 128 SWA slots + compressed valid count)
+        - compress_ratio=128: window_size + kv_len // 128
+          (fixed 128 SWA slots + compressed valid count)
+
+        For ratio>1, the SWA region always occupies exactly window_size (128) slots.
+        Invalid SWA positions within the window are padded with -1 in the index buffer.
         """
         window_size = self.sparse_attention_config.window_size
 
         # kv_len for each token = pos + 1
         kv_lens = token_positions + 1  # [num_tokens]
 
-        swa_count = torch.minimum(kv_lens, torch.full_like(kv_lens, window_size))
-
         for compress_ratio in self.compress_ratio_set:
             if compress_ratio == 1:
-                # SWA only
-                total_count = swa_count
+                # SWA only: actual valid count
+                total_count = torch.minimum(kv_lens, torch.full_like(kv_lens, window_size))
             elif compress_ratio == 4:
-                # SWA + indexer topk
+                # Dual-pool: fixed window_size SWA slots + compressed valid count
                 compressed_count = torch.minimum(
                     kv_lens // compress_ratio, torch.full_like(kv_lens, self.sparse_mla_topk)
                 )
-                total_count = swa_count + compressed_count
+                total_count = window_size + compressed_count
             elif compress_ratio == 128:
-                # SWA + all compressed tokens
+                # Dual-pool: fixed window_size SWA slots + compressed valid count
                 compressed_count = kv_lens // compress_ratio
-                total_count = swa_count + compressed_count
+                total_count = window_size + compressed_count
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
 
@@ -584,13 +591,12 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(extend_compress_ratios[layer_idx])
         }
 
-        # Per-ratio base pointer for sparse MLA = min(swa_pool_ptr, compressed_pool_ptr).
-        swa_pool_ptr = self.kv_cache_manager.swa_pool_ptr
+        # Per-ratio base pointer for sparse MLA
         self.sparse_mla_base_ptrs = {
-            1: swa_pool_ptr,
+            1: self.kv_cache_manager.swa_pool_ptr,
         }
         for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
-            self.sparse_mla_base_ptrs[ratio] = min(swa_pool_ptr, compress_pool_ptr)
+            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
 
     def prepare(self):
         TrtllmAttentionMetadata.prepare(self)
@@ -991,7 +997,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
 
-        sparse_mla_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
+        swa_pool_base_ptr = metadata.sparse_mla_base_ptrs[1]
 
         # Get cached buffer pointers
         swa_buffer_ptr = metadata.swa_buffer_ptrs[layer_idx]
@@ -1009,62 +1015,49 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             has_fp8_kv_cache,
         )
 
-        # Select indices/tables based on phase
+        # Select token range based on phase
         if is_generation:
             start_idx = metadata.num_ctx_tokens
             end_idx = metadata.num_tokens
-            req_start = metadata.num_contexts
-            req_end = metadata.num_seqs
-            req_offset = metadata.num_contexts
         else:
             start_idx = 0
             end_idx = metadata.num_ctx_tokens
-            req_start = 0
-            req_end = metadata.num_contexts
-            req_offset = 0
 
-        req_id = (metadata.req_idx_per_token[start_idx:end_idx] - req_offset).to(torch.int32)
+        # Use global req_id directly
+        req_id = metadata.req_idx_per_token[start_idx:end_idx]
         swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
-        block_table_swa = metadata.cache_buffer_block_offsets[1][req_start:req_end]
+        block_table_swa = metadata.cache_buffer_block_offsets[1]
 
-        # Handle compressed based on compress_ratio
-        if self.compress_ratio == 1:
-            # SWA only
-            global_indices = mewtwo_local_to_global_indices(
-                req_id=req_id,
-                block_table_swa=block_table_swa,
-                swa_local_indices=swa_local_indices,
-                sparse_mla_base_ptr=sparse_mla_base_ptr,
-                swa_buffer_ptr=swa_buffer_ptr,
-                tokens_per_block=kv_cache_manager.tokens_per_block,
-                token_stride=token_stride,
-                compress_ratio=1,
-            )
-        else:
-            # SWA + compressed indices
+        if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
-            block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio][
-                req_start:req_end
-            ]
+            compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
+            block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio]
             if self.compress_ratio == 4:
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
-            global_indices = mewtwo_local_to_global_indices(
-                req_id=req_id,
-                block_table_swa=block_table_swa,
-                swa_local_indices=swa_local_indices,
-                sparse_mla_base_ptr=sparse_mla_base_ptr,
-                swa_buffer_ptr=swa_buffer_ptr,
-                tokens_per_block=kv_cache_manager.tokens_per_block,
-                token_stride=token_stride,
-                block_table_compressed=block_table_compressed,
-                compressed_local_indices=compressed_local_indices,
-                compressed_buffer_ptr=compressed_buffer_ptr,
-                compress_ratio=self.compress_ratio,
-                num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
-            )
+        else:
+            compressed_buffer_ptr = 0
+            compress_pool_base_ptr = 0
+            block_table_compressed = None
+            compressed_local_indices = None
+
+        global_indices = mewtwo_local_to_global_indices(
+            req_id=req_id,
+            block_table_swa=block_table_swa,
+            swa_local_indices=swa_local_indices,
+            swa_pool_base_ptr=swa_pool_base_ptr,
+            swa_buffer_ptr=swa_buffer_ptr,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            token_stride=token_stride,
+            block_table_compressed=block_table_compressed,
+            compressed_local_indices=compressed_local_indices,
+            compress_pool_base_ptr=compress_pool_base_ptr,
+            compressed_buffer_ptr=compressed_buffer_ptr,
+            compress_ratio=self.compress_ratio,
+            num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+        )
 
         return global_indices, None
 

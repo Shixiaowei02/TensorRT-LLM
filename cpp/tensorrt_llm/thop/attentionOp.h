@@ -80,7 +80,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata = std::nullopt,
     std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt,
-    std::optional<int64_t> sparse_mla_kv_cache_pool_ptr = std::nullopt);
+    std::optional<int64_t> sparse_mla_secondary_kv_pool_ptr = std::nullopt);
 
 struct KvCachePoolPointers
 {

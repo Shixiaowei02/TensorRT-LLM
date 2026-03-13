@@ -156,7 +156,8 @@ def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_se
         skip_indexer_for_short_seqs=False,
     )
     batch_size = len(context_lengths)
-    max_tokens = max_seq_len * batch_size
+    # TODO(yuhangh): Investigate here
+    max_tokens = max_seq_len * batch_size * 4
 
     cache_manager = MewtwoCacheManager(
         kv_cache_config=KvCacheConfig(
@@ -548,7 +549,8 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
         for i, ctx_len in enumerate(context_lengths)
     ]
     scheduled_batch = ScheduledRequests()
-    scheduled_batch.context_requests = requests
+    for req in requests:
+        scheduled_batch.append_context_request(req)
     cache_manager.prepare_resources(scheduled_batch)
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -1010,6 +1012,415 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
 
     cache_manager.shutdown()
     print("\nAll tests passed!")
+
+
+@pytest.mark.parametrize("context_lengths", [[14, 508, 3947]])
+def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
+    scenario = Scenario()
+    device = torch.device("cuda")
+    dtype = scenario.dtype
+    generation_seq_len_q = 1
+
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    v_head_dim = scenario.v_head_dim
+    rope_append = scenario.rope_append
+    kv_lora_rank = (
+        scenario.kv_lora_rank - qk_rope_head_dim if not rope_append else scenario.kv_lora_rank
+    )
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    num_heads = 64 if not rope_append else scenario.num_heads
+    mscale = scenario.rope_mscale
+    q_scaling = 1.0 / (mscale * mscale)
+
+    batch_size = len(context_lengths)
+    assert batch_size >= 2
+    num_ctx = 1
+    num_gen = batch_size - num_ctx
+    max_context_len = max(context_lengths)
+    max_seq_len = max_context_len + 2 * generation_seq_len_q
+    total_ctx_tokens = context_lengths[0]
+    total_gen_tokens = num_gen * generation_seq_len_q
+    total_mixed_tokens = total_ctx_tokens + total_gen_tokens
+
+    torch.manual_seed(42)
+
+    # 1. Setup cache, layers, RoPE
+    cache_manager, sparse_config = _create_cache_manager(scenario, context_lengths, max_seq_len)
+    request_ids = list(range(batch_size))
+
+    requests = [
+        LlmRequest(
+            request_id=i,
+            max_new_tokens=2,
+            input_tokens=list(range(ctx_len)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        for i, ctx_len in enumerate(context_lengths)
+    ]
+    scheduled_batch = ScheduledRequests()
+    for req in requests:
+        scheduled_batch.append_context_request(req)
+    cache_manager.prepare_resources(scheduled_batch)
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    rope_cos_sin = (
+        torch.tensor(
+            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                rope_config.max_position_embeddings,
+                rope_config.qk_rope_head_dim,
+                rope_config.rope_theta,
+                rope_config.rope_scaling["factor"],
+                rope_config.rope_scaling["original_max_position_embeddings"],
+                rope_config.rope_scaling["beta_fast"],
+                rope_config.rope_scaling["beta_slow"],
+                rope_config.rope_scaling["mscale"],
+                rope_config.rope_scaling["mscale_all_dim"],
+            )[1],
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(rope_config.max_position_embeddings, -1, 2)
+        .transpose(-2, -1)
+    )
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(rope_config),
+        is_neox=False,
+    )
+    mla_params = MLAParams(
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+        rope_append=rope_append,
+        predicted_tokens_per_seq=1,
+    )
+
+    layers = {}
+    for li in TEST_LAYERS:
+        layer = MewtwoTrtllmAttention(
+            layer_idx=li,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=scenario.num_kv_heads,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            sparse_attention_config=sparse_config,
+            dtype=dtype,
+        )
+        layer.wrapper.update_quant_config(None)
+        layers[li] = layer
+
+    # 2. Pre-fill KV cache for gen requests (1..N) — all layers, all ratios.
+    gen_ctx_lengths = context_lengths[num_ctx:]
+    gen_request_ids = request_ids[num_ctx:]
+    gen_total_ctx = sum(gen_ctx_lengths)
+
+    prefill_fused_q = torch.empty(
+        [gen_total_ctx, num_heads * head_dim], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    prefill_k_pe = torch.empty(
+        [gen_total_ctx, qk_rope_head_dim], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    prefill_q_pe = torch.empty(
+        [gen_total_ctx, num_heads, qk_rope_head_dim], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    prefill_compressed_kv = torch.empty(
+        [gen_total_ctx, kv_lora_rank], dtype=dtype, device=device
+    ).uniform_(-1, 1)
+    prefill_latent = torch.cat([prefill_compressed_kv, prefill_k_pe], dim=-1)
+
+    prefill_metadata = MewtwoTrtllmAttentionMetadata(
+        seq_lens=torch.tensor(gen_ctx_lengths, dtype=torch.int),
+        request_ids=gen_request_ids,
+        max_num_requests=num_gen,
+        num_contexts=num_gen,
+        prompt_lens=gen_ctx_lengths,
+        max_num_tokens=gen_total_ctx,
+        kv_cache_manager=cache_manager,
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * num_gen),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    prefill_metadata.prepare()
+    for li in TEST_LAYERS:
+        ratio = scenario.compress_ratios[li]
+        sl = prefill_metadata.sparse_mla_topk_lens[ratio][:gen_total_ctx].clone()
+        prefill_topk = None
+        if ratio == 4:
+            positions = []
+            for cl in gen_ctx_lengths:
+                positions.extend(range(cl))
+            prefill_topk = _build_compressed_topk_indices(
+                positions, ratio, scenario.index_topk, device
+            )
+        layers[li].forward(
+            prefill_fused_q.clone(),
+            None,
+            None,
+            prefill_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=prefill_latent,
+            q_pe=prefill_q_pe,
+            topk_indices=prefill_topk,
+            sparse_lens=sl,
+            is_generation=False,
+        )
+
+    # Pre-fill COMPRESS buffers for ratio > 1.
+    compress_ref_data: Dict[int, List[torch.Tensor]] = {}
+    for li in TEST_LAYERS:
+        ratio = scenario.compress_ratios[li]
+        if ratio > 1:
+            compress_ref_data[li] = _prefill_compress_buffer(
+                cache_manager,
+                li,
+                gen_ctx_lengths,
+                gen_request_ids,
+                head_dim,
+                device,
+            )
+
+    # 3. Allocate 1 gen step for gen requests.
+    _allocate_kv_cache_for_generation(cache_manager, gen_request_ids, generation_seq_len_q)
+    gen_cached_lens = [cl + generation_seq_len_q for cl in gen_ctx_lengths]
+
+    # Grow compress buffers for gen step.
+    gen_kv_lens = [cl + generation_seq_len_q for cl in gen_cached_lens]
+    for li in TEST_LAYERS:
+        ratio = scenario.compress_ratios[li]
+        if ratio > 1 and li in compress_ref_data:
+            _grow_compress_buffer_for_generation(
+                cache_manager,
+                li,
+                gen_request_ids,
+                head_dim,
+                device,
+                gen_kv_lens,
+                compress_ref_data[li],
+            )
+
+    # 4. Mixed metadata: request 0 = context, requests 1..N = generation.
+    mixed_seq_lens = [context_lengths[0]] + [generation_seq_len_q] * num_gen
+    mixed_cached_lens = [0] + gen_cached_lens
+    mixed_metadata = MewtwoTrtllmAttentionMetadata(
+        seq_lens=torch.tensor(mixed_seq_lens, dtype=torch.int),
+        request_ids=request_ids,
+        max_num_requests=batch_size,
+        num_contexts=num_ctx,
+        prompt_lens=context_lengths,
+        max_num_tokens=total_mixed_tokens,
+        kv_cache_manager=cache_manager,
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=mixed_cached_lens),
+        mapping=mapping,
+        enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
+        sparse_attention_config=sparse_config,
+    )
+    mixed_metadata.prepare()
+
+    # 5. Per-layer forward + verify (mirrors forward_impl_with_mewtwo).
+    for li in TEST_LAYERS:
+        ratio = scenario.compress_ratios[li]
+        print(f"\n--- Mixed: layer {li}, compress_ratio={ratio} ---")
+
+        # Random inputs
+        ctx_q_nope = torch.empty(
+            [total_ctx_tokens, num_heads, kv_lora_rank], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        ctx_q_pe = torch.empty(
+            [total_ctx_tokens, num_heads, qk_rope_head_dim], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        ctx_fused_q = torch.cat([ctx_q_nope, ctx_q_pe], dim=-1).view(-1, num_heads * head_dim)
+        ctx_k_pe = torch.empty(
+            [total_ctx_tokens, qk_rope_head_dim], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        ctx_compressed_kv = torch.empty(
+            [total_ctx_tokens, kv_lora_rank], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        ctx_latent = torch.cat([ctx_compressed_kv, ctx_k_pe], dim=-1)
+
+        gen_fused_q = torch.empty(
+            [total_gen_tokens, num_heads * head_dim], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gen_q_pe = torch.empty(
+            [total_gen_tokens, num_heads, qk_rope_head_dim], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gen_compressed_kv = torch.empty(
+            [total_gen_tokens, kv_lora_rank], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gen_k_pe = torch.empty(
+            [total_gen_tokens, qk_rope_head_dim], dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gen_latent = torch.cat([gen_compressed_kv, gen_k_pe], dim=-1)
+
+        output = torch.empty(
+            [total_mixed_tokens, num_heads * v_head_dim], dtype=dtype, device=device
+        )
+
+        # topk_indices for ratio=4
+        ctx_topk = gen_topk = None
+        if ratio == 4:
+            ctx_positions = list(range(context_lengths[0]))
+            ctx_topk = _build_compressed_topk_indices(
+                ctx_positions, ratio, scenario.index_topk, device
+            )
+            gen_topk = _build_compressed_topk_indices(
+                [kv - 1 for kv in [cl + generation_seq_len_q for cl in gen_cached_lens]],
+                ratio,
+                scenario.index_topk,
+                device,
+            )
+
+        # Context forward → output[:total_ctx_tokens]
+        ctx_sparse = mixed_metadata.sparse_mla_topk_lens[ratio][:total_ctx_tokens].clone()
+        layers[li].forward(
+            ctx_fused_q.clone(),
+            None,
+            None,
+            mixed_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            output=output[:total_ctx_tokens],
+            latent_cache=ctx_latent,
+            q_pe=ctx_q_pe,
+            topk_indices=ctx_topk,
+            sparse_lens=ctx_sparse,
+            is_generation=False,
+        )
+
+        # Generation forward → output[total_ctx_tokens:]
+        num_seqs = mixed_metadata.kv_lens_cuda_runtime.size(0)
+        cu_q = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        cu_kv = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        counter = torch.empty(1, dtype=torch.uint32, device=device)
+        layers[li].mla_rope_generation(
+            gen_fused_q,
+            gen_q_pe,
+            gen_latent,
+            mixed_metadata,
+            cu_q,
+            cu_kv,
+            counter,
+            None,
+            None,
+            None,
+        )
+        gen_sparse = mixed_metadata.sparse_mla_topk_lens[ratio][
+            total_ctx_tokens:total_mixed_tokens
+        ].clone()
+        layers[li].forward(
+            gen_fused_q,
+            None,
+            None,
+            mixed_metadata,
+            attention_input_type=AttentionInputType.generation_only,
+            output=output[total_ctx_tokens:total_mixed_tokens],
+            latent_cache=gen_latent,
+            q_pe=gen_q_pe,
+            cu_q_seqlens=cu_q,
+            cu_kv_seqlens=cu_kv,
+            fmha_scheduler_counter=counter,
+            topk_indices=gen_topk,
+            sparse_lens=gen_sparse,
+            is_generation=True,
+        )
+
+        # Context reference
+        ctx_k_pe_ref = _rotate_k_pe_for_ctx(ctx_k_pe, rope_cos_sin, [context_lengths[0]])
+        ctx_latent_ref = torch.cat([ctx_compressed_kv, ctx_k_pe_ref], dim=-1)
+        ctx_q_rot = _rotate_fused_q_for_ctx(
+            ctx_fused_q,
+            rope_cos_sin,
+            [context_lengths[0]],
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+        )
+        ctx_ref = calculate_mewtwo_ref_ctx_sparse(
+            ctx_q_rot,
+            ctx_latent_ref,
+            None,
+            scenario.window_size,
+            ctx_topk,
+            [context_lengths[0]],
+            num_heads,
+            kv_lora_rank,
+            v_head_dim,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            q_scaling,
+            ratio,
+        )
+
+        # Generation reference
+        prefill_k_pe_ref = _rotate_k_pe_for_ctx(prefill_k_pe, rope_cos_sin, gen_ctx_lengths)
+        gen_latent_ref = torch.cat([prefill_compressed_kv, prefill_k_pe_ref], dim=-1)
+        gen_q_rot, new_latent = _rotate_gen_inputs(
+            gen_fused_q,
+            gen_q_pe,
+            gen_compressed_kv,
+            gen_k_pe,
+            rope_cos_sin,
+            gen_cached_lens,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+        )
+        gen_ref, _ = calculate_mewtwo_ref_gen_sparse(
+            gen_q_rot,
+            new_latent,
+            gen_latent_ref,
+            compress_ref_data.get(li),
+            gen_topk,
+            scenario.window_size,
+            gen_cached_lens,
+            num_heads,
+            kv_lora_rank,
+            v_head_dim,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            q_scaling,
+            ratio,
+        )
+
+        ctx_diff = (output[:total_ctx_tokens] - ctx_ref).abs()
+        gen_diff = (output[total_ctx_tokens:] - gen_ref).abs()
+        print(
+            f"  Context:    diff mean={ctx_diff.mean().item():.6f}, max={ctx_diff.max().item():.6f}"
+        )
+        print(
+            f"  Generation: diff mean={gen_diff.mean().item():.6f}, max={gen_diff.max().item():.6f}"
+        )
+        assert torch.allclose(output[:total_ctx_tokens], ctx_ref, atol=0.2, rtol=0.02), (
+            f"Mixed ctx mismatch layer {li} ratio={ratio}: max diff={ctx_diff.max().item():.6f}"
+        )
+        assert torch.allclose(output[total_ctx_tokens:], gen_ref, atol=0.2, rtol=0.02), (
+            f"Mixed gen mismatch layer {li} ratio={ratio}: max diff={gen_diff.max().item():.6f}"
+        )
+        print("  PASSED")
+
+    cache_manager.shutdown()
+    print("\nMixed batch test PASSED!")
 
 
 if __name__ == "__main__":

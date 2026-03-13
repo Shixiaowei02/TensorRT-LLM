@@ -219,6 +219,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Secondary KV pool base pointer for dual-TMA-descriptor path.
+    void const* secondaryKvBasePtr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer

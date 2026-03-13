@@ -97,7 +97,7 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> sparse_mla_kv_cache_pool_ptr = std::nullopt) const
+        std::optional<int64_t> sparse_mla_secondary_kv_pool_ptr = std::nullopt) const
         = 0;
 };
 
@@ -160,7 +160,7 @@ public:
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
         std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> sparse_mla_kv_cache_pool_ptr) const override
+        std::optional<int64_t> sparse_mla_secondary_kv_pool_ptr) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -377,7 +377,11 @@ public:
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
         if (op.isMLAEnabled() && op.mUseSparseAttention)
         {
-            if (sparse_mla_topk_lens.has_value())
+            TORCH_CHECK(use_kv_cache, "KV cache is required for sparse MLA");
+            bool const is_variable_topk_lens = sparse_mla_topk_lens.has_value();
+            // VariableTopKLens sparse MLA uses the topk_lens to get kv_lens for each token,
+            // while FixedTopKLens sparse MLA uses sparse_mla_topk.
+            if (is_variable_topk_lens)
             {
                 op.mRuntimeSparseAttentionParams.sparse_mla_topk_lens
                     = sparse_mla_topk_lens.value().data_ptr<int32_t>();
@@ -387,15 +391,19 @@ public:
                 op.mRuntimeSparseAttentionParams.sparse_mla_topk_lens = nullptr;
             }
             op.mRuntimeSparseAttentionParams.sparse_mla_topk = sparse_mla_topk;
-            if (sparse_mla_kv_cache_pool_ptr.has_value())
+            // Primary KV pool: from host_kv_cache_pool_pointers (the default paged KV pool).
+            op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool
+                = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+            // Secondary KV pool: explicitly provided for dual-pool or nullptr for single-pool.
+            // However, we may adjust the ptrs later.
+            if (sparse_mla_secondary_kv_pool_ptr.has_value())
             {
-                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool
-                    = reinterpret_cast<char*>(sparse_mla_kv_cache_pool_ptr.value());
+                op.mRuntimeSparseAttentionParams.sparse_mla_secondary_kv_pool
+                    = reinterpret_cast<char*>(sparse_mla_secondary_kv_pool_ptr.value());
             }
-            else if (op.useKVCache() && host_kv_cache_pool_pointers.has_value())
+            else
             {
-                op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool = reinterpret_cast<char*>(
-                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                op.mRuntimeSparseAttentionParams.sparse_mla_secondary_kv_pool = nullptr;
             }
         }
 
@@ -650,7 +658,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    std::optional<int64_t> sparse_mla_kv_cache_pool_ptr)
+    std::optional<int64_t> sparse_mla_secondary_kv_pool_ptr)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -917,7 +925,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            sparse_mla_kv_cache_pool_ptr);
+            sparse_mla_secondary_kv_pool_ptr);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -937,7 +945,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_attn_offsets, sparse_attn_indices_block_size, sparse_mla_topk_value, sparse_mla_topk_lens,
             cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer,
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            sparse_mla_kv_cache_pool_ptr);
+            sparse_mla_secondary_kv_pool_ptr);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

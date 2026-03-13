@@ -87,6 +87,8 @@ struct KernelParams
     CUtensorMap tmaK_;
     // TMA descriptor for V.
     CUtensorMap tmaV_;
+    // TMA descriptor for secondary KV pool (e.g., SWA).
+    CUtensorMap tmaKSecondary_;
     // The descriptor for O.
     CUtensorMap tmaO_;
 
@@ -785,6 +787,18 @@ struct KernelParams
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
             /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+
+        // Build the secondary TMA descriptor for the secondary KV pool.
+        // Same shape/stride as tmaK_ for sparse MLA, but with a different base pointer.
+        if (options.mSparseMlaType == SparseMlaType::VariableTopKLens)
+        {
+            TLLM_CHECK_WITH_INFO(options.secondaryKvBasePtr != nullptr,
+                "Secondary KV base pointer must be provided when SparseMlaType::VariableTopKLens is used.");
+            params.tmaKSecondary_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
+                const_cast<void*>(options.secondaryKvBasePtr),
+                /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+        }
+
         // Build tma descriptor for V.
         params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
