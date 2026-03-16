@@ -324,3 +324,31 @@ class PeerRegistrar:
         )
         self._overlap_cache[key] = targets
         return targets
+
+    def should_send_kv(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
+        dup_head_factor = peer_overlap.duplicate_head_factor
+        if dup_head_factor <= 1:
+            return True
+        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup_head_factor) == (
+            self_tp_rank_in_dp_group % dup_head_factor
+        )
+
+    def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
+        # to ensure the transfer aux is not duplicated
+
+        # TP: only the first rank in each peer-TP-sized group sends aux
+        ratio = max(1, self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group)
+        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
+
+        # PP: only the first self-PP rank whose layers overlap with the peer's PP rank sends aux.
+        # All tp/pp ranks have the same aux data, so pick the first overlapping one to avoid duplication.
+        peer_start_layer = sum(peer_rank_info.layer_num_per_pp[: peer_rank_info.pp_rank])
+        peer_end_layer = peer_start_layer + peer_rank_info.layer_num_per_pp[peer_rank_info.pp_rank]
+        offset = 0
+        for p, n in enumerate(self._ri.layer_num_per_pp):
+            if offset < peer_end_layer and offset + n > peer_start_layer:
+                return should_send_in_tp and p == self._ri.pp_rank
+            offset += n
+        return False
