@@ -120,12 +120,17 @@ class PeerRegistrar:
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
 
+        if self_pt is None or peer_pt is None:
+            mapping[(0, 0)] = (0, 0)
+            self._lg_pool_mapping_cache[key] = mapping
+            return mapping
         if not self_pt.layer_groups or not peer_pt.layer_groups:
             mapping[(0, 0)] = (0, 0)
             self._lg_pool_mapping_cache[key] = mapping
             return mapping
 
         peer_layer_to_group = get_layer_to_layer_group(peer_pt)
+        assert self._ri.attention is not None
         kv_factor = self._ri.attention.kv_factor
 
         for self_lg_idx, self_lg in enumerate(self_pt.layer_groups):
@@ -199,6 +204,8 @@ class PeerRegistrar:
 
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
+        assert self_pt is not None
+        assert peer_pt is not None
         self_lg_idx, self_pi = self_pool_key
         peer_lg_idx, peer_pi = peer_pool_key
         self_lg = self_pt.layer_groups[self_lg_idx]
@@ -206,6 +213,7 @@ class PeerRegistrar:
         self_pv = self_lg.pool_views[self_pi]
         peer_pv = peer_lg.pool_views[peer_pi]
 
+        assert self._ri.attention is not None
         kv_factor = self._ri.attention.kv_factor
         is_indexer = len(self_pv.buffer_entries) == 0
         self_pool_role = (

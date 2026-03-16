@@ -9,7 +9,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import SyncStatus, TransferWorker
+from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, TransferWorker
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -266,12 +266,12 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 sync_status = self.send_futures[request_id].result(
                     timeout=self.sender_future_timeout_ms / 1000.0
                 )
-                if sync_status == SyncStatus.SUCCESS:
+                if sync_status == AgentResult.SUCCESS:
                     if self._need_aux_transfer(req) and session.aux_task is not None:
                         aux_status = session.aux_task.future.result(
                             timeout=self.sender_future_timeout_ms / 1000.0
                         )
-                        if aux_status == SyncStatus.SUCCESS:
+                        if aux_status == AgentResult.SUCCESS:
                             completed_request_ids.append(request_id)
                         else:
                             failed_request_ids.append(request_id)
@@ -357,7 +357,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             req = self.recv_req_id_to_request[request_id]
             try:
                 sync_status = self.recv_futures[request_id].result()
-                if sync_status == SyncStatus.SUCCESS:
+                if sync_status == AgentResult.SUCCESS:
                     completed_request_ids.append(request_id)
                 else:
                     failed_request_ids.append(request_id)
@@ -370,6 +370,20 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             if request_id in completed_request_ids:
                 if self._need_aux_transfer(req):
                     self.transfer_worker.unpack_aux(recv_session, req)
+                    first_gen_tokens = req.py_first_gen_tokens
+                    draft_tokens = req.py_draft_tokens
+                    if req.context_phase_params is None:
+                        req.context_phase_params = ContextPhaseParams(
+                            first_gen_tokens=first_gen_tokens,
+                            req_id=req.py_request_id,
+                            opaque_state=b"",
+                            draft_tokens=draft_tokens,
+                            ctx_dp_rank=0,
+                            disagg_info_endpoint="",
+                        )
+                    else:
+                        req.context_phase_params.first_gen_tokens = first_gen_tokens
+                        req.context_phase_params.draft_tokens = draft_tokens
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             elif request_id in failed_request_ids:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -392,7 +406,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         # requests before context-phase response data arrives.
         return {
             "ctx_dp_rank": self.dp_rank,
-            "ctx_info_endpoint": self.context_info_endpoint,
+            "ctx_info_endpoint": [self.context_info_endpoint]
+            if self.context_info_endpoint
+            else None,
         }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
