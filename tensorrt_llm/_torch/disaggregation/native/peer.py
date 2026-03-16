@@ -121,11 +121,9 @@ class PeerRegistrar:
         peer_pt = peer_ri.page_table
 
         if self_pt is None or peer_pt is None:
-            mapping[(0, 0)] = (0, 0)
             self._lg_pool_mapping_cache[key] = mapping
             return mapping
         if not self_pt.layer_groups or not peer_pt.layer_groups:
-            mapping[(0, 0)] = (0, 0)
             self._lg_pool_mapping_cache[key] = mapping
             return mapping
 

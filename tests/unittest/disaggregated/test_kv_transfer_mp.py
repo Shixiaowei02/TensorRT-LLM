@@ -332,10 +332,10 @@ def worker_fn(
             # Get block ids and send
             block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
             send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            send_slice_task = sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+            send_future = sender_session.send(send_kv_slice)
 
             # Wait for send to complete
-            send_slice_task.future.result()
+            send_future.result()
             assert sender_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
@@ -371,10 +371,10 @@ def worker_fn(
             # Get block ids and receive
             block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
             recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            recv_slice_task = receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+            recv_future = receiver_session.receive(recv_kv_slice)
 
             # Wait for receive to complete
-            recv_slice_task.future.result()
+            recv_future.result()
             assert receiver_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification

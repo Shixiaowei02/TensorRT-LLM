@@ -355,10 +355,24 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id in to_complete_request_ids:
             recv_session = self.recv_sessions[request_id]
             req = self.recv_req_id_to_request[request_id]
+            need_aux = self._need_aux_transfer(req)
             try:
                 sync_status = self.recv_futures[request_id].result()
                 if sync_status == AgentResult.SUCCESS:
-                    completed_request_ids.append(request_id)
+                    if need_aux:
+                        # KV future resolved, but the session is not fully done
+                        # until AUX arrives (status == FULLY_TRANSFERRED).
+                        # KV_TRANSFERRED means AUX is still in flight — skip
+                        # this request and re-evaluate on the next poll cycle.
+                        session_status = recv_session.status
+                        if session_status == SessionStatus.FULLY_TRANSFERRED:
+                            completed_request_ids.append(request_id)
+                        elif session_status == SessionStatus.ERROR:
+                            failed_request_ids.append(request_id)
+                        # else: KV_TRANSFERRED or other intermediate — leave
+                        # the session in recv_sessions for the next iteration.
+                    else:
+                        completed_request_ids.append(request_id)
                 else:
                     failed_request_ids.append(request_id)
             except Exception:

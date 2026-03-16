@@ -625,8 +625,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
 
@@ -641,8 +641,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -655,8 +655,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_tasks = [
-            receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
+        recv_slice_futures = [
+            receiver_session.receive(recv_kv_slice)
             for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
         ]
 
@@ -676,8 +676,8 @@ def add_and_verify_request(
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_tasks = [
-            sender_session._kv_tasks[sender_session.send(send_kv_slice)]
+        send_slice_futures = [
+            sender_session.send(send_kv_slice)
             for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
         ]
         send_aux_tasks = []
@@ -685,10 +685,10 @@ def add_and_verify_request(
             sender_session.pack_aux()
             send_aux_tasks.append(sender_session.send_aux())
 
-    for send_slice_task in send_slice_tasks:
-        send_slice_task.future.result()
-    for recv_slice_task in recv_slice_tasks:
-        recv_slice_task.future.result()
+    for future in send_slice_futures:
+        future.result()
+    for future in recv_slice_futures:
+        future.result()
     if not send_first:
         for send_aux_task in send_aux_tasks:
             send_aux_task.future.result()

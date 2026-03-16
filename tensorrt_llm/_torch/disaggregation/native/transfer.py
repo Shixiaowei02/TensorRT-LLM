@@ -825,6 +825,7 @@ class KVRecvTask:
         self.slice_id = slice_id
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
+        self.last_slice_count = 0
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -990,9 +991,12 @@ class Receiver(ReceiverBase):
         self._messenger.start_listener(handle_message)
 
     def _process_kv_agent_result(self, send_id: bytes, message: list[bytes]):
-        msg_type, peer_rank, unique_rid, _, is_last_slice_str, status = decode_message(message)
+        msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
+            message
+        )
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
+        slice_id = int(slice_id_str)
         if msg_type.encode("ascii") != MessageType.KV_AGENT_RESULT:
             logger.error(
                 f"_process_kv_agent_result: unexpected msg_type={msg_type!r}, expected TASK_STATUS"
@@ -1004,7 +1008,9 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: session {unique_rid} not found (already closed?), dropping status"
             )
             return
-        session.process_kv_agent_result(peer_rank, is_last_slice_str == "True", AgentResult(status))
+        session.process_kv_agent_result(
+            peer_rank, slice_id, is_last_slice_str == "True", AgentResult(status)
+        )
 
     def _process_aux_agent_result(self, send_id: bytes, message: list[bytes]):
         msg_type, peer_rank, unique_rid, status = decode_message(message)
@@ -1053,7 +1059,6 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._kv_tasks: list[KVRecvTask] = []
-        self._last_slice_count = 0
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._receiver.setup_session(self)
@@ -1091,17 +1096,21 @@ class RxSession(RxSessionBase):
         self._receiver.dispatch_task(task)
         return task.future
 
-    def process_kv_agent_result(self, peer_rank: int, is_last_slice: bool, status: AgentResult):
-        task = self._kv_tasks[0]  # TODO: index by slice_id when multi-slice is supported
+    def process_kv_agent_result(
+        self, peer_rank: int, slice_id: int, is_last_slice: bool, status: AgentResult
+    ):
+        task = self._kv_tasks[slice_id]
         if status == AgentResult.SUCCESS:
             if is_last_slice:
-                self._last_slice_count += 1
-                if self._last_slice_count == task.expected_transfers:
+                task.last_slice_count += 1
+                if task.last_slice_count == task.expected_transfers:
                     if not task.future.done():
                         task.future.set_result(AgentResult.SUCCESS)
                     task.status = TaskStatus.TRANSFERRED
 
-                    logger.debug(f"KV transfer complete for request {self.request_id}")
+                    logger.debug(
+                        f"KV transfer complete for request {self.request_id} slice {slice_id}"
+                    )
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_end(peer_rank)
                     ri = self._receiver._registrar.self_rank_info
@@ -1109,7 +1118,9 @@ class RxSession(RxSessionBase):
         elif status == AgentResult.FAILED:
             if not task.future.done():
                 task.future.set_exception(
-                    RuntimeError(f"KV transfer failed for request {self.request_id}")
+                    RuntimeError(
+                        f"KV transfer failed for request {self.request_id} slice {slice_id}"
+                    )
                 )
             task.status = TaskStatus.ERROR
         else:
