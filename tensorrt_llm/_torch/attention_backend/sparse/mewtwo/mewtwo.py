@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
@@ -149,54 +150,6 @@ def get_token_bytes(
     return attn_dim * dtype_bytes + scale_size
 
 
-def build_window_local_indices(
-    token_positions: torch.Tensor,
-    window_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build SWA local indices for all tokens.
-    """
-    positions = token_positions.unsqueeze(1)  # [num_tokens, 1]
-    offsets = torch.arange(window_size, dtype=torch.int32, device=device)
-
-    # matrix[i, j] = max(0, pos[i] - window_size + 1) + j
-    swa_start = (positions - window_size + 1).clamp(min=0)
-    swa_indices = swa_start + offsets
-
-    swa_indices = torch.where(swa_indices > positions, -1, swa_indices)
-    return swa_indices.to(torch.int32)
-
-
-def build_compressed_local_indices(
-    token_positions: torch.Tensor,
-    compress_ratio: int,
-    max_compressed_indices: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build compressed local indices for compress_ratio=128.
-    For each token, indices are arange(0, (pos+1) // compress_ratio).
-    """
-    num_tokens = token_positions.shape[0]
-    # Number of valid compressed indices per token
-    num_valid = (token_positions + 1) // compress_ratio  # [num_tokens]
-
-    # Create output filled with -1
-    indices = torch.full((num_tokens, max_compressed_indices), -1, dtype=torch.int32, device=device)
-
-    # Generate sequential indices: 0, 1, 2, ..., max_compressed_indices-1
-    col_indices = torch.arange(max_compressed_indices, dtype=torch.int32, device=device)
-
-    # Mask: valid where col_idx < num_valid[row]
-    valid_mask = col_indices.unsqueeze(0) < num_valid.unsqueeze(1)
-
-    # Fill valid positions with sequential indices
-    indices = torch.where(valid_mask, col_indices.unsqueeze(0).expand(num_tokens, -1), indices)
-
-    return indices
-
-
 class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
@@ -218,6 +171,15 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         capture_graph = self.is_cuda_graph
         self.compress_ratio_set = set(self.compress_ratios)
+        # Cache a sorted list for deterministic iteration order across
+        # torch.compile traces. Avoids repeated set→list conversion and
+        # guarantees stable specialization keys.
+        self._compress_ratios_sorted = sorted(self.compress_ratio_set)
+        _supported_ratios = {1, 4, 128}
+        _unsupported = self.compress_ratio_set - _supported_ratios
+        assert not _unsupported, (
+            f"Unsupported compress ratios {_unsupported}. Only {_supported_ratios} are supported."
+        )
 
         attention_types = []
         for compress_ratio in self.compress_ratio_set:
@@ -501,6 +463,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = self.swa_local_indices_cuda.device
 
         if token_positions is None:
+            # Initial prepare() path — build token_positions from CPU data.
             num_requests = self.num_seqs
             cached_token_lens = self.cached_token_lens_cpu[:num_requests].to(
                 device, non_blocking=True
@@ -516,61 +479,79 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 token_idx += seq_len
             token_positions = token_positions[: self.num_tokens]
 
+        self._prepare_mewtwo_indices_compiled(
+            token_positions,
+            window_size,
+            self.max_compressed_indices[128],
+            self.sparse_mla_topk,
+            self.swa_local_indices_cuda,
+            self.compressed_local_indices_cuda,
+            self.sparse_mla_topk_lens,
+            self._compress_ratios_sorted,
+        )
+
+    @staticmethod
+    @maybe_compile(dynamic=True, options={"max-autotune": True})
+    def _prepare_mewtwo_indices_compiled(
+        token_positions: torch.Tensor,
+        window_size: int,
+        max_compressed_indices_128: int,
+        sparse_mla_topk: int,
+        swa_local_indices_buf: torch.Tensor,
+        compressed_local_indices_buf: torch.Tensor,
+        sparse_mla_topk_lens_bufs: Dict[int, torch.Tensor],
+        compress_ratios: list,
+    ):
+        """Build SWA indices, compressed indices, and topk_lens in one fused graph."""
+        device = token_positions.device
         num_tokens = token_positions.shape[0]
 
-        swa_indices = build_window_local_indices(token_positions, window_size, device)
-        self.swa_local_indices_cuda[:num_tokens].copy_(swa_indices)
+        # ── SWA local indices ──
+        positions = token_positions.unsqueeze(1)  # [num_tokens, 1]
+        swa_offsets = torch.arange(window_size, dtype=torch.int32, device=device)
+        swa_start = (positions - window_size + 1).clamp(min=0)
+        swa_indices = swa_start + swa_offsets
+        swa_indices = torch.where(swa_indices > positions, -1, swa_indices).to(torch.int32)
+        swa_local_indices_buf[:num_tokens] = swa_indices
 
-        # Only build ratio=128 here; ratio=4 uses dynamic topk_indices from indexer
-        compressed_indices = build_compressed_local_indices(
-            token_positions,
-            compress_ratio=128,
-            max_compressed_indices=self.max_compressed_indices[128],
-            device=device,
+        # ── Compressed local indices (ratio=128) ──
+        # Hardcoded 128: compressed_local_indices only applies to ratio=128
+        # layers. This is a design constraint — see compress_ratio_set
+        # validation in __post_init__ which restricts ratios to {1, 4, 128}.
+        num_valid = (token_positions + 1) // 128
+        comp_col = torch.arange(max_compressed_indices_128, dtype=torch.int32, device=device)
+        valid_mask = comp_col.unsqueeze(0) < num_valid.unsqueeze(1)
+        comp_indices = torch.where(
+            valid_mask,
+            comp_col.unsqueeze(0).expand(num_tokens, -1),
+            torch.full(
+                (num_tokens, max_compressed_indices_128), -1, dtype=torch.int32, device=device
+            ),
         )
-        self.compressed_local_indices_cuda[:num_tokens].copy_(compressed_indices)
+        compressed_local_indices_buf[:num_tokens] = comp_indices
 
-        self.prepare_sparse_mla_topk_lens(token_positions)
-
-    def prepare_sparse_mla_topk_lens(self, token_positions: torch.Tensor):
-        """
-        Prepare sparse_mla_topk_lens: number of KV indices per token for FMHA.
-
-        Dual-pool layout:
-        - compress_ratio=1: min(kv_len, window_size) — actual valid SWA count
-        - compress_ratio=4: window_size + min(kv_len // 4, sparse_mla_topk)
-          (fixed 128 SWA slots + compressed valid count)
-        - compress_ratio=128: window_size + kv_len // 128
-          (fixed 128 SWA slots + compressed valid count)
-
-        For ratio>1, the SWA region always occupies exactly window_size (128) slots.
-        Invalid SWA positions within the window are padded with -1 in the index buffer.
-        """
-        window_size = self.sparse_attention_config.window_size
-
-        # kv_len for each token = pos + 1
-        kv_lens = token_positions + 1  # [num_tokens]
-
-        for compress_ratio in self.compress_ratio_set:
+        # ── sparse_mla_topk_lens per compress_ratio ──
+        # Dual-pool layout:
+        # - compress_ratio=1: min(kv_len, window_size) — actual valid SWA count
+        # - compress_ratio=4: window_size + min(kv_len // 4, sparse_mla_topk)
+        #   (fixed 128 SWA slots + compressed valid count)
+        # - compress_ratio=128: window_size + kv_len // 128
+        #   (fixed 128 SWA slots + compressed valid count)
+        # For ratio>1, the SWA region always occupies exactly window_size (128)
+        # slots. Invalid SWA positions are padded with -1 in the index buffer.
+        kv_lens = token_positions + 1
+        for compress_ratio in compress_ratios:
             if compress_ratio == 1:
-                # SWA only: actual valid count
-                total_count = torch.minimum(kv_lens, torch.full_like(kv_lens, window_size))
+                total_count = kv_lens.clamp(max=window_size)
             elif compress_ratio == 4:
-                # Dual-pool: fixed window_size SWA slots + compressed valid count
-                compressed_count = torch.minimum(
-                    kv_lens // compress_ratio, torch.full_like(kv_lens, self.sparse_mla_topk)
-                )
+                compressed_count = (kv_lens // compress_ratio).clamp(max=sparse_mla_topk)
                 total_count = window_size + compressed_count
             elif compress_ratio == 128:
-                # Dual-pool: fixed window_size SWA slots + compressed valid count
                 compressed_count = kv_lens // compress_ratio
                 total_count = window_size + compressed_count
             else:
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
-
-            self.sparse_mla_topk_lens[compress_ratio][: self.num_tokens].copy_(
-                total_count.to(torch.int32)
-            )
+            sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
 
     def prepare_for_cache_buffer_data_pointers(self):
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1
@@ -668,8 +649,8 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
             num_ctx_compressed_tokens = new_comp_kv_lens[: self.num_contexts].sum().item()
             # To support CUDA graph, generation requests should use a constant number of compressed tokens.
-            num_gen_compressed_tokens = self.num_generations * math.ceil(
-                num_gen_tokens_per_seq / compress_ratio
+            num_gen_compressed_tokens = self.num_generations * (
+                (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
             )
             self.num_total_compressed_tokens[compress_ratio] = (
                 num_ctx_compressed_tokens + num_gen_compressed_tokens
@@ -708,7 +689,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 # Use a constant number of new compressed KV tokens for each generation request
                 # to support CUDA graph.
                 past_kv_lens = self.past_kv_lens[compress_ratio][self.num_contexts + i].item()
-                new_kv_lens = math.ceil(num_gen_tokens_per_seq / compress_ratio)
+                new_kv_lens = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 position_ids.extend(list(range(past_kv_lens, past_kv_lens + new_kv_lens)))
             compressed_num_tokens = len(position_ids)
             self.compressed_position_ids[compress_ratio][:compressed_num_tokens] = (
@@ -727,79 +708,166 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_contexts = self.num_contexts
         num_generations = self.num_generations
         num_tokens = self.num_tokens
-        device = self.kv_lens_cuda.device
         kv_lens = self.kv_lens_cuda[:batch_size]
         seq_lens = self._seq_lens_cuda[:batch_size]
         cached_tokens = kv_lens - seq_lens
-
-        # Recompute cu_seq_lens and req_idx_per_token
-        self.cu_seq_lens_cuda[:1].zero_()
-        torch.cumsum(seq_lens.to(torch.int), dim=0, out=self.cu_seq_lens_cuda[1 : batch_size + 1])
-        token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
-        self.req_idx_per_token[:num_tokens].copy_(
-            torch.searchsorted(
-                self.cu_seq_lens_cuda[1 : batch_size + 1].to(torch.int32), token_idx, right=True
-            )
-        )
-
-        # Per-token positions: cached_tokens[req] + intra-sequence offset
-        req_idx = self.req_idx_per_token[:num_tokens]
-        base_pos = cached_tokens[req_idx].to(torch.int32)
-        offsets = token_idx - self.cu_seq_lens_cuda[req_idx].to(torch.int32)
-        token_positions = base_pos + offsets
 
         num_gen_tokens = num_tokens - self.num_ctx_tokens
         self.num_gen_tokens_per_seq = (
             num_gen_tokens // num_generations if num_generations > 0 else 0
         )
-        num_gen_tokens_per_seq = self.num_gen_tokens_per_seq
 
-        # Per-ratio: update compressed/past/new KV lens and position IDs.
-        # num_total_compressed_tokens and max_num_compressed_tokens are NOT
-        # updated here; prepare() sets them as stable upper bounds.
-        for compress_ratio in self.compress_ratio_set:
-            compressed_kv = (kv_lens // compress_ratio).to(torch.int)
-            self.compressed_kv_lens_cuda[compress_ratio][:batch_size].copy_(compressed_kv)
+        self._compute_per_ratio_kv_lens(
+            kv_lens,
+            cached_tokens,
+            batch_size,
+            self.compressed_kv_lens_cuda,
+            self.past_kv_lens_cuda,
+            self.new_comp_kv_lens_cuda,
+            self.cu_new_comp_kv_cuda,
+            self._compress_ratios_sorted,
+        )
 
-            past_kv = (cached_tokens // compress_ratio).to(torch.int)
-            self.past_kv_lens_cuda[compress_ratio][:batch_size].copy_(past_kv)
+        token_positions = self._compute_token_positions(
+            seq_lens,
+            cached_tokens,
+            batch_size,
+            num_tokens,
+            self.cu_seq_lens_cuda,
+            self.req_idx_per_token,
+        )
 
-            new_comp = compressed_kv - past_kv
-            self.new_comp_kv_lens_cuda[compress_ratio][:batch_size].copy_(new_comp)
-
-            self.cu_new_comp_kv_cuda[compress_ratio][:1].zero_()
-            torch.cumsum(
-                new_comp, dim=0, out=self.cu_new_comp_kv_cuda[compress_ratio][1 : batch_size + 1]
+        if num_contexts > 0:
+            self._compute_ctx_compressed_position_ids(
+                self.past_kv_lens_cuda,
+                self.cu_new_comp_kv_cuda,
+                self.compressed_position_ids_cuda,
+                num_contexts,
+                self._compress_ratios_sorted,
             )
 
-            # Compressed position IDs (layout computed locally)
-            new_gen_comp = (
-                math.ceil(num_gen_tokens_per_seq / compress_ratio)
-                if num_gen_tokens_per_seq > 0
-                else 0
+        if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
+            self._compute_gen_compressed_position_ids(
+                self.past_kv_lens_cuda,
+                self.cu_new_comp_kv_cuda,
+                self.compressed_position_ids_cuda,
+                batch_size,
+                num_generations,
+                self.num_gen_tokens_per_seq,
+                self._compress_ratios_sorted,
             )
-            gen_comp = num_generations * new_gen_comp
-            ctx_comp = new_comp[:num_contexts].sum().item() if num_contexts > 0 else 0
-
-            if ctx_comp > 0:
-                ctx_idx = torch.arange(ctx_comp, dtype=torch.int32, device=device)
-                ctx_cu = self.cu_new_comp_kv_cuda[compress_ratio][: num_contexts + 1].to(
-                    torch.int32
-                )
-                ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
-                ctx_offset = ctx_idx - ctx_cu[ctx_req]
-                self.compressed_position_ids_cuda[compress_ratio][:ctx_comp].copy_(
-                    ((past_kv[:num_contexts][ctx_req] + ctx_offset) * compress_ratio).to(torch.int)
-                )
-            if gen_comp > 0 and num_generations > 0:
-                gen_past = past_kv[num_contexts:batch_size]
-                gen_offsets = torch.arange(new_gen_comp, dtype=torch.int32, device=device)
-                gen_pos = gen_past.unsqueeze(1) + gen_offsets.unsqueeze(0)
-                self.compressed_position_ids_cuda[compress_ratio][
-                    ctx_comp : ctx_comp + gen_comp
-                ].copy_((gen_pos.reshape(-1) * compress_ratio).to(torch.int))
 
         self.prepare_for_mewtwo_indices(token_positions)
+
+    @staticmethod
+    @maybe_compile(dynamic=True, options={"max-autotune": True})
+    def _compute_per_ratio_kv_lens(
+        kv_lens: torch.Tensor,
+        cached_tokens: torch.Tensor,
+        batch_size: int,
+        compressed_kv_lens_bufs: Dict[int, torch.Tensor],
+        past_kv_lens_bufs: Dict[int, torch.Tensor],
+        new_comp_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
+        compress_ratios: list,
+    ):
+        """Compute per-ratio compressed/past/new kv lens and cu_new_comp."""
+        for compress_ratio in compress_ratios:
+            compressed_kv = (kv_lens // compress_ratio).to(torch.int)
+            compressed_kv_lens_bufs[compress_ratio][:batch_size] = compressed_kv
+
+            past_kv = (cached_tokens // compress_ratio).to(torch.int)
+            past_kv_lens_bufs[compress_ratio][:batch_size] = past_kv
+
+            new_comp = compressed_kv - past_kv
+            new_comp_kv_lens_bufs[compress_ratio][:batch_size] = new_comp
+
+            cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
+            cu_new_comp[0] = 0
+            cu_new_comp[1 : batch_size + 1] = torch.cumsum(new_comp, dim=0)
+
+    @staticmethod
+    def _compute_token_positions(
+        seq_lens: torch.Tensor,
+        cached_tokens: torch.Tensor,
+        batch_size: int,
+        num_tokens: int,
+        cu_seq_lens_buf: torch.Tensor,
+        req_idx_per_token_buf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute cu_seq_lens, req_idx_per_token, and token_positions (eager)."""
+        device = seq_lens.device
+
+        # cu_seq_lens
+        cu_seq_lens_buf[0] = 0
+        cu_seq_lens_buf[1 : batch_size + 1] = torch.cumsum(seq_lens.to(torch.int), dim=0)
+
+        # req_idx_per_token via searchsorted
+        token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        req_idx = torch.searchsorted(
+            cu_seq_lens_buf[1 : batch_size + 1].to(torch.int32), token_idx, right=True
+        )
+        req_idx_per_token_buf[:num_tokens] = req_idx
+
+        # token positions
+        base_pos = cached_tokens[req_idx].to(torch.int32)
+        offsets = token_idx - cu_seq_lens_buf[req_idx].to(torch.int32)
+        return base_pos + offsets
+
+    @staticmethod
+    @maybe_compile(options={"max-autotune": True})
+    def _compute_gen_compressed_position_ids(
+        past_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
+        compressed_position_ids_bufs: Dict[int, torch.Tensor],
+        batch_size: int,
+        num_generations: int,
+        num_gen_tokens_per_seq: int,
+        compress_ratios: list,
+    ):
+        """Generation compressed position IDs.
+
+        gen_start = batch_size - num_generations avoids num_contexts as a
+        compile-time constant. All int args are stable during decode."""
+        device = past_kv_lens_bufs[compress_ratios[0]].device
+        gen_start = batch_size - num_generations
+        for compress_ratio in compress_ratios:
+            gen_past = past_kv_lens_bufs[compress_ratio][gen_start:batch_size]
+            new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+            gen_offsets = torch.arange(new_gen_comp, dtype=torch.int32, device=device)
+            gen_pos = gen_past.unsqueeze(1) + gen_offsets.unsqueeze(0)
+            gen_comp = num_generations * new_gen_comp
+            result = (gen_pos.reshape(-1) * compress_ratio).to(torch.int)
+            if gen_start == 0:
+                compressed_position_ids_bufs[compress_ratio][:gen_comp] = result
+            else:
+                output_offset = cu_new_comp_kv_bufs[compress_ratio][gen_start]
+                compressed_position_ids_bufs[compress_ratio][
+                    output_offset : output_offset + gen_comp
+                ] = result
+
+    @staticmethod
+    def _compute_ctx_compressed_position_ids(
+        past_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
+        compressed_position_ids_bufs: Dict[int, torch.Tensor],
+        num_contexts: int,
+        compress_ratios: list,
+    ):
+        """Context-only compressed position IDs (eager, data-dependent shapes)."""
+        device = past_kv_lens_bufs[compress_ratios[0]].device
+        for compress_ratio in compress_ratios:
+            past_kv = past_kv_lens_bufs[compress_ratio]
+            cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
+
+            total_ctx_comp = cu_new_comp[num_contexts]
+            ctx_idx = torch.arange(total_ctx_comp, dtype=torch.int32, device=device)
+            ctx_cu = cu_new_comp[: num_contexts + 1].to(torch.int32)
+            ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
+            ctx_offset = ctx_idx - ctx_cu[ctx_req]
+            compressed_position_ids_bufs[compress_ratio][:total_ctx_comp] = (
+                (past_kv[:num_contexts][ctx_req] + ctx_offset) * compress_ratio
+            ).to(torch.int)
 
 
 class MewtwoIndexer(Indexer):
