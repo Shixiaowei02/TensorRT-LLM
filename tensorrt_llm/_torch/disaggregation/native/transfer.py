@@ -606,15 +606,21 @@ class Sender(SenderBase):
                 case MessageType.TERMINATION:
                     return False
                 case MessageType.REQUEST_DATA:
-                    self._respond_with_kv(send_id, msg)
+                    try:
+                        self._respond_with_kv(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"Sender: error handling REQUEST_DATA: {e}")
                 case MessageType.REGISTER_RANK_INFO:
-                    self._register_peer_rank(send_id, msg)
+                    try:
+                        self._register_peer_rank(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"Sender: error handling REGISTER_RANK_INFO: {e}")
                 case _:
-                    raise ValueError(f"Sender received unknown message type: {msg[0]}")
+                    logger.error(f"Sender received unknown message type: {msg[0]}")
 
         self._messenger.start_listener(handle_message)
 
-    def _register_peer_rank(self, send_id: bytes, message: list[bytes]):
+    def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
         ri: RankInfo = RankInfo.from_bytes(message[1])
 
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
@@ -631,7 +637,7 @@ class Sender(SenderBase):
         )
 
     @nvtx_range("_respond_with_kv")
-    def _respond_with_kv(self, send_id: bytes, message: list[bytes]):
+    def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # A session's KV send may race with incoming req_infos from multiple gen ranks.
         # _sessions_lock guards against session insertion between _save_peer_req_info and
         # _get_session; session.lock serializes _enqueue calls from both paths.
@@ -707,6 +713,12 @@ class Sender(SenderBase):
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
         self._loaded_remote_agents.clear()
+        for dealer in self._dealers.values():
+            try:
+                dealer.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
+        self._dealers.clear()
         self._messenger.stop()
 
     def __del__(self):
@@ -718,7 +730,7 @@ class Sender(SenderBase):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
 
@@ -802,7 +814,7 @@ class TxSession(TxSessionBase):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, _exc_type, _exc, _tb):
         self.close()
 
     def __del__(self):
@@ -876,6 +888,12 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
+        for dealer in self._dealers.values():
+            try:
+                dealer.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
+        self._dealers.clear()
         self._messenger.stop()
 
     def clear_session(self, unique_rid: int):
@@ -899,6 +917,10 @@ class Receiver(ReceiverBase):
 
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
+        assert task._params.ctx_request_id is not None, (
+            f"ctx_request_id is None for task unique_rid={task._unique_rid}"
+        )
+        assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
@@ -957,10 +979,12 @@ class Receiver(ReceiverBase):
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
-            messenger.send([MessageType.REQUEST_INSTANCE_INFO])
-            message = messenger.receive()
-            sender_info = RankInfo.from_bytes(message[0])
-            messenger.stop()
+            try:
+                messenger.send([MessageType.REQUEST_INSTANCE_INFO])
+                message = messenger.receive()
+                sender_info = RankInfo.from_bytes(message[0])
+            finally:
+                messenger.stop()
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
@@ -981,16 +1005,22 @@ class Receiver(ReceiverBase):
                 case MessageType.TERMINATION:
                     return False
                 case MessageType.KV_AGENT_RESULT:
-                    self._process_kv_agent_result(send_id, msg)
+                    try:
+                        self._process_kv_agent_result(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"Receiver: error handling KV_AGENT_RESULT: {e}")
                 case MessageType.AUX_AGENT_RESULT:
-                    self._process_aux_agent_result(send_id, msg)
+                    try:
+                        self._process_aux_agent_result(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"Receiver: error handling AUX_AGENT_RESULT: {e}")
                 case _:
-                    raise ValueError(f"Receiver received unknown message type: {msg[0]}")
+                    logger.error(f"Receiver received unknown message type: {msg[0]}")
             return True
 
         self._messenger.start_listener(handle_message)
 
-    def _process_kv_agent_result(self, send_id: bytes, message: list[bytes]):
+    def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
         msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
             message
         )
@@ -1012,8 +1042,8 @@ class Receiver(ReceiverBase):
             peer_rank, slice_id, is_last_slice_str == "True", AgentResult(status)
         )
 
-    def _process_aux_agent_result(self, send_id: bytes, message: list[bytes]):
-        msg_type, peer_rank, unique_rid, status = decode_message(message)
+    def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
+        _msg_type, peer_rank, unique_rid, status = decode_message(message)
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         session = self._get_session(unique_rid)
@@ -1040,7 +1070,7 @@ class Receiver(ReceiverBase):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
 
@@ -1128,7 +1158,7 @@ class RxSession(RxSessionBase):
                 f"Session {self.request_id} received unknown task status: {status.value}"
             )
 
-    def process_aux_agent_result(self, peer_rank: int, status: AgentResult):
+    def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
         task = self._kv_tasks[0]  # TODO: index by slice_id when multi-slice is supported
         if status == AgentResult.SUCCESS:
             self._aux_count += 1
@@ -1165,7 +1195,7 @@ class RxSession(RxSessionBase):
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, _exc_type, _exc, _tb):
         self.close()
 
     def __del__(self):
@@ -1178,13 +1208,13 @@ class RxSession(RxSessionBase):
 class RankInfoServer:
     def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
         self._rank_info = rank_info
+        self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
         else:
             endpoint = f"tcp://{addr}:{port}"
         self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint)
         self._start_listener()
-        self._shutdown = False
 
     @property
     def endpoint(self) -> str:
@@ -1205,16 +1235,17 @@ class RankInfoServer:
                 case MessageType.TERMINATION:
                     return False
                 case MessageType.REQUEST_INSTANCE_INFO:
-                    self._handle_rank_info_request(send_id, msg)
+                    try:
+                        self._handle_rank_info_request(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"RankInfoServer: error handling REQUEST_INSTANCE_INFO: {e}")
                 case _:
-                    raise ValueError(
-                        f"Instance info server received unknown message type: {msg[0]}"
-                    )
+                    logger.error(f"Instance info server received unknown message type: {msg[0]}")
             return True
 
         self._messenger.start_listener(handle_message)
 
-    def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+    def _handle_rank_info_request(self, send_id: bytes, _message: list[bytes]):
         self._messenger.send([send_id, self._rank_info.to_bytes()])
 
     def __del__(self):
@@ -1226,7 +1257,7 @@ class RankInfoServer:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
 
@@ -1461,17 +1492,28 @@ class TransferWorker:
         return request
 
     def shutdown(self):
-        if self._rank_info_server is not None:
-            self._rank_info_server.shutdown()
-        if self._sender is not None:
-            self._sender.shutdown()
-        if self._receiver is not None:
-            self._receiver.shutdown()
+        if getattr(self, "_shutdown", False):
+            return
+        self._shutdown = True
+        # Use getattr guards: __init__ may have failed partway, leaving some
+        # attributes unset.  Without them, __del__ -> shutdown() raises
+        # AttributeError and ZMQ resources from already-created sub-objects
+        # are never cleaned up.
+        rank_info_server = getattr(self, "_rank_info_server", None)
+        if rank_info_server is not None:
+            rank_info_server.shutdown()
+        sender = getattr(self, "_sender", None)
+        if sender is not None:
+            sender.shutdown()
+        receiver = getattr(self, "_receiver", None)
+        if receiver is not None:
+            receiver.shutdown()
         # Deregister NIXL memory before shutting down components, so that
         # pinned GPU memory is released and can be re-allocated (e.g. when
         # the KV cache manager is recreated after profiling).
-        if self._finalizer is not None:
-            self._finalizer()
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            finalizer()
 
     def __del__(self):
         try:
@@ -1482,5 +1524,5 @@ class TransferWorker:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
