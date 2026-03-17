@@ -1,25 +1,33 @@
-from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
+from enum import IntEnum
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.attention_backend.sparse.dsa import rotate_activation
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm.quantization.utils import fp8_utils
 
-from .kernel import compressed_kv_scatter_cutile, kv_compress_cutile, kv_compress_prefill_cutile
+from .kernel import kv_compress_cutile, kv_compress_prefill_cutile
 
 if TYPE_CHECKING:
     from .mewtwo import MewtwoTrtllmAttentionMetadata
 
-# KV cache dtype options:
-#   "default"      - bf16/fp16, no quantization
-#   "fp8_pertensor" - FP8 with single per-tensor scale (stored separately)
-#   "fp8_blockwise" - FP8 with per-128-element blockwise scales (interleaved in cache)
-KVCacheDtype = Literal["default", "fp8_pertensor", "fp8_blockwise"]
+
+class KVCacheDtype(IntEnum):
+    """KV cache quantization mode (values match C++ cache_mode parameter)."""
+
+    DEFAULT = 0  # bf16/fp16, no quantization
+    FP8_PERTENSOR = 1  # FP8 with single per-tensor scale
+    FP8_BLOCKWISE = 2  # FP8 with per-128-element blockwise scales
+
+
+_KV_CACHE_DTYPE_MAP = {
+    "default": KVCacheDtype.DEFAULT,
+    "fp8_pertensor": KVCacheDtype.FP8_PERTENSOR,
+    "fp8_blockwise": KVCacheDtype.FP8_BLOCKWISE,
+}
 
 
 class Compressor(nn.Module):
@@ -33,7 +41,8 @@ class Compressor(nn.Module):
         skip_create_weights_in_init: Whether to skip weight initialization
         pos_embd_params: Positional embedding parameters for RoPE
         dtype: Data type for computation
-        kv_cache_dtype: Cache quantization mode ("default", "fp8_pertensor", "fp8_blockwise")
+        kv_cache_dtype: Cache quantization mode (KVCacheDtype enum or string)
+        rotate_activation: Whether to apply Hadamard transform in postprocessing (False to skip)
     """
 
     def __init__(
@@ -45,8 +54,9 @@ class Compressor(nn.Module):
         skip_create_weights_in_init: bool,
         pos_embd_params: PositionalEmbeddingParams,
         dtype: Optional[torch.dtype] = torch.bfloat16,
-        kv_cache_dtype: KVCacheDtype = "default",
+        kv_cache_dtype: Union[str, KVCacheDtype] = KVCacheDtype.DEFAULT,
         is_indexer: bool = False,
+        rotate_activation: bool = True,
     ):
         super().__init__()
         # Dimensions
@@ -62,8 +72,11 @@ class Compressor(nn.Module):
 
         # Cache config
         self.layer_idx = layer_idx
-        self.kv_cache_dtype = kv_cache_dtype
+        if isinstance(kv_cache_dtype, str):
+            kv_cache_dtype = _KV_CACHE_DTYPE_MAP[kv_cache_dtype]
+        self.kv_cache_dtype: KVCacheDtype = kv_cache_dtype
         self.is_indexer = is_indexer
+        self.rotate_activation = rotate_activation
 
         # Modules
         self.wkv_gate = Linear(
@@ -89,7 +102,7 @@ class Compressor(nn.Module):
         self,
         x: torch.Tensor,
         metadata: "MewtwoTrtllmAttentionMetadata",
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], None]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Forward pass for paged KV compression.
 
         Args:
@@ -97,9 +110,10 @@ class Compressor(nn.Module):
             metadata: Attention metadata with cache info
 
         Returns:
-            - "default" mode: kv_comp tensor [total_compressed, head_dim]
-            - "fp8_blockwise" mode: (kv_fp8, kv_scale) tuple
-            - "fp8_pertensor" mode: (kv_fp8, scale) tuple
+            (kv_data, scale) tuple:
+            - default / fp8_pertensor: (kv_comp, None)
+            - fp8_blockwise indexer:   (fp8_output, scale_output)
+            - no compressed tokens:    (None, None)
         """
         # Import at runtime to avoid circular dependency
         from .mewtwo import MewtwoAttentionType
@@ -142,7 +156,7 @@ class Compressor(nn.Module):
         total_num_comp_tokens = metadata.num_total_compressed_tokens[self.compress_ratio]
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_num_comp_tokens = metadata.max_num_compressed_tokens[self.compress_ratio]
-        max_ctx_comp_kv_lens, _, max_comp_kv_lens = max_num_comp_tokens
+        max_ctx_comp_kv_lens, _, _ = max_num_comp_tokens
 
         # Project input to KV and score
         kv_score = self.wkv_gate(x.float())
@@ -194,165 +208,46 @@ class Compressor(nn.Module):
                 next_n=metadata.num_gen_tokens_per_seq,
             )
 
-        # If there are no compressed tokens, there should be no generation requests.
-        # Directly return the compressed tokens.
-        if total_num_comp_tokens == 0:
-            if self.kv_cache_dtype == "fp8_blockwise":
-                return None, None
-            else:
-                return kv_comp
-
-        # Scatter to cache with appropriate quantization
+        # Scatter to cache with appropriate quantization (all modes fused)
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
+        total_tokens = kv_comp.shape[0]
 
-        if self.kv_cache_dtype == "fp8_blockwise":
-            # FP8 modes still use the unfused pipeline
-            kv_comp = self._postprocess(kv_comp, metadata)
-            return self._scatter_fp8_blockwise(
-                kv_comp,
-                num_comp_tokens,
-                cu_new_comp_kv,
-                start_pos,
-                kv_cache,
-                block_table,
-                compress_tokens_per_block,
-                max_comp_kv_lens,
+        # Allocate FP8 output buffers for blockwise indexer; other modes ignore them
+        fp8_output = None
+        scale_output = None
+        if self.kv_cache_dtype == KVCacheDtype.FP8_BLOCKWISE and self.is_indexer:
+            num_scale_blocks = self.head_dim // 128
+            fp8_output = torch.empty(
+                total_tokens, self.head_dim, dtype=torch.uint8, device=kv_comp.device
             )
-        elif self.kv_cache_dtype == "fp8_pertensor":
-            kv_comp = self._postprocess(kv_comp, metadata)
-            return self._scatter_fp8_pertensor(
-                kv_comp,
-                num_comp_tokens,
-                cu_new_comp_kv,
-                start_pos,
-                kv_cache,
-                block_table,
-                compress_tokens_per_block,
-                max_comp_kv_lens,
+            scale_output = torch.empty(
+                total_tokens, num_scale_blocks, dtype=torch.float32, device=kv_comp.device
             )
-        else:
-            total_tokens = kv_comp.shape[0]
-            if total_tokens > 0 and max_comp_kv_lens > 0:
-                position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
-                torch.ops.trtllm.compressor_fused_postprocess_scatter(
-                    kv_comp,
-                    self.norm.weight,
-                    self.norm.variance_epsilon,
-                    self.rotary_emb.rotary_cos_sin.float().contiguous(),
-                    position_ids.to(torch.int32).contiguous(),
-                    self.nope_head_dim,
-                    self.rope_head_dim,
-                    kv_cache,
-                    num_comp_tokens,
-                    cu_new_comp_kv,
-                    start_pos,
-                    block_table,
-                    compress_tokens_per_block,
-                    self.head_dim,
-                    total_tokens,
-                )
-            return kv_comp
 
-    def _postprocess(self, kv_comp: torch.Tensor, metadata) -> torch.Tensor:
-        """Apply RMSNorm, RoPE, and Hadamard transform to compressed tokens."""
-        kv_comp = self.norm(kv_comp)
-        position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][: kv_comp.shape[0]]
-        torch.ops.trtllm.mla_rope_inplace(
-            kv_comp.unsqueeze(1),
-            position_ids.view(-1),
+        position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
+
+        # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
+        torch.ops.trtllm.compressor_postprocess_scatter(
+            kv_comp,
+            None,
+            self.norm.weight,
+            self.norm.variance_epsilon,
             self.rotary_emb.rotary_cos_sin,
-            1,
+            position_ids,
             self.nope_head_dim,
             self.rope_head_dim,
-            False,
-            self.rotary_emb.is_neox,
-        )
-        kv_comp = rotate_activation(kv_comp)
-        return kv_comp
-
-    def _scatter_fp8_blockwise(
-        self,
-        kv_comp: torch.Tensor,
-        num_comp_tokens: torch.Tensor,
-        cu_new_comp_kv: torch.Tensor,
-        start_pos: torch.Tensor,
-        kv_cache: torch.Tensor,
-        block_offsets: torch.Tensor,
-        tokens_per_block: int,
-        max_outputs: int,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Quantize to blockwise FP8 and scatter to cache.
-
-        Returns:
-            (kv_fp8, kv_scale) tuple, or None if empty
-        """
-        num_tokens = kv_comp.shape[0]
-        if num_tokens == 0:
-            return None
-
-        # Quantize with per-128-element scales
-        kv_fp8, kv_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(kv_comp, use_ue8m0=False)
-
-        # kv_fp8: [num_tokens, head_dim] in float8_e4m3fn - pass directly
-        # kv_scale: [num_tokens, num_scale_blocks] in float32 - pass directly
-
-        compressed_kv_scatter_cutile(
-            kv_fp8.contiguous().view(num_tokens, self.head_dim),
+            kv_cache,
             num_comp_tokens,
             cu_new_comp_kv,
             start_pos,
-            kv_cache,
-            block_offsets,
-            tokens_per_block,
-            self.head_dim,
-            max_outputs=max_outputs,
-            kv_cache_dtype="fp8_blockwise",
-            kv_scale=kv_scale,
+            block_table,
+            compress_tokens_per_block,
+            int(self.kv_cache_dtype),
+            self.rotate_activation,
+            fp8_output,
+            scale_output,
         )
-        return kv_fp8, kv_scale
 
-    def _scatter_fp8_pertensor(
-        self,
-        kv_comp: torch.Tensor,
-        num_comp_tokens: torch.Tensor,
-        cu_new_comp_kv: torch.Tensor,
-        start_pos: torch.Tensor,
-        kv_cache: torch.Tensor,
-        block_offsets: torch.Tensor,
-        tokens_per_block: int,
-        max_outputs: int,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Quantize to per-tensor FP8 and scatter to cache.
-
-        Uses static scale = 1.0
-        kv_scale_quant_orig: dequantization scale = 1.0
-        kv_scale_orig_quant: quantization scale = 1.0
-
-        Returns:
-            (kv_fp8, kv_scale_quant_orig) tuple, or None if empty
-        """
-        num_tokens = kv_comp.shape[0]
-        if num_tokens == 0:
-            return None
-
-        # Static scale = 1.0 (no scaling, following trtllm.py convention)
-        # kv_scale_quant_orig = dequant scale = 1.0
-        # kv_scale_orig_quant = quant scale = 1.0
-        kv_scale_quant_orig = torch.ones(1, dtype=torch.float32, device=kv_comp.device)
-
-        # Quantize with scale = 1.0 (direct cast to FP8)
-        kv_fp8 = kv_comp.to(torch.float8_e4m3fn)
-
-        compressed_kv_scatter_cutile(
-            kv_fp8.view(torch.uint8),
-            num_comp_tokens,
-            cu_new_comp_kv,
-            start_pos,
-            kv_cache,
-            block_offsets,
-            tokens_per_block,
-            self.head_dim,
-            max_outputs=max_outputs,
-            kv_cache_dtype="fp8_pertensor",
-        )
-        return kv_fp8, kv_scale_quant_orig
+        if fp8_output is not None:
+            return fp8_output.view(torch.float8_e4m3fn), scale_output
+        return kv_comp, None

@@ -1039,15 +1039,16 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
 
 
 # ============================================================================
-# Fused PostProcess + Scatter Test
+# Postprocess + Scatter Kernel Tests
 # ============================================================================
 
 try:
-    _HAS_FUSED_SCATTER = hasattr(torch.ops.trtllm, "compressor_fused_postprocess_scatter")
+    _HAS_POSTPROCESS_SCATTER = hasattr(torch.ops.trtllm, "compressor_postprocess_scatter")
 except Exception:
-    _HAS_FUSED_SCATTER = False
+    _HAS_POSTPROCESS_SCATTER = False
 
 
+@pytest.mark.parametrize("rotate_activation", [True, False], ids=["rotate", "no_rotate"])
 @pytest.mark.parametrize(
     "batch_size,num_tokens,head_dim,nope_dim,rope_dim,tokens_per_block",
     [
@@ -1059,14 +1060,16 @@ except Exception:
         pytest.param(4, 32, 512, 256, 256, 128, id="b4_t32_hd512"),
     ],
 )
-@pytest.mark.skipif(not _HAS_FUSED_SCATTER, reason="Fused CUDA scatter not available")
+@pytest.mark.skipif(
+    not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
+)
 def test_fused_postprocess_scatter(
-    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
+    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block, rotate_activation
 ):
-    """Compare fused RMSNorm+RoPE+Hadamard+Scatter vs sequential unfused path.
+    """Compare fused RMSNorm+RoPE+(optional Hadamard)+Scatter vs sequential unfused path.
 
     Ensures the fused CUDA kernel produces identical paged KV cache output as
-    the reference pipeline: RMSNorm -> RoPE -> Hadamard -> Scatter.
+    the reference pipeline: RMSNorm -> RoPE -> (Hadamard) -> Scatter.
     """
     torch.manual_seed(42)
     device = "cuda"
@@ -1085,7 +1088,9 @@ def test_fused_postprocess_scatter(
     max_comp_len = tokens_per_batch + 4
     max_blocks = (max_comp_len + tokens_per_block - 1) // tokens_per_block
     num_blocks = batch_size * max_blocks
-    kv_cache_fused = torch.zeros(num_blocks, tokens_per_block * head_dim, device=device, dtype=torch.bfloat16)
+    kv_cache_fused = torch.zeros(
+        num_blocks, tokens_per_block * head_dim, device=device, dtype=torch.bfloat16
+    )
     kv_cache_ref = torch.zeros_like(kv_cache_fused)
 
     block_offsets = torch.zeros(batch_size, max_blocks, device=device, dtype=torch.int32)
@@ -1099,47 +1104,377 @@ def test_fused_postprocess_scatter(
     max_outputs = num_comp_tokens.max().item()
 
     # --- Reference: unfused pipeline ---
-    try:
-        from fast_hadamard_transform import hadamard_transform
-    except ImportError:
-        pytest.skip("fast_hadamard_transform not installed")
+    x = _build_postprocess_reference(
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        head_dim,
+        rotate_activation,
+    )
 
+    compressed_kv_scatter_cutile(
+        x,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        kv_cache_ref,
+        block_offsets,
+        tokens_per_block,
+        head_dim,
+        max_outputs=max_outputs,
+    )
+
+    # --- Fused postprocess + scatter kernel ---
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        kv_comp,
+        None,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        kv_cache_fused,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        block_offsets,
+        tokens_per_block,
+        0,
+        rotate_activation,
+        None,
+        None,
+    )
+    torch.cuda.synchronize()
+
+    max_diff = (kv_cache_fused.float() - kv_cache_ref.float()).abs().max().item()
+    assert max_diff < 0.05, f"Postprocess+scatter vs ref max diff = {max_diff}"
+
+
+def _build_postprocess_reference(
+    kv_comp,
+    rms_weight,
+    rms_eps,
+    cos_sin_table,
+    position_ids,
+    nope_dim,
+    rope_dim,
+    head_dim,
+    rotate_activation=True,
+):
+    """Reference: RMSNorm -> RoPE -> optional Hadamard on kv_comp.
+
+    Matches the CUDA postprocess kernel: float32 throughout, then truncate
+    to input dtype at the end. Returns bf16 tensor (same as kernel output).
+    """
     x = kv_comp.clone().float()
     var = x.pow(2).mean(-1, keepdim=True)
-    x = (x * torch.rsqrt(var + rms_eps)).to(torch.bfloat16)
-    x = rms_weight * x
+    x = x * torch.rsqrt(var + rms_eps)
+    x = rms_weight.float() * x
     xn = x[:, :nope_dim]
     xp = x[:, nope_dim:]
     half_rope = rope_dim // 2
     cos_v = cos_sin_table[position_ids.long(), 0, :]
     sin_v = cos_sin_table[position_ids.long(), 1, :]
-    # Interleaved even/odd pairs (is_neox=False), matching the fused kernel
     xp = xp.view(-1, half_rope, 2)
     x_even, x_odd = xp[..., 0], xp[..., 1]
-    xp = torch.stack([x_even * cos_v - x_odd * sin_v,
-                       x_odd * cos_v + x_even * sin_v], dim=-1)
+    xp = torch.stack([x_even * cos_v - x_odd * sin_v, x_odd * cos_v + x_even * sin_v], dim=-1)
     xp = xp.view(-1, rope_dim)
     x = torch.cat([xn, xp], dim=-1)
-    x = hadamard_transform(x, scale=head_dim ** -0.5)
+    if rotate_activation:
+        try:
+            from fast_hadamard_transform import hadamard_transform
+        except ImportError:
+            pytest.skip("fast_hadamard_transform not installed")
+        x = hadamard_transform(x, scale=head_dim**-0.5)
+    return x.to(kv_comp.dtype)
 
-    compressed_kv_scatter_cutile(
-        x, num_comp_tokens, cu_kv_comp, start_pos,
-        kv_cache_ref, block_offsets, tokens_per_block, head_dim,
-        max_outputs=max_outputs,
+
+def _setup_fused_test_inputs(
+    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
+):
+    """Common setup for fused postprocess scatter tests."""
+    torch.manual_seed(42)
+    device = "cuda"
+    total_tokens = batch_size * num_tokens
+
+    kv_comp = torch.randn(total_tokens, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+    rms_weight = torch.randn(head_dim, device=device, dtype=torch.bfloat16) * 0.1 + 1.0
+    rms_eps = 1e-5
+    max_pos = total_tokens + 64
+    cos_sin_table = torch.randn(max_pos, 2, rope_dim // 2, device=device, dtype=torch.float32)
+    position_ids = torch.arange(total_tokens, device=device, dtype=torch.int32)
+
+    max_comp_len = num_tokens + 4
+    max_blocks = (max_comp_len + tokens_per_block - 1) // tokens_per_block
+    num_blocks = batch_size * max_blocks
+
+    block_offsets = torch.zeros(batch_size, max_blocks, device=device, dtype=torch.int32)
+    for b in range(batch_size):
+        block_offsets[b] = torch.arange(b * max_blocks, (b + 1) * max_blocks, dtype=torch.int32)
+
+    num_comp_tokens = torch.full((batch_size,), num_tokens, device=device, dtype=torch.int32)
+    cu_kv_comp = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+    cu_kv_comp[1:] = num_comp_tokens.cumsum(0)
+    start_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    return (
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        num_blocks,
+        max_blocks,
+        block_offsets,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        total_tokens,
     )
 
-    # --- Fused kernel ---
-    torch.ops.trtllm.compressor_fused_postprocess_scatter(
-        kv_comp, rms_weight, rms_eps,
-        cos_sin_table.float().contiguous(),
-        position_ids.to(torch.int32).contiguous(),
-        nope_dim, rope_dim, kv_cache_fused, num_comp_tokens, cu_kv_comp,
-        start_pos, block_offsets, tokens_per_block, head_dim, total_tokens,
+
+@pytest.mark.parametrize("rotate_activation", [True, False], ids=["rotate", "no_rotate"])
+@pytest.mark.parametrize(
+    "batch_size,num_tokens,head_dim,nope_dim,rope_dim,tokens_per_block",
+    [
+        pytest.param(1, 16, 128, 64, 64, 32, id="b1_t16_hd128"),
+        pytest.param(2, 32, 128, 64, 64, 32, id="b2_t32_hd128"),
+        pytest.param(1, 128, 512, 256, 256, 128, id="b1_t128_hd512"),
+        pytest.param(2, 64, 512, 256, 256, 128, id="b2_t64_hd512"),
+    ],
+)
+@pytest.mark.skipif(
+    not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
+)
+def test_fused_postprocess_scatter_fp8_pertensor(
+    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block, rotate_activation
+):
+    """Test fused RMSNorm+RoPE+(optional Hadamard)+FP8PerTensor scatter vs reference.
+
+    FP8 per-tensor uses scale=1.0 (direct float->fp8_e4m3fn cast).
+    Validates fp8 bytes in cache match reference pipeline.
+    """
+    (
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        num_blocks,
+        max_blocks,
+        block_offsets,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        total_tokens,
+    ) = _setup_fused_test_inputs(
+        batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
+    )
+
+    # FP8 per-tensor: cache_stride_blk_bytes = tpb * hd (1 byte per element)
+    cache_stride_blk_bytes = tokens_per_block * head_dim
+    kv_cache_fused = torch.zeros(
+        num_blocks * cache_stride_blk_bytes, device="cuda", dtype=torch.uint8
+    )
+
+    # Reference: postprocess (returns bf16), then cast to fp8
+    ref = _build_postprocess_reference(
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        head_dim,
+        rotate_activation,
+    )
+    ref_fp8 = ref.float().to(torch.float8_e4m3fn)
+
+    # Fused postprocess + scatter (cache_mode=1 for FP8 per-tensor)
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        kv_comp,
+        None,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        kv_cache_fused,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        block_offsets,
+        tokens_per_block,
+        1,
+        rotate_activation,
+        None,
+        None,
     )
     torch.cuda.synchronize()
 
-    max_diff = (kv_cache_fused.float() - kv_cache_ref.float()).abs().max().item()
-    assert max_diff < 0.05, f"Fused vs ref max diff = {max_diff}"
+    # Read back and compare fp8 bytes
+    for b in range(batch_size):
+        for t in range(num_tokens):
+            blk = t // tokens_per_block
+            off = t % tokens_per_block
+            phys = block_offsets[b, blk].item()
+            base = phys * cache_stride_blk_bytes + off * head_dim
+            fused_bytes = kv_cache_fused[base : base + head_dim]
+            ref_bytes = ref_fp8[b * num_tokens + t].view(torch.uint8)
+            max_diff = (fused_bytes.int() - ref_bytes.int()).abs().max().item()
+            assert max_diff <= 1, (
+                f"FP8 pertensor mismatch at b={b}, t={t}: max byte diff={max_diff}"
+            )
+
+
+@pytest.mark.parametrize("rotate_activation", [True, False], ids=["rotate", "no_rotate"])
+@pytest.mark.parametrize(
+    "batch_size,num_tokens,head_dim,nope_dim,rope_dim,tokens_per_block",
+    [
+        pytest.param(1, 16, 128, 64, 64, 32, id="b1_t16_hd128"),
+        pytest.param(2, 32, 128, 64, 64, 32, id="b2_t32_hd128"),
+        pytest.param(1, 128, 512, 256, 256, 128, id="b1_t128_hd512"),
+        pytest.param(2, 64, 512, 256, 256, 128, id="b2_t64_hd512"),
+    ],
+)
+@pytest.mark.skipif(
+    not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
+)
+def test_fused_postprocess_scatter_fp8_blockwise(
+    batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block, rotate_activation
+):
+    """Test fused RMSNorm+RoPE+(optional Hadamard)+FP8Blockwise scatter vs reference.
+
+    FP8 blockwise uses per-128-element scales. Validates:
+    1. FP8 data in cache matches reference quantization
+    2. Scales in cache are correct
+    3. Optional fp8_output and scale_output buffers are populated
+    """
+    (
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        num_blocks,
+        max_blocks,
+        block_offsets,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        total_tokens,
+    ) = _setup_fused_test_inputs(
+        batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block
+    )
+
+    num_scale_blocks = head_dim // 128
+    cache_stride_blk_bytes = tokens_per_block * head_dim + tokens_per_block * num_scale_blocks * 4
+    kv_cache_fused = torch.zeros(
+        num_blocks * cache_stride_blk_bytes, device="cuda", dtype=torch.uint8
+    )
+
+    # Optional output buffers
+    fp8_output = torch.zeros(total_tokens, head_dim, device="cuda", dtype=torch.uint8)
+    scale_output = torch.zeros(total_tokens, num_scale_blocks, device="cuda", dtype=torch.float32)
+
+    # Reference: postprocess (returns bf16) then blockwise quantize
+    ref = _build_postprocess_reference(
+        kv_comp,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        head_dim,
+        rotate_activation,
+    )
+
+    # Per-128-element quantization reference (from bf16 values)
+    ref_fp8_list = []
+    ref_scale_list = []
+    for token_idx in range(total_tokens):
+        row = ref[token_idx]
+        fp8_row = torch.zeros(head_dim, dtype=torch.uint8, device="cuda")
+        scales = torch.zeros(num_scale_blocks, dtype=torch.float32, device="cuda")
+        for s in range(num_scale_blocks):
+            chunk = row[s * 128 : (s + 1) * 128].float()
+            amax = chunk.abs().max()
+            scale = amax / 448.0
+            inv_scale = (448.0 / amax) if amax > 0 else 1.0
+            quantized = (chunk * inv_scale).to(torch.float8_e4m3fn)
+            fp8_row[s * 128 : (s + 1) * 128] = quantized.view(torch.uint8)
+            scales[s] = scale
+        ref_fp8_list.append(fp8_row)
+        ref_scale_list.append(scales)
+    ref_fp8_all = torch.stack(ref_fp8_list)
+    ref_scale_all = torch.stack(ref_scale_list)
+
+    # Fused postprocess + scatter (cache_mode=2 for FP8 blockwise)
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        kv_comp,
+        None,
+        rms_weight,
+        rms_eps,
+        cos_sin_table,
+        position_ids,
+        nope_dim,
+        rope_dim,
+        kv_cache_fused,
+        num_comp_tokens,
+        cu_kv_comp,
+        start_pos,
+        block_offsets,
+        tokens_per_block,
+        2,
+        rotate_activation,
+        fp8_output,
+        scale_output,
+    )
+    torch.cuda.synchronize()
+
+    # Validate optional output buffers
+    max_byte_diff = (fp8_output.int() - ref_fp8_all.int()).abs().max().item()
+    assert max_byte_diff <= 1, f"fp8_output buffer max byte diff = {max_byte_diff}"
+
+    max_scale_diff = (scale_output - ref_scale_all).abs().max().item()
+    assert max_scale_diff < 5e-3, f"scale_output buffer max scale diff = {max_scale_diff}"
+
+    # Validate cache contents
+    for b in range(batch_size):
+        for t in range(num_tokens):
+            blk = t // tokens_per_block
+            off = t % tokens_per_block
+            phys = block_offsets[b, blk].item()
+            block_base = phys * cache_stride_blk_bytes
+
+            # Check FP8 data
+            fp8_base = block_base + off * head_dim
+            fused_bytes = kv_cache_fused[fp8_base : fp8_base + head_dim]
+            ref_bytes = ref_fp8_all[b * num_tokens + t]
+            byte_diff = (fused_bytes.int() - ref_bytes.int()).abs().max().item()
+            assert byte_diff <= 1, (
+                f"FP8 blockwise data mismatch at b={b}, t={t}: max byte diff={byte_diff}"
+            )
+
+            # Check scales
+            scale_base = block_base + tokens_per_block * head_dim
+            for s in range(num_scale_blocks):
+                scale_off = scale_base + (off * num_scale_blocks + s) * 4
+                fused_scale_bytes = kv_cache_fused[scale_off : scale_off + 4]
+                fused_scale = fused_scale_bytes.view(torch.float32).item()
+                ref_scale = ref_scale_all[b * num_tokens + t, s].item()
+                assert abs(fused_scale - ref_scale) < 5e-3, (
+                    f"Scale mismatch at b={b}, t={t}, s={s}: "
+                    f"fused={fused_scale:.6f} ref={ref_scale:.6f}"
+                )
 
 
 # ============================================================================

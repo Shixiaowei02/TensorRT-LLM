@@ -19,5 +19,7 @@ set(SRC_CU compressorKernels.cu)
 
 add_library(compressorKernels_src OBJECT ${SRC_CU})
 set_property(TARGET compressorKernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET compressorKernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_compile_options(compressorKernels_src PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+set_property(TARGET compressorKernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                   ON)
+target_compile_options(compressorKernels_src
+                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)

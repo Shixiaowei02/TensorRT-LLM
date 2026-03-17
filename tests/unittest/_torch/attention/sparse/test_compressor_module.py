@@ -75,6 +75,7 @@ class DummyAttentionMetadata:
         self.max_num_compressed_tokens = max_num_compressed_tokens
         self.num_gen_tokens_per_seq = 0  # Set by caller
         self.kv_lens_cuda_runtime = None  # Set by caller
+        self.cached_token_lens_cuda = None  # Set by caller
 
 
 # ============================================================================
@@ -632,6 +633,7 @@ class CompressorWrapper:
             dtype=DTYPE,
             kv_cache_dtype=kv_cache_dtype,
             is_indexer=is_indexer,
+            rotate_activation=rotate,
         ).to(DEVICE)
 
         # Create MewtwoCacheManager
@@ -1069,6 +1071,7 @@ class CompressorWrapper:
         )
         # kv_lens_cuda_runtime: [num_seqs] total KV length per sequence (past + current)
         metadata.kv_lens_cuda_runtime = kv_lens
+        metadata.cached_token_lens_cuda = past_kv_lens
         metadata.num_gen_tokens_per_seq = (
             num_gen_tokens // num_generations if num_generations > 0 else 0
         )
@@ -1089,20 +1092,53 @@ class CompressorWrapper:
             req.add_new_token(token_count, 0)
         self.cache_manager.update_resources(scheduled_batch)
 
-        # For FP8 modes, return tuple directly (kv_fp8, kv_scale)
+        # Compressor.forward() returns (kv_comp, scale) tuple.
+        # For FP8 blockwise (indexer), scale is non-None → return directly.
         if isinstance(result, tuple):
-            return result
-
-        # For default mode, reshape output to [bsz, num_compressed, head_dim]
-        kv_comp = result
+            kv_comp, scale = result
+            if scale is not None:
+                return kv_comp, scale
+        else:
+            kv_comp = result
         total_outputs = cu_new_comp_kv[-1].item()
         if total_outputs == 0:
             return None
 
         # Fused scatter writes postprocessed data to kv_cache but returns raw
-        # kv_comp. Apply postprocessing here for test comparison with reference.
-        if self.kv_cache_dtype == "default" and kv_comp is not None:
-            kv_comp = self.compressor._postprocess(kv_comp, metadata)
+        # kv_comp. Apply postprocessing inline for test comparison with reference.
+        if kv_comp is not None and self.kv_cache_dtype == "fp8_pertensor":
+            # Read FP8 data directly from cache (written by fused kernel) to
+            # ensure golden cache comparison matches exactly.
+            all_fp8 = []
+            for b in range(bsz):
+                n = cu_new_comp_kv[b + 1].item() - cu_new_comp_kv[b].item()
+                if n > 0:
+                    tokens = read_paged_cache_tokens(
+                        self.kv_cache, self.block_offsets, b, n, self.tokens_per_block
+                    )
+                    all_fp8.append(tokens)
+            if all_fp8:
+                kv_fp8 = torch.cat(all_fp8, dim=0).view(torch.float8_e4m3fn)
+                kv_scale = torch.ones(1, dtype=torch.float32, device=kv_comp.device)
+                return kv_fp8, kv_scale
+            return None
+        elif kv_comp is not None and self.kv_cache_dtype == "default":
+            kv_proc = self.compressor.norm(kv_comp.clone())
+            pos_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][: kv_proc.shape[0]]
+            torch.ops.trtllm.mla_rope_inplace(
+                kv_proc.unsqueeze(1),
+                pos_ids.view(-1),
+                self.compressor.rotary_emb.rotary_cos_sin,
+                1,
+                self.compressor.nope_head_dim,
+                self.compressor.rope_head_dim,
+                False,
+                self.compressor.rotary_emb.is_neox,
+            )
+            if self.compressor.rotate_activation:
+                kv_comp = rotate_activation(kv_proc)
+            else:
+                kv_comp = kv_proc
 
         # Split packed output back to per-batch
         outputs = []
@@ -1613,9 +1649,7 @@ def test_fused_decode(prefill, steps, batch, ratio):
                     cached_comp = read_paged_cache_tokens(
                         comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
                     ).unsqueeze(0)
-                    assert_similar(
-                        cached_ref, cached_comp, f"Fused decode cache[{b}] step{step}"
-                    )
+                    assert_similar(cached_ref, cached_comp, f"Fused decode cache[{b}] step{step}")
 
 
 def test_fused_mixed_batch():
@@ -1666,6 +1700,156 @@ def test_fused_mixed_batch():
             comp.kv_cache, comp.block_offsets, 0, num_ctx_comp, comp.tokens_per_block
         ).unsqueeze(0)
         assert_similar(cached_ref, cached_comp, "Fused mixed ctx cache")
+
+
+# ============================================================================
+# Tests with rotate_activation=False (no Hadamard transform)
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "batch,seqlen,ratio",
+    [
+        (1, 128, 4),
+        (2, 130, 4),
+        (4, 128, 4),
+        (1, 256, 128),
+        (2, 512, 128),
+    ],
+)
+def test_prefill_no_rotate(batch, seqlen, ratio):
+    """Test prefill mode with rotate_activation=False (Hadamard skipped)."""
+    ref, comp = setup_compressors(ratio, rotate=False)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)[:seqlen]
+    x = torch.randn(batch, seqlen, DIM, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        out_ref = ref(x, 0, freqs)
+        out_comp = comp.forward(x, 0, freqs)
+
+    assert_similar(out_ref, out_comp)
+    if out_ref is not None:
+        num_tokens = out_ref.size(1)
+        for b in range(batch):
+            cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+            cached_comp = read_paged_cache_tokens(
+                comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+            ).unsqueeze(0)
+            assert_similar(cached_ref, cached_comp, f"Prefill no-rotate cache[{b}]")
+
+
+@pytest.mark.parametrize(
+    "prefill,steps,batch,ratio",
+    [
+        (128, 8, 1, 4),
+        (128, 8, 2, 4),
+        (128, 24, 1, 4),
+        (128, 4, 1, 128),
+    ],
+)
+def test_decode_no_rotate(prefill, steps, batch, ratio):
+    """Test prefill + decode with rotate_activation=False."""
+    ref, comp = setup_compressors(ratio, rotate=False)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)
+
+    x = torch.randn(batch, prefill, DIM, device=DEVICE, dtype=DTYPE)
+    with torch.no_grad():
+        assert_similar(
+            ref(x, 0, freqs[:prefill]), comp.forward(x, 0, freqs[:prefill]), "Prefill no-rotate"
+        )
+
+    for step in range(steps):
+        pos = prefill + step
+        x = torch.randn(batch, 1, DIM, device=DEVICE, dtype=DTYPE)
+        with torch.no_grad():
+            out_ref = ref(x, pos, freqs[pos : pos + 1])
+            out_comp = comp.forward(x, pos, freqs[pos : pos + 1])
+            assert_similar(out_ref, out_comp, f"Decode no-rotate[{step}]")
+            if out_ref is not None:
+                num_tokens = pos // ratio + 1
+                for b in range(batch):
+                    cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+                    cached_comp = read_paged_cache_tokens(
+                        comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+                    ).unsqueeze(0)
+                    assert_similar(
+                        cached_ref, cached_comp, f"Decode no-rotate cache[{b}] step{step}"
+                    )
+
+
+@pytest.mark.parametrize(
+    "batch,seqlen,ratio",
+    [
+        (1, 128, 4),
+        (2, 130, 4),
+        (2, 256, 4),
+        (1, 256, 128),
+        (2, 512, 128),
+    ],
+)
+def test_fused_prefill_no_rotate(batch, seqlen, ratio):
+    """Test fused prefill cache with rotate_activation=False."""
+    ref, comp = setup_compressors(ratio, rotate=False)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)[:seqlen]
+    x = torch.randn(batch, seqlen, DIM, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        out_ref = ref(x, 0, freqs)
+        comp.forward(x, 0, freqs)
+
+    if out_ref is not None:
+        num_tokens = out_ref.size(1)
+        for b in range(batch):
+            cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+            cached_comp = read_paged_cache_tokens(
+                comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+            ).unsqueeze(0)
+            assert_similar(cached_ref, cached_comp, f"Fused prefill no-rotate cache[{b}]")
+
+
+@pytest.mark.parametrize(
+    "prefill,steps,batch,ratio",
+    [
+        (128, 8, 1, 4),
+        (128, 8, 2, 4),
+        (128, 24, 1, 4),
+        (128, 4, 1, 128),
+    ],
+)
+def test_fused_decode_no_rotate(prefill, steps, batch, ratio):
+    """Test fused prefill + decode cache with rotate_activation=False."""
+    ref, comp = setup_compressors(ratio, rotate=False)
+    freqs = precompute_freqs_cis(
+        ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+    ).to(DEVICE)
+
+    x = torch.randn(batch, prefill, DIM, device=DEVICE, dtype=DTYPE)
+    with torch.no_grad():
+        ref(x, 0, freqs[:prefill])
+        comp.forward(x, 0, freqs[:prefill])
+
+    for step in range(steps):
+        pos = prefill + step
+        x = torch.randn(batch, 1, DIM, device=DEVICE, dtype=DTYPE)
+        with torch.no_grad():
+            out_ref = ref(x, pos, freqs[pos : pos + 1])
+            comp.forward(x, pos, freqs[pos : pos + 1])
+            if out_ref is not None:
+                num_tokens = pos // ratio + 1
+                for b in range(batch):
+                    cached_ref = ref.kv_cache[b : b + 1, :num_tokens]
+                    cached_comp = read_paged_cache_tokens(
+                        comp.kv_cache, comp.block_offsets, b, num_tokens, comp.tokens_per_block
+                    ).unsqueeze(0)
+                    assert_similar(
+                        cached_ref, cached_comp, f"Fused decode no-rotate cache[{b}] step{step}"
+                    )
 
 
 if __name__ == "__main__":
