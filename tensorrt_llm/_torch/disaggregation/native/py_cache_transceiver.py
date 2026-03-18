@@ -8,8 +8,7 @@ import torch
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, WaitResult, get_unique_rid
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -71,21 +70,14 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self.device_id} in PyNativeCacheTransceiver")
 
-        # Aux payload carries first-gen and draft tokens in generation-first flow.
-        self.aux_buffer = AuxBuffer(
-            # * 2 to allow back-to-back batches, one in transferring, one in preparing next batch
-            max_slot_num=max(1, int(self.kv_cache_manager.max_batch_size)) * 2,
-            beam_width=max(1, int(getattr(self.kv_cache_manager, "max_beam_width", 1))),
-            max_draft_len=max(0, int(getattr(self.kv_cache_manager, "max_draft_len", 0))),
-            device="cpu",
-        )
-
         self.transfer_worker = TransferWorker(
-            kv_cache_manager=kv_cache_manager,
-            mapping=mapping,
-            device_id=self.device_id,
-            instance_name=instance_name,
-            aux_buffer=self.aux_buffer,
+            TransferWorkerConfig(
+                kv_cache_manager=kv_cache_manager,
+                device_id=self.device_id,
+                instance_name=instance_name,
+                # * 2: allow back-to-back batches, one in transferring, one preparing next batch
+                max_concurrent_sessions=max(1, int(self.kv_cache_manager.max_batch_size)) * 2,
+            )
         )
 
         self.context_info_endpoint = None
@@ -276,7 +268,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif request_id in failed_request_ids:
                 self.send_req_id_to_request[request_id].state = LlmRequestState.DISAGG_TRANS_ERROR
             del self.send_req_id_to_request[request_id]
-            self.transfer_worker.clear_session(self.send_sessions[request_id])
+            self.send_sessions[request_id].close()
             del self.send_sessions[request_id]
 
         return completed_request_ids, failed_request_ids
@@ -360,7 +352,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif request_id in failed_request_ids:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
             del self.recv_req_id_to_request[request_id]
-            self.transfer_worker.clear_session(recv_session)
+            recv_session.close()
             del self.recv_sessions[request_id]
 
         return
