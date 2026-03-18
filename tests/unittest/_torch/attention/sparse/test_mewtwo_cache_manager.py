@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -108,6 +108,7 @@ class TestMewtwoCacheManager:
         compress_ratios: List[int],
         dtype: DataType,
         compressor_dtype: DataType,
+        max_input_len: Optional[int] = None,
     ) -> Tuple[MewtwoCacheManager, MewtwoSparseAttentionConfig]:
         """Helper to create a MewtwoCacheManager for testing."""
 
@@ -119,10 +120,11 @@ class TestMewtwoCacheManager:
         )
 
         # Create KV cache config
-        max_num_tokens = max_seq_len * max_batch_size
+        if max_input_len is None:
+            max_input_len = max_seq_len
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
-            max_tokens=max_num_tokens,
+            max_tokens=max_seq_len * max_batch_size,
             event_buffer_max_size=0,
         )
 
@@ -139,11 +141,12 @@ class TestMewtwoCacheManager:
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
+            max_input_len=max_input_len,
             mapping=mapping,
             dtype=dtype,
             compressor_dtype=compressor_dtype,
             vocab_size=self.vocab_size,
-            max_num_tokens=max_num_tokens,
+            max_num_tokens=max_input_len + max_batch_size,
             sparse_attn_config=sparse_attn_config,
         )
 
@@ -656,6 +659,7 @@ class TestMewtwoCacheManager:
     ):
         max_batch_size = len(prompt_lens)
         max_seq_len = max(prompt_lens) + num_generation_steps + 1
+        max_input_len = sum(prompt_lens)
         # Create cache manager and sparse attention config
         cache_manager, sparse_attn_config = self._create_mewtwo_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -664,6 +668,7 @@ class TestMewtwoCacheManager:
             compress_ratios=compress_ratios,
             dtype=dtype,
             compressor_dtype=compressor_dtype,
+            max_input_len=max_input_len,
         )
 
         # Create requests and their cache values
@@ -701,8 +706,6 @@ class TestMewtwoCacheManager:
             req.context_current_position = prompt_lens[req.py_request_id]
             req.add_new_token(prompt_lens[req.py_request_id], 0)
         cache_manager.update_resources(scheduled_batch)
-
-        # For disagg example: cache transmission happens here
 
         # Read context from cache and verify
         for req in requests:
@@ -845,5 +848,6 @@ class TestMewtwoCacheManager:
 
 if __name__ == "__main__":
     tester = TestMewtwoCacheManager()
-    tester.test_write_read_cache([1, 4, 128], [512, 128, 160], 100, DataType.BF16, DataType.FLOAT)
+    print("=== FP8, prompt_lens=[1024, 2048, 4096], steps=100 ===")
+    tester.test_write_read_cache([1, 4, 128], [1024, 2048, 4096], 100, DataType.FP8, DataType.FLOAT)
     print("Test passed")

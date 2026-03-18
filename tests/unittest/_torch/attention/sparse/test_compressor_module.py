@@ -714,10 +714,9 @@ class CompressorWrapper:
         )
 
         # Create KV cache config
-        max_num_tokens = MAX_SEQ * MAX_BATCH
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
-            max_tokens=max_num_tokens,
+            max_tokens=MAX_SEQ * MAX_BATCH,
             event_buffer_max_size=0,
         )
 
@@ -739,11 +738,12 @@ class CompressorWrapper:
             tokens_per_block=PAGE_SIZE,
             max_seq_len=MAX_SEQ,
             max_batch_size=MAX_BATCH,
+            max_input_len=MAX_SEQ,
             mapping=mapping,
             dtype=cache_dtype,
             compressor_dtype=DataType.FLOAT,  # State caches always use FP32
             vocab_size=self.VOCAB_SIZE,
-            max_num_tokens=max_num_tokens,
+            max_num_tokens=MAX_SEQ + MAX_BATCH,
             sparse_attn_config=sparse_attn_config,
         )
 

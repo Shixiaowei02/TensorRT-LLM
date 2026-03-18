@@ -156,12 +156,11 @@ def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_se
         skip_indexer_for_short_seqs=False,
     )
     batch_size = len(context_lengths)
-    # TODO(yuhangh): Investigate here
-    max_tokens = max_seq_len * batch_size * 4
+    max_input_len = max(context_lengths)
 
     cache_manager = MewtwoCacheManager(
         kv_cache_config=KvCacheConfig(
-            max_tokens=max_tokens,
+            max_tokens=max_seq_len * batch_size,
             enable_block_reuse=False,
             event_buffer_max_size=0,
         ),
@@ -178,11 +177,12 @@ def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_se
         tokens_per_block=scenario.kv_cache_tokens_per_block,
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
+        max_input_len=max_input_len,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=DataType.BF16,
         compressor_dtype=DataType.FLOAT,
         vocab_size=129280,
-        max_num_tokens=max_tokens,
+        max_num_tokens=max_input_len * batch_size + batch_size,
         sparse_attn_config=sparse_config,
     )
     return cache_manager, sparse_config

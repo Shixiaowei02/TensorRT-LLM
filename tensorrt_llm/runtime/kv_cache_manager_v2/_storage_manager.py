@@ -616,6 +616,13 @@ class StorageManager:
         ), "Not enough slots"
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
+        allocator = pool_group._slot_allocator
+        if allocator._num_active_slots == 0 and not persistent_pages:
+            allocator._occupied_mask.resize(new_num_slots)
+            allocator._capacity = new_num_slots
+            allocator._target_capacity = new_num_slots
+            pool_group.resize_pools(new_num_slots)
+            return
         ctrl = self._levels[level].controller
         # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
@@ -626,7 +633,6 @@ class StorageManager:
         num_overflow_persistent = len(overflow_persistent_pages)
         if num_overflow_persistent > new_num_slots:
             raise OutOfPagesError("Not enough slots to hold all persistent pages")
-        allocator = pool_group._slot_allocator
         # prevent allocating slots with id >= new_num_slots
         allocator.prepare_for_shrink(new_num_slots)
         min_num_evicted = 0

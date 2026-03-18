@@ -107,6 +107,7 @@ def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
         dtype=scenario.dtype,
         compressor_dtype=scenario.compressor_dtype,
         vocab_size=scenario.vocab_size,
+        max_input_len=scenario.max_seq_len,
         max_num_tokens=max_tokens,
         sparse_attn_config=sparse_attn_config,
     )

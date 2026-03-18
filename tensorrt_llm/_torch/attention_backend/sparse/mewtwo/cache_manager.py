@@ -19,9 +19,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
+    BatchDesc,
     BufferConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
+    KVCacheDesc,
     LayerId,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -36,22 +38,6 @@ from .mewtwo import (
     is_overlap_compressor,
     is_sparse_layer,
 )
-
-
-def _get_adjust_len(
-    max_input_len: int,
-    max_seq_len: int,
-    max_num_context: int,
-    num_generation: int,
-) -> Tuple[int, int]:
-    total_requests = max_num_context + num_generation
-    assert total_requests > 0, "max_num_context + num_generation must be positive"
-
-    avg_history_length = round(num_generation * max_seq_len / total_requests)
-    avg_capacity = round(
-        (max_num_context * max_input_len + num_generation * max_seq_len) / total_requests
-    )
-    return avg_history_length, avg_capacity
 
 
 def _estimate_bytes_per_token(
@@ -134,6 +120,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         compressor_dtype: DataType = DataType.FLOAT,
         sparse_attn_config: MewtwoSparseAttentionConfig,
         max_input_len: Optional[int] = None,
+        max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> None:
         # Mewtwo specific attributes initialization
@@ -186,6 +173,10 @@ class MewtwoCacheManager(KVCacheManagerV2):
             self.index_head_dim // self.quant_block_size, self._indexer_scale_dtype
         )
 
+        # _build_cache_config() needs them to build constraints
+        self._max_input_len = max_input_len
+        self._max_num_tokens = max_num_tokens
+
         # General initialization
         super().__init__(
             kv_cache_config,
@@ -202,41 +193,6 @@ class MewtwoCacheManager(KVCacheManagerV2):
             **kwargs,
         )
         self.is_vswa = True  # Mewtwo must has VSWA
-
-        # TODO(jiaganc): this is a workaround to call adjust()
-        # Derive max_context_tokens from max_num_tokens:
-        # max_num_tokens = max_context_tokens + max_batch_size * (max_draft_len + 1)
-        max_num_tokens = kwargs.get("max_num_tokens", None)
-        max_context_tokens = (
-            max_num_tokens - max_batch_size * (self._max_draft_len + 1)
-            if max_num_tokens is not None
-            else None
-        )
-        if max_input_len is not None and max_context_tokens is not None and max_context_tokens > 0:
-            assert max_input_len > 0, "max_input_len must be positive"
-            cap = max_batch_size * (max_input_len + self._max_draft_len + 1)
-            if max_context_tokens > cap:
-                logger.warning(
-                    f"max_context_tokens ({max_context_tokens}) exceeds "
-                    f"max_batch_size * max_input_len ({cap}), capping to {cap}"
-                )
-                max_context_tokens = cap
-            max_num_context = max_context_tokens // max_input_len
-            num_generation = max_batch_size - max_num_context
-            avg_history_length, avg_capacity = _get_adjust_len(
-                max_input_len,
-                max_seq_len,
-                max_num_context,
-                num_generation,
-            )
-            self.impl.adjust(avg_history_length, avg_capacity)
-            # Recompute max_seq_len after adjust() since pool ratios changed.
-            max_num_tokens = self.get_num_available_tokens(token_num_upper_bound=max_seq_len)
-            self.max_seq_len = min(max_num_tokens, max_seq_len)
-            logger.info(
-                f"[Mewtwo] after adjust: max_seq_len={self.max_seq_len}, "
-                f"max_num_tokens={max_num_tokens}, original max_seq_len={max_seq_len}"
-            )
 
         # Mewtwo expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
@@ -476,12 +432,48 @@ class MewtwoCacheManager(KVCacheManagerV2):
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
+        # Build constraints and typical_step for better pool ratio.
+        max_batch_size = self.max_batch_size
+        max_seq_len = self.max_seq_len
+        max_input_len = self._max_input_len
+        max_num_tokens = self._max_num_tokens
+        max_draft_len = self._max_draft_len
+
+        # max_batch_size generation requests as typical cases.
+        typical_step = BatchDesc(
+            kv_caches=[
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)
+            ]
+            * max_batch_size,
+        )
+
+        constraints = []
+        # Constraint 1: one context request at max_seq_len, this case is used in warmup stage.
+        # max_draft_len is already included in max_seq_len, so no need to add it again.
+        constraints.append(BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=0)]))
+
+        # Constraint 2: when user given max_input_len and max_num_tokens, we can build constraints for context requests.
+        if max_input_len is not None and max_num_tokens is not None:
+            # There are at most max_batch_size generation requests, and each generation request consumes
+            # (max_draft_len + 1) tokens, so the remaining tokens are for context requests.
+            max_context_tokens = max_num_tokens - max_batch_size * (max_draft_len + 1)
+            if max_context_tokens > 0:
+                max_num_context = min(max_context_tokens // max_input_len, max_batch_size)
+                constraints.append(
+                    BatchDesc(
+                        [KVCacheDesc(capacity=max_input_len + max_draft_len + 1, history_length=0)]
+                        * max_num_context
+                    )
+                )
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             layers=layers,
+            typical_step=typical_step,
+            constraints=constraints,
         )
 
     def _assert_layer_pool_scale(self) -> None:

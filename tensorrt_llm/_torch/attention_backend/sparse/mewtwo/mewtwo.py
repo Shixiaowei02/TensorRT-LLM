@@ -783,8 +783,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             new_comp_kv_lens_bufs[compress_ratio][:batch_size] = new_comp
 
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
-            cu_new_comp[0] = 0
-            cu_new_comp[1 : batch_size + 1] = torch.cumsum(new_comp, dim=0)
+            cu_new_comp[: batch_size + 1] = torch.nn.functional.pad(
+                torch.cumsum(new_comp, dim=0), (1, 0)
+            )
 
     @staticmethod
     def _compute_token_positions(
@@ -799,8 +800,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = seq_lens.device
 
         # cu_seq_lens
-        cu_seq_lens_buf[0] = 0
-        cu_seq_lens_buf[1 : batch_size + 1] = torch.cumsum(seq_lens.to(torch.int), dim=0)
+        cu_seq_lens_buf[: batch_size + 1] = torch.nn.functional.pad(
+            torch.cumsum(seq_lens.to(torch.int), dim=0), (1, 0)
+        )
 
         # req_idx_per_token via searchsorted
         token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
