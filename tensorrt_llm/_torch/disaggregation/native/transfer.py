@@ -174,11 +174,10 @@ class Sender(SenderBase):
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
-        device_id: int,
         agent: BaseTransferAgent,
     ):
         self._registrar = peer_registrar
-        self._device_id = device_id
+        self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         # unique_rid -> instance_rank -> RecvReqInfo
         self._peer_requests: dict = {}
@@ -905,11 +904,9 @@ class Receiver(ReceiverBase):
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
-        device_id: int,
         agent: BaseTransferAgent,
     ):
         self._registrar = peer_registrar
-        self._device_id = device_id
         self._agent = agent
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -1406,7 +1403,7 @@ class TransferWorker:
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
         self._setup_peer_infrastructure(kvm)
-        self._setup_transfer_engine(config.device_id)
+        self._setup_transfer_engine()
 
     def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
         assert self._rank_info is not None
@@ -1447,25 +1444,27 @@ class TransferWorker:
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
-    def _setup_transfer_engine(self, device_id: int):
+    def _setup_transfer_engine(self):
         self._agent = _create_nixl_agent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
         self._registered_mem: list = []
-        self._register_kv_cache(device_id)
+        self._register_kv_cache()
         if self._aux_buffer is not None:
             self._register_aux_buffer()
-        self._sender = Sender(self._peer_registrar, device_id, self._agent)
-        self._receiver = Receiver(self._peer_registrar, device_id, self._agent)
+        self._sender = Sender(self._peer_registrar, self._agent)
+        self._receiver = Receiver(self._peer_registrar, self._agent)
         self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
         self._rank_info.self_endpoint = self._receiver.endpoint
         self._finalizer = weakref.finalize(
             self, _deregister_registered_memory, self._agent, list(self._registered_mem)
         )
 
-    def _register_kv_cache(self, device_id: int):
+    def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
-        memory_descs = get_unique_pool_memory_descs(self._rank_info.page_table, device_id)
+        memory_descs = get_unique_pool_memory_descs(
+            self._rank_info.page_table, self._rank_info.device_id
+        )
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
