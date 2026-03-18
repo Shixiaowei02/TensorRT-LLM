@@ -18,7 +18,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionEmbeddingType,
     RotaryScalingType,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import rotate_activation
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo import MewtwoCacheManager
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoAttentionType
@@ -29,6 +28,33 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+
+
+def _hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-Python Walsh-Hadamard transform (no external dependency).
+
+    Matches the butterfly implementation in the CUDA postProcessScatterKernel.
+    """
+    n = x.shape[-1]
+    assert n & (n - 1) == 0, "Last dim must be a power of 2"
+    y = x.float().clone()
+    stride = 1
+    while stride < n:
+        idx = torch.arange(n, device=x.device)
+        lo_mask = (idx & stride) == 0
+        hi_idx = idx ^ stride
+        a = y[..., lo_mask].clone()
+        b = y[..., hi_idx[lo_mask]].clone()
+        y[..., lo_mask] = a + b
+        y[..., hi_idx[lo_mask]] = a - b
+        stride <<= 1
+    return (y * scale).to(x.dtype)
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard rotation matching the CUDA kernel (no fast_hadamard_transform needed)."""
+    return _hadamard_transform(x, scale=x.size(-1) ** -0.5)
+
 
 # ============================================================================
 # Dummy Metadata for Testing
