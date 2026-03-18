@@ -7,9 +7,9 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, get_unique_rid
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, WaitResult, get_unique_rid
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, TransferWorker
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -119,9 +119,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self.context_info_endpoint: {self.context_info_endpoint}")
         self.send_sessions = {}  # request_id to send_session
-        self.send_futures = {}  # request_id to send Future
         self.recv_sessions = {}  # request_id to recv_session
-        self.recv_futures = {}  # request_id to recv Future
         self.send_req_id_to_request = {}  # request_id to request (for send)
         self.recv_req_id_to_request = {}  # request_id to request (for recv)
         self.wait_req_id_to_request = {}  # request_id to request (for gen-first waiting-scheduler)
@@ -190,9 +188,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             send_session = self.send_sessions[unique_rid]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         kv_slice = self._create_kv_slice(req)
-        self.send_futures[unique_rid] = send_session.send(kv_slice)
+        send_session.send(kv_slice)
         if self._need_aux_transfer(req):
-            self.transfer_worker.pack_aux(send_session, req)
+            send_session.pack_aux(req)
             send_session.send_aux()
 
         req.context_phase_params = ContextPhaseParams(
@@ -216,7 +214,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         recv_session = self.transfer_worker.create_rx_session(req)
         self.recv_sessions[unique_rid] = recv_session
         kv_slice = self._create_kv_slice(req)
-        self.recv_futures[unique_rid] = recv_session.receive(kv_slice)
+        recv_session.receive(kv_slice)
         self.recv_req_id_to_request[unique_rid] = req
 
     def check_context_transfer_status(self, at_least_request_num: int, mark_complete: bool = False):
@@ -229,15 +227,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id, session in self.send_sessions.items():
             req = self.send_req_id_to_request[request_id]
             need_aux = self._need_aux_transfer(req)
-            session_status = session.status
-            if need_aux:
-                if session_status == SessionStatus.FULLY_TRANSFERRED:
-                    local_completed_request_ids.append(request_id)
-                elif session_status == SessionStatus.ERROR:
-                    local_failed_request_ids.append(request_id)
-            elif session_status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED):
+            if session.is_completed(need_aux):
                 local_completed_request_ids.append(request_id)
-            elif session_status == SessionStatus.ERROR:
+            elif session.has_failed():
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
 
@@ -259,32 +251,19 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         completed_request_ids = []
         timeout_request_ids = []
         failed_request_ids = []
+        timeout = self.sender_future_timeout_ms / 1000.0
         for request_id in to_complete_request_ids:
             session = self.send_sessions[request_id]
             req = self.send_req_id_to_request[request_id]
-            try:
-                sync_status = self.send_futures[request_id].result(
-                    timeout=self.sender_future_timeout_ms / 1000.0
-                )
-                if sync_status == AgentResult.SUCCESS:
-                    if self._need_aux_transfer(req) and session.aux_task is not None:
-                        aux_status = session.aux_task.future.result(
-                            timeout=self.sender_future_timeout_ms / 1000.0
-                        )
-                        if aux_status == AgentResult.SUCCESS:
-                            completed_request_ids.append(request_id)
-                        else:
-                            failed_request_ids.append(request_id)
-                    else:
-                        completed_request_ids.append(request_id)
-                else:
-                    failed_request_ids.append(request_id)
-            except TimeoutError:
+            result = session.wait_complete(need_aux=self._need_aux_transfer(req), timeout=timeout)
+            if result == WaitResult.COMPLETED:
+                completed_request_ids.append(request_id)
+            elif result == WaitResult.TIMEOUT:
                 logger.warning(
                     f"TxSession {session.disagg_request_id} timed out waiting for completion"
                 )
                 timeout_request_ids.append(request_id)
-            except Exception:
+            else:
                 logger.warning(f"TxSession {session.disagg_request_id} failed to complete")
                 failed_request_ids.append(request_id)
 
@@ -299,7 +278,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             del self.send_req_id_to_request[request_id]
             self.transfer_worker.clear_session(self.send_sessions[request_id])
             del self.send_sessions[request_id]
-            del self.send_futures[request_id]
 
         return completed_request_ids, failed_request_ids
 
@@ -313,15 +291,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id, session in self.recv_sessions.items():
             req = self.recv_req_id_to_request[request_id]
             need_aux = self._need_aux_transfer(req)
-            session_status = session.status
-            if need_aux:
-                if session_status == SessionStatus.FULLY_TRANSFERRED:
-                    local_completed_request_ids.append(request_id)
-                elif session_status == SessionStatus.ERROR:
-                    local_failed_request_ids.append(request_id)
-            elif session_status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED):
+            if session.is_completed(need_aux):
                 local_completed_request_ids.append(request_id)
-            elif session_status == SessionStatus.ERROR:
+            elif session.has_failed():
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
 
@@ -355,35 +327,21 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         for request_id in to_complete_request_ids:
             recv_session = self.recv_sessions[request_id]
             req = self.recv_req_id_to_request[request_id]
-            need_aux = self._need_aux_transfer(req)
-            try:
-                sync_status = self.recv_futures[request_id].result()
-                if sync_status == AgentResult.SUCCESS:
-                    if need_aux:
-                        # KV future resolved, but the session is not fully done
-                        # until AUX arrives (status == FULLY_TRANSFERRED).
-                        # KV_TRANSFERRED means AUX is still in flight — skip
-                        # this request and re-evaluate on the next poll cycle.
-                        session_status = recv_session.status
-                        if session_status == SessionStatus.FULLY_TRANSFERRED:
-                            completed_request_ids.append(request_id)
-                        elif session_status == SessionStatus.ERROR:
-                            failed_request_ids.append(request_id)
-                        # else: KV_TRANSFERRED or other intermediate — leave
-                        # the session in recv_sessions for the next iteration.
-                    else:
-                        completed_request_ids.append(request_id)
-                else:
-                    failed_request_ids.append(request_id)
-            except Exception:
+            result = recv_session.wait_complete(
+                need_aux=self._need_aux_transfer(req), block_for_aux=block_all
+            )
+            if result == WaitResult.COMPLETED:
+                completed_request_ids.append(request_id)
+            elif result == WaitResult.FAILED:
                 failed_request_ids.append(request_id)
+            # else: None — KV done but aux still in flight; re-poll next cycle
 
         for request_id in completed_request_ids + failed_request_ids:
             recv_session = self.recv_sessions[request_id]
             req = self.recv_req_id_to_request[request_id]
             if request_id in completed_request_ids:
                 if self._need_aux_transfer(req):
-                    self.transfer_worker.unpack_aux(recv_session, req)
+                    recv_session.unpack_aux(req)
                     first_gen_tokens = req.py_first_gen_tokens
                     draft_tokens = req.py_draft_tokens
                     if req.context_phase_params is None:
@@ -404,7 +362,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             del self.recv_req_id_to_request[request_id]
             self.transfer_worker.clear_session(recv_session)
             del self.recv_sessions[request_id]
-            del self.recv_futures[request_id]
 
         return
 

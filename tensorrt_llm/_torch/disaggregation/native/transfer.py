@@ -4,6 +4,7 @@ import concurrent.futures
 import os
 import queue
 import threading
+import time
 import weakref
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionArgsBase,
     SessionStatus,
     TxSessionBase,
+    WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
@@ -736,12 +738,18 @@ class Sender(SenderBase):
 
 class TxSession(TxSessionBase):
     def __init__(
-        self, request_id: int, params: DisaggregatedParams, sender: Sender, aux_slot: Optional[int]
+        self,
+        request_id: int,
+        params: DisaggregatedParams,
+        sender: Sender,
+        aux_slot: Optional[int],
+        aux_buffer: Optional[AuxBuffer] = None,
     ):
         super().__init__(sender, SessionArgsBase(params))
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self.aux_slot = aux_slot
+        self._aux_buffer = aux_buffer
         self.receiver_ready: bool = False
         self.kv_tasks = []
         self.aux_task = None
@@ -786,6 +794,42 @@ class TxSession(TxSessionBase):
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
         return task
+
+    def pack_aux(self, request: LlmRequest) -> None:
+        """Fill the aux buffer slot with token data from the given request."""
+        assert self._aux_buffer is not None, "No aux_buffer set for this session"
+        assert self.aux_slot is not None, "No aux_slot set for this session"
+        self._aux_buffer.fill_slot(self.aux_slot, request)
+
+    def is_completed(self, need_aux: bool) -> bool:
+        """Non-blocking check: has the transfer completed successfully?"""
+        status = self.status
+        if need_aux:
+            return status == SessionStatus.FULLY_TRANSFERRED
+        return status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED)
+
+    def has_failed(self) -> bool:
+        """Non-blocking check: has the transfer failed?"""
+        return self.status == SessionStatus.ERROR
+
+    def wait_complete(self, need_aux: bool, timeout: float) -> WaitResult:
+        """Block until KV (and optionally aux) transfer finishes.
+
+        Returns WaitResult.COMPLETED, WaitResult.FAILED, or WaitResult.TIMEOUT.
+        """
+        try:
+            kv_status = self.kv_tasks[0].future.result(timeout=timeout)
+            if kv_status != AgentResult.SUCCESS:
+                return WaitResult.FAILED
+            if need_aux and self.aux_task is not None:
+                aux_status = self.aux_task.future.result(timeout=timeout)
+                if aux_status != AgentResult.SUCCESS:
+                    return WaitResult.FAILED
+            return WaitResult.COMPLETED
+        except TimeoutError:
+            return WaitResult.TIMEOUT
+        except Exception:
+            return WaitResult.FAILED
 
     def set_exception(self, reason: str = ""):
         msg = f"TxSession {self.disagg_request_id} exception"
@@ -1081,11 +1125,13 @@ class RxSession(RxSessionBase):
         params: DisaggregatedParams,
         receiver: Receiver,
         aux_slot: Optional[int],
+        aux_buffer: Optional[AuxBuffer] = None,
     ):
         super().__init__(receiver, SessionArgsBase(params))
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self.aux_slot = aux_slot
+        self._aux_buffer = aux_buffer
         self._exception: Optional[Exception] = None
         self._closed = False
         self._kv_tasks: list[KVRecvTask] = []
@@ -1182,6 +1228,51 @@ class RxSession(RxSessionBase):
     @property
     def exception(self) -> Optional[Exception]:
         return self._exception
+
+    def unpack_aux(self, request: LlmRequest) -> None:
+        """Read token data from the aux buffer slot into the given request."""
+        assert self._aux_buffer is not None, "No aux_buffer set for this session"
+        assert self.aux_slot is not None, "No aux_slot set for this session"
+        first_gen_tokens, draft_tokens = self._aux_buffer.get_slot_tokens(self.aux_slot)
+        request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
+        request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
+
+    def is_completed(self, need_aux: bool) -> bool:
+        """Non-blocking check: has the transfer completed successfully?"""
+        status = self.status
+        if need_aux:
+            return status == SessionStatus.FULLY_TRANSFERRED
+        return status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED)
+
+    def has_failed(self) -> bool:
+        """Non-blocking check: has the transfer failed?"""
+        return self.status == SessionStatus.ERROR
+
+    def wait_complete(self, need_aux: bool, block_for_aux: bool = False) -> Optional[WaitResult]:
+        """Block until KV transfer is done; optionally wait for aux too.
+
+        With block_for_aux=False (default): returns None if KV is done but aux
+        is still in flight — caller should re-poll next cycle.
+        With block_for_aux=True: spins until aux also arrives (use for block_all).
+        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
+        """
+        try:
+            kv_status = self._kv_tasks[0].future.result()
+            if kv_status != AgentResult.SUCCESS:
+                return WaitResult.FAILED
+            if need_aux:
+                while True:
+                    status = self.status
+                    if status == SessionStatus.FULLY_TRANSFERRED:
+                        return WaitResult.COMPLETED
+                    elif status == SessionStatus.ERROR:
+                        return WaitResult.FAILED
+                    if not block_for_aux:
+                        return None  # KV done, aux still in flight; re-poll next cycle
+                    time.sleep(0.001)
+            return WaitResult.COMPLETED
+        except Exception:
+            return WaitResult.FAILED
 
     def close(self):
         if getattr(self, "_closed", False):
@@ -1352,6 +1443,7 @@ class TransferWorker:
             params=params,
             sender=self._sender,
             aux_slot=aux_slot,
+            aux_buffer=self._aux_buffer,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -1369,6 +1461,7 @@ class TransferWorker:
             params=params,
             receiver=self._receiver,
             aux_slot=aux_slot,
+            aux_buffer=self._aux_buffer,
         )
 
     def clear_session(self, session: TxSession | RxSession):
@@ -1473,23 +1566,6 @@ class TransferWorker:
     def page_table(self):
         assert self._rank_info is not None
         return self._rank_info.page_table
-
-    # pack the aux data to the meta buffer
-
-    def pack_aux(self, tx_session: TxSession, request: LlmRequest):
-        assert self._aux_buffer is not None
-        assert tx_session.aux_slot is not None
-        self._aux_buffer.fill_slot(tx_session.aux_slot, request)
-
-    def unpack_aux(self, rx_session: RxSession, request: LlmRequest):
-        assert self._aux_buffer is not None
-        assert rx_session.aux_slot is not None
-        first_gen_tokens, draft_tokens = self._aux_buffer.get_slot_tokens(rx_session.aux_slot)
-
-        # TODO: not first gen ,but add_tokens?
-        request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
-        request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
-        return request
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):

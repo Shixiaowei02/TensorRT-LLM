@@ -73,6 +73,14 @@ class SessionStatus(Enum):
     ERROR = "ERROR"
 
 
+class WaitResult(Enum):
+    """Result of waiting for a transfer session to complete."""
+
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    TIMEOUT = "TIMEOUT"
+
+
 @dataclass
 class SessionArgsBase:
     """Base arguments for transfer sessions."""

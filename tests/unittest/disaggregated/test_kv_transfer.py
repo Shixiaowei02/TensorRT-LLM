@@ -682,7 +682,7 @@ def add_and_verify_request(
         ]
         send_aux_tasks = []
         for sender_session in sender_sessions:
-            sender_session.pack_aux()
+            sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())
 
     for future in send_slice_futures:
@@ -819,9 +819,9 @@ def add_and_verify_request(
             for tp_rank in range(valid_gen_tp):
                 transfer_worker = valid_gen_transfer_workers[pp_rank * valid_gen_tp + tp_rank]
                 recv_session = receiver_sessions[pp_rank * valid_gen_tp + tp_rank]
-                recv_session.unpack_aux()
+                recv_session.unpack_aux(gen_request)
 
-                assert gen_request.context_phase_params.first_gen_tokens == [8 + ctx_request_id]
+                assert gen_request.py_first_gen_tokens == [8 + ctx_request_id]
                 assert gen_request.py_draft_tokens == [
                     9 + ctx_request_id,
                     10 + ctx_request_id,
