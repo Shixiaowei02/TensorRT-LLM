@@ -6,8 +6,6 @@ Tests cover: prefill/decode corner cases, state updates, varlen, MTP support.
 Run: pytest -s tests/unittest/_torch/attention/sparse/test_compressor_kernel.py
 """
 
-from typing import Tuple
-
 import pytest
 import torch
 import triton
@@ -25,8 +23,8 @@ def prepare_compress_output(
     head_dim: int,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pre-allocate output tensors for compression kernels.
+) -> torch.Tensor:
+    """Pre-allocate output tensor for compression kernels.
 
     Args:
         cu_new_comp_kv: [bsz+1] cumulative output offsets
@@ -37,12 +35,10 @@ def prepare_compress_output(
 
     Returns:
         kv_comp: [total_outputs, head_dim] output buffer
-        compressed_mask: [batch_size] bool mask buffer
     """
     total_outputs = cu_new_comp_kv[-1].item()
     kv_comp = torch.empty(total_outputs, head_dim, device=device, dtype=dtype)
-    compressed_mask = torch.empty(batch_size, device=device, dtype=torch.bool)
-    return kv_comp, compressed_mask
+    return kv_comp
 
 
 # ============================================================================
@@ -336,7 +332,7 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
     )
-    kv_comp, compressed_mask = prepare_compress_output(
+    kv_comp = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
     seq_lens = kv_lens - start_pos
@@ -351,7 +347,6 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
         cu_seq_lens,
         cu_outputs,
         kv_comp,
-        compressed_mask,
         paged_kv,
         paged_score,
         block_table,
@@ -410,7 +405,7 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
     cu_seq_lens, cu_outputs = prepare_decode_metadata(
         batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=1
     )
-    kv_comp, compressed_mask = prepare_compress_output(
+    kv_comp = prepare_compress_output(
         cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
     )
 
@@ -462,7 +457,6 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
             cu_seq_lens,
             cu_outputs,
             kv_comp,
-            compressed_mask,
             paged_kv,
             paged_score,
             block_table,
@@ -476,7 +470,6 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
 
         should_compress = (step + 1) % compress_ratio == 0
         if should_compress:
-            assert compressed_mask.all(), f"Step {step}: expected compression but mask is False"
             if out_py is not None:
                 for b in range(batch_size):
                     out_idx = cu_outputs[b].item()
@@ -487,8 +480,6 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
                         rtol=1e-2,
                         atol=1e-3,
                     ), f"Step {step}, Batch {b}: mismatch diff={(diff).abs().max():.6f}"
-        else:
-            assert not compressed_mask.any(), f"Step {step}: unexpected compression"
 
 
 STATE_UPDATE_CONFIGS = [
@@ -541,7 +532,7 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
     )
-    kv_comp, compressed_mask = prepare_compress_output(
+    kv_comp = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
     seq_lens = kv_lens - start_pos
@@ -556,7 +547,6 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
         cu_seq_lens,
         cu_outputs,
         kv_comp,
-        compressed_mask,
         paged_kv,
         paged_score,
         block_table,
@@ -670,7 +660,7 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
     )
-    kv_comp, compressed_mask = prepare_compress_output(
+    kv_comp = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
     )
     seq_lens = kv_lens - start_pos
@@ -685,7 +675,6 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
         cu_seq_lens,
         cu_outputs,
         kv_comp,
-        compressed_mask,
         paged_kv,
         paged_score,
         block_table,
@@ -793,7 +782,7 @@ def test_prefill_then_decode(
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens_prefill, start_pos_prefill, compress_ratio, head_dim, kv_score_prefill.device
     )
-    kv_comp, compressed_mask = prepare_compress_output(
+    kv_comp = prepare_compress_output(
         cu_outputs, batch_size, head_dim, kv_score_prefill.device, torch.bfloat16
     )
     seq_lens = kv_lens_prefill - start_pos_prefill
@@ -808,7 +797,6 @@ def test_prefill_then_decode(
         cu_seq_lens,
         cu_outputs,
         kv_comp,
-        compressed_mask,
         paged_kv,
         paged_score,
         block_table,
@@ -837,7 +825,7 @@ def test_prefill_then_decode(
     cu_seq_lens_decode, cu_outputs_decode = prepare_decode_metadata(
         batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=1
     )
-    kv_comp_decode, compressed_mask_decode = prepare_compress_output(
+    kv_comp_decode = prepare_compress_output(
         cu_outputs_decode, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
     )
 
@@ -879,7 +867,6 @@ def test_prefill_then_decode(
             cu_seq_lens_decode,
             cu_outputs_decode,
             kv_comp_decode,
-            compressed_mask_decode,
             paged_kv,
             paged_score,
             block_table,
@@ -893,9 +880,6 @@ def test_prefill_then_decode(
 
         should_compress = (token_idx + 1) % compress_ratio == 0
         if should_compress and out_py is not None:
-            assert compressed_mask_decode.all(), (
-                f"Step {i} (token_idx={token_idx}): expected compression"
-            )
             for b in range(batch_size):
                 out_idx = cu_outputs_decode[b].item()
                 diff = out_py[b, 0, :head_dim].to(kv_comp_decode.dtype) - kv_comp_decode[out_idx, :]
@@ -997,7 +981,7 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
         cu_seq_lens, cu_outputs = prepare_decode_metadata(
             batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=actual_n
         )
-        kv_comp, compressed_mask = prepare_compress_output(
+        kv_comp = prepare_compress_output(
             cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
         )
 
@@ -1009,7 +993,6 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
             cu_seq_lens,
             cu_outputs,
             kv_comp,
-            compressed_mask,
             paged_kv,
             paged_score,
             block_table,
@@ -1023,7 +1006,6 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
 
         # Verify outputs match (packed [total_outputs, head_dim] format)
         if len(py_outputs) > 0:
-            assert compressed_mask.all(), f"Step {step}: expected compression"
             for i, (token_idx, out_py) in enumerate(py_outputs):
                 for b in range(batch_size):
                     out_idx = cu_outputs[b].item() + i
@@ -1129,6 +1111,7 @@ def test_fused_postprocess_scatter(
     )
 
     # --- Fused postprocess + scatter kernel ---
+    compressed_mask = torch.ones(total_tokens, dtype=torch.bool, device=device)
     torch.ops.trtllm.compressor_postprocess_scatter(
         kv_comp,
         None,
@@ -1143,6 +1126,7 @@ def test_fused_postprocess_scatter(
         cu_kv_comp,
         start_pos,
         block_offsets,
+        compressed_mask,
         tokens_per_block,
         0,
         rotate_activation,
@@ -1153,6 +1137,112 @@ def test_fused_postprocess_scatter(
 
     max_diff = (kv_cache_fused.float() - kv_cache_ref.float()).abs().max().item()
     assert max_diff < 0.05, f"Postprocess+scatter vs ref max diff = {max_diff}"
+
+
+@pytest.mark.parametrize(
+    "batch_size, tokens_per_batch_list, head_dim, nope_dim, rope_dim, tokens_per_block, mask_pattern",
+    [
+        # Variable token counts + non-contiguous mask: skip batches 1 and 3
+        (4, [8, 4, 6, 2], 128, 64, 64, 4, [True, False, True, False]),
+        # All masked except one
+        (4, [4, 4, 4, 4], 128, 64, 64, 4, [False, False, True, False]),
+        # Alternating mask with head_dim=512
+        (4, [4, 8, 4, 8], 512, 384, 128, 4, [True, False, True, False]),
+        # Single batch masked (edge case)
+        (1, [8], 128, 64, 64, 4, [False]),
+        # All unmasked (baseline sanity)
+        (3, [6, 4, 8], 128, 64, 64, 4, [True, True, True]),
+    ],
+)
+@pytest.mark.skipif(
+    not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
+)
+def test_fused_postprocess_scatter_masked_batches(
+    batch_size, tokens_per_batch_list, head_dim, nope_dim, rope_dim, tokens_per_block, mask_pattern
+):
+    """Verify compressed_mask skips scatter for masked batches with variable token counts.
+
+    Tests:
+    - Masked batches have zero cache
+    - Unmasked batches have correct postprocessed values matching reference
+    - Non-contiguous and all-masked/all-unmasked patterns
+    """
+    torch.manual_seed(42)
+    device = "cuda"
+
+    num_comp_tokens_list = tokens_per_batch_list
+    num_comp_tokens = torch.tensor(num_comp_tokens_list, device=device, dtype=torch.int32)
+    total_tokens = int(num_comp_tokens.sum().item())
+
+    kv_comp = torch.randn(total_tokens, head_dim, device=device, dtype=torch.bfloat16) * 0.1
+    rms_weight = torch.randn(head_dim, device=device, dtype=torch.bfloat16) * 0.1 + 1.0
+    rms_eps = 1e-5
+
+    max_pos = total_tokens + 64
+    cos_sin_table = torch.randn(max_pos, 2, rope_dim // 2, device=device, dtype=torch.float32)
+    position_ids = torch.arange(total_tokens, device=device, dtype=torch.int32)
+
+    max_tokens = max(num_comp_tokens_list)
+    max_comp_len = max_tokens + 4
+    max_blocks = (max_comp_len + tokens_per_block - 1) // tokens_per_block
+    num_blocks = batch_size * max_blocks
+    kv_cache_fused = torch.zeros(
+        num_blocks, tokens_per_block * head_dim, device=device, dtype=torch.bfloat16
+    )
+
+    block_offsets = torch.zeros(batch_size, max_blocks, device=device, dtype=torch.int32)
+    for b in range(batch_size):
+        block_offsets[b] = torch.arange(b * max_blocks, (b + 1) * max_blocks, dtype=torch.int32)
+
+    cu_kv_comp = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
+    cu_kv_comp[1:] = num_comp_tokens.cumsum(0)
+    start_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    # Build per-token compressed_mask from per-batch mask_pattern
+    compressed_mask = torch.zeros(total_tokens, dtype=torch.bool, device=device)
+    for b in range(batch_size):
+        if mask_pattern[b]:
+            start = cu_kv_comp[b].item()
+            end = cu_kv_comp[b + 1].item()
+            compressed_mask[start:end] = True
+
+    # Build reference for unmasked batches
+    ref = _build_postprocess_reference(
+        kv_comp, rms_weight, rms_eps, cos_sin_table, position_ids,
+        nope_dim, rope_dim, head_dim, rotate_activation=True,
+    )
+
+    torch.ops.trtllm.compressor_postprocess_scatter(
+        kv_comp, None, rms_weight, rms_eps,
+        cos_sin_table, position_ids, nope_dim, rope_dim,
+        kv_cache_fused, num_comp_tokens, cu_kv_comp,
+        start_pos, block_offsets, compressed_mask,
+        tokens_per_block, 0, True, None, None,
+    )
+    torch.cuda.synchronize()
+
+    for b in range(batch_size):
+        n_tokens = num_comp_tokens_list[b]
+        if not mask_pattern[b]:
+            # Masked: all cache blocks must be zero
+            for blk_idx in range(max_blocks):
+                phys = block_offsets[b, blk_idx].item()
+                assert kv_cache_fused[phys].abs().max().item() == 0.0, (
+                    f"Masked batch {b} block {blk_idx} should be zero"
+                )
+        else:
+            # Unmasked: cache values should match reference
+            token_offset = cu_kv_comp[b].item()
+            for t in range(n_tokens):
+                blk = t // tokens_per_block
+                off = t % tokens_per_block
+                phys = block_offsets[b, blk].item()
+                cache_row = kv_cache_fused[phys, off * head_dim : (off + 1) * head_dim]
+                ref_row = ref[token_offset + t]
+                max_diff = (cache_row.float() - ref_row.float()).abs().max().item()
+                assert max_diff < 0.05, (
+                    f"Unmasked batch {b} token {t}: max_diff={max_diff}"
+                )
 
 
 def _build_postprocess_reference(
@@ -1297,6 +1387,7 @@ def test_fused_postprocess_scatter_fp8_pertensor(
     ref_fp8 = ref.float().to(torch.float8_e4m3fn)
 
     # Fused postprocess + scatter (cache_mode=1 for FP8 per-tensor)
+    compressed_mask = torch.ones(total_tokens, dtype=torch.bool, device="cuda")
     torch.ops.trtllm.compressor_postprocess_scatter(
         kv_comp,
         None,
@@ -1311,6 +1402,7 @@ def test_fused_postprocess_scatter_fp8_pertensor(
         cu_kv_comp,
         start_pos,
         block_offsets,
+        compressed_mask,
         tokens_per_block,
         1,
         rotate_activation,
@@ -1418,6 +1510,7 @@ def test_fused_postprocess_scatter_fp8_blockwise(
     ref_scale_all = torch.stack(ref_scale_list)
 
     # Fused postprocess + scatter (cache_mode=2 for FP8 blockwise)
+    compressed_mask = torch.ones(total_tokens, dtype=torch.bool, device="cuda")
     torch.ops.trtllm.compressor_postprocess_scatter(
         kv_comp,
         None,
@@ -1432,6 +1525,7 @@ def test_fused_postprocess_scatter_fp8_blockwise(
         cu_kv_comp,
         start_pos,
         block_offsets,
+        compressed_mask,
         tokens_per_block,
         2,
         rotate_activation,
@@ -1537,7 +1631,7 @@ def benchmark_compress_kernel():
         cu_seq_lens, cu_outputs = prepare_decode_metadata(
             batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=1
         )
-        kv_comp, compressed_mask = prepare_compress_output(
+        kv_comp = prepare_compress_output(
             cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
         )
 
@@ -1554,7 +1648,6 @@ def benchmark_compress_kernel():
                 cu_seq_lens,
                 cu_outputs,
                 kv_comp_cutile,
-                compressed_mask,
                 paged_kv_cutile,
                 paged_score_cutile,
                 block_table,
@@ -1651,7 +1744,7 @@ def benchmark_compress_prefill_kernel():
         cu_seq_lens, cu_outputs = prepare_prefill_metadata(
             kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
         )
-        kv_comp, compressed_mask = prepare_compress_output(
+        kv_comp = prepare_compress_output(
             cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
         )
         paged_kv, paged_score, block_table, _, _ = create_paged_cache(
@@ -1661,7 +1754,6 @@ def benchmark_compress_prefill_kernel():
         paged_kv_cutile = paged_kv.clone()
         paged_score_cutile = paged_score.clone()
         kv_comp_cutile = kv_comp.clone()
-        compressed_mask_cutile = compressed_mask.clone()
 
         def cutile_fn():
             seq_lens = kv_lens - start_pos
@@ -1675,7 +1767,6 @@ def benchmark_compress_prefill_kernel():
                 cu_seq_lens,
                 cu_outputs,
                 kv_comp_cutile,
-                compressed_mask_cutile,
                 paged_kv_cutile,
                 paged_score_cutile,
                 block_table,

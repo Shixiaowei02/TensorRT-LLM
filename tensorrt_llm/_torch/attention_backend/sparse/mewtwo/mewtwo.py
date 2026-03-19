@@ -278,6 +278,25 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
+        # compressed_mask_cuda: per-token bool mask for postprocess scatter.
+        # Precomputed from new_comp_kv_lens to skip padded generation slots.
+        self.compressed_mask_cuda = {
+            compress_ratio: self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                dtype=torch.bool,
+                cache_name=f"compressed_mask_cuda_{compress_ratio}",
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+        self.compressed_mask = {
+            compress_ratio: torch.empty_like(
+                self.compressed_mask_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
+            )
+            for compress_ratio in self.compress_ratio_set
+        }
+
         # empty topk indices buffer with all -1s in the tensor
         self.empty_topk_indices_buffer = self.get_empty(
             self.cuda_graph_buffers,
@@ -631,9 +650,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # tensor-scalar slice inside compiled function.
             # For decode-only batches (num_contexts == 0), offset is 0.
             gen_output_offsets = {
-                r: self.cu_new_comp_kv_cuda[r][num_contexts].item()
-                if num_contexts > 0
-                else 0
+                r: self.cu_new_comp_kv_cuda[r][num_contexts].item() if num_contexts > 0 else 0
                 for r in self._compress_ratios_sorted
             }
             self._compute_gen_compressed_position_ids(
@@ -662,6 +679,15 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
 
         self.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+
+        self._compute_compressed_mask(
+            self.new_comp_kv_lens_cuda,
+            self.cu_new_comp_kv_cuda,
+            self.compressed_mask_cuda,
+            batch_size,
+            self.num_total_compressed_tokens,
+            self._compress_ratios_sorted,
+        )
 
         token_positions = self._compute_token_positions(
             seq_lens,
@@ -760,6 +786,36 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             compressed_position_ids_bufs[compress_ratio][
                 output_offset : output_offset + gen_comp
             ] = result
+
+    @staticmethod
+    @maybe_compile(dynamic=True, options={"max-autotune": True})
+    def _compute_compressed_mask(
+        new_comp_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
+        compressed_mask_bufs: Dict[int, torch.Tensor],
+        batch_size: int,
+        num_total_compressed_tokens: Dict[int, int],
+        compress_ratios: list,
+    ):
+        """Compute per-token compressed_mask on device (graph-safe, no .item()).
+
+        For each token in [0, total_tokens), determine which sequence it
+        belongs to via searchsorted on cu_new_comp_kv, then compare its
+        within-sequence offset against the actual new_comp_kv_len.
+        Context tokens (offset < actual) are always True.
+        Generation tokens whose offset >= actual new_comp are padding → False.
+        """
+        device = new_comp_kv_lens_bufs[compress_ratios[0]].device
+        for compress_ratio in compress_ratios:
+            total_tokens = num_total_compressed_tokens[compress_ratio]
+            new_comp = new_comp_kv_lens_bufs[compress_ratio][:batch_size]
+            cu = cu_new_comp_kv_bufs[compress_ratio][: batch_size + 1]
+
+            token_idx = torch.arange(total_tokens, dtype=torch.int32, device=device)
+            seq_idx = torch.searchsorted(cu[1:], token_idx, right=True)
+            seq_idx = seq_idx.clamp_(max=batch_size - 1)
+            offset_in_seq = token_idx - cu[seq_idx]
+            compressed_mask_bufs[compress_ratio][:total_tokens] = offset_in_seq < new_comp[seq_idx]
 
     @staticmethod
     def _compute_ctx_compressed_position_ids(

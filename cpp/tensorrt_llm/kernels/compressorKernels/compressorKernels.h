@@ -44,7 +44,6 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int32_t const* start_pos,                    // [bsz]
     int32_t const* cu_seq_lens,                  // [bsz+1]
     int32_t const* cu_kv_comp,                   // [bsz+1]
-    bool* compressed_mask,                       // [bsz]
     int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, bool is_overlap, int next_n,
     int io_elem_bytes,                           // bytes per element for kv_score/paged (2=bf16, 4=fp32)
     int out_elem_bytes,                          // bytes per element for output
@@ -66,7 +65,6 @@ void prefillReductionLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or 
     int32_t const* start_pos,                     // [bsz]
     int32_t const* cu_seq_lens,                   // [bsz+1]
     int32_t const* cu_kv_comp,                    // [bsz+1]
-    bool* compressed_mask,                        // [bsz]
     int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, bool is_overlap, int max_outputs,
     int io_elem_bytes, int out_elem_bytes, cudaStream_t stream);
 
@@ -87,6 +85,7 @@ void postProcessScatterLaunch(void const* kv_comp, // [total_tokens, head_dim] i
     int32_t const* cu_kv_comp,                     // [bsz+1]
     int32_t const* start_pos,                      // [bsz]
     int32_t const* block_offsets,                  // [bsz, max_blocks]
+    bool const* compressed_mask,                   // [total_tokens] — per-token mask, false ⇒ skip
     int batch_size, int tokens_per_block, int head_dim, int max_blocks_per_seq, int elem_bytes, int total_tokens,
     int cache_mode,                                // 0=default, 1=fp8_pertensor, 2=fp8_blockwise
     bool rotate_activation,                        // whether to apply Hadamard transform (false to skip)

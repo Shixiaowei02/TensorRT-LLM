@@ -162,7 +162,6 @@ class Compressor(nn.Module):
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
-        compressed_mask = torch.empty(bsz, device=x.device, dtype=torch.bool)
 
         # Run compression kernels
         if num_contexts > 0:
@@ -174,7 +173,6 @@ class Compressor(nn.Module):
                 cu_seq_lens=metadata.cu_seq_lens_cuda,
                 cu_new_comp_kv=cu_new_comp_kv[: num_contexts + 1],
                 kv_comp=kv_comp,
-                compressed_mask=compressed_mask[:num_contexts],
                 paged_kv=paged_kv_state,
                 paged_score=paged_score_state,
                 block_table_kv=block_table_kv_state[:num_contexts],
@@ -195,7 +193,6 @@ class Compressor(nn.Module):
                 cu_seq_lens=metadata.cu_seq_lens_cuda,
                 cu_new_comp_kv=cu_new_comp_kv[num_contexts:],
                 kv_comp=kv_comp,
-                compressed_mask=compressed_mask[num_contexts:],
                 paged_kv=paged_kv_state,
                 paged_score=paged_score_state,
                 block_table_kv=block_table_kv_state[num_contexts:],
@@ -224,6 +221,7 @@ class Compressor(nn.Module):
             )
 
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
+        compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
 
         # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
         torch.ops.trtllm.compressor_postprocess_scatter(
@@ -240,6 +238,7 @@ class Compressor(nn.Module):
             cu_new_comp_kv,
             start_pos,
             block_table,
+            compressed_mask,
             compress_tokens_per_block,
             int(self.kv_cache_dtype),
             self.rotate_activation,

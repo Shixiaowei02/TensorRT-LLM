@@ -82,6 +82,7 @@ class DummyAttentionMetadata:
         max_ctx_compressed_tokens: dict,
         slot_mapping_fp8: torch.Tensor = None,
         slot_mapping_scale: torch.Tensor = None,
+        compressed_mask_cuda: dict = None,
     ):
         self.num_contexts = num_contexts
         self.num_generations = num_generations
@@ -99,6 +100,7 @@ class DummyAttentionMetadata:
         self.new_comp_kv_lens_cuda = new_comp_kv_lens_cuda
         self.num_total_compressed_tokens = num_total_compressed_tokens
         self.max_ctx_compressed_tokens = max_ctx_compressed_tokens
+        self.compressed_mask_cuda = compressed_mask_cuda
         self.num_gen_tokens_per_seq = 0  # Set by caller
         self.kv_lens_cuda_runtime = None  # Set by caller
         self.cached_token_lens_cuda = None  # Set by caller
@@ -987,9 +989,12 @@ class CompressorWrapper:
 
         # Compute number of compressed outputs per batch
         # For prefill (start_pos=0): compress every ratio tokens
-        # For decode (start_pos>0): compress only if we complete a chunk
+        # For decode (start_pos>0): count how many chunk boundaries are crossed.
+        # (past+n)//ratio - past//ratio correctly handles MTP (next_n>1) where
+        # the compression trigger may fall in the middle of the seq_lens window,
+        # unlike (past+n)%ratio==0 which only fires when the last token completes a chunk.
         num_comp_prefill = seq_lens // ratio
-        should_compress_decode = ((past_kv_lens + seq_lens) % ratio == 0).to(torch.int32)
+        should_compress_decode = (past_kv_lens + seq_lens) // ratio - past_kv_lens // ratio
         num_comp = torch.where(is_prefill, num_comp_prefill, should_compress_decode)
 
         cu_new_comp_kv = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
@@ -1006,9 +1011,16 @@ class CompressorWrapper:
                 for i in range(n_out):
                     position_ids[offset + i] = i * ratio
             else:
-                # Decode: position is start_pos
-                for i in range(n_out):
-                    position_ids[offset + i] = past_kv_lens[b].item()
+                # Decode: position is the last token of each completed chunk.
+                # For the c-th new compression, the chunk ends at token
+                # (base_chunk + c + 1) * ratio - 1.
+                # For standard single-token decode (n_out ≤ 1, sp = chunk_end),
+                # this equals past_kv_lens[b], but for MTP (seq_lens > 1) the
+                # compressing token may differ from past_kv_lens.
+                sp = past_kv_lens[b].item()
+                base_chunk = sp // ratio
+                for c in range(n_out):
+                    position_ids[offset + c] = (base_chunk + c + 1) * ratio - 1
             offset += n_out
 
         # Determine attention types based on is_indexer
@@ -1071,6 +1083,18 @@ class CompressorWrapper:
         num_total_compressed_tokens_dict = {ratio: num_total_compressed_tokens}
         max_ctx_compressed_tokens_dict = {ratio: max_ctx_comp_kv_lens}
 
+        # Build per-token compressed_mask
+        compressed_mask_tokens = torch.zeros(
+            num_total_compressed_tokens, dtype=torch.bool, device=DEVICE
+        )
+        offset = 0
+        for b in range(bsz):
+            n = int(num_comp[b].item())
+            compressed_mask_tokens[offset : offset + n] = True
+            slot_size = int(cu_new_comp_kv[b + 1].item() - cu_new_comp_kv[b].item())
+            offset += slot_size
+        compressed_mask_cuda_dict = {ratio: compressed_mask_tokens}
+
         # Build attention metadata using MewtwoCacheManager
         metadata = DummyAttentionMetadata(
             num_contexts=num_contexts,
@@ -1087,6 +1111,7 @@ class CompressorWrapper:
             new_comp_kv_lens_cuda=new_comp_kv_lens_cuda_dict,
             num_total_compressed_tokens=num_total_compressed_tokens_dict,
             max_ctx_compressed_tokens=max_ctx_compressed_tokens_dict,
+            compressed_mask_cuda=compressed_mask_cuda_dict,
         )
         # kv_lens_cuda_runtime: [num_seqs] total KV length per sequence (past + current)
         metadata.kv_lens_cuda_runtime = kv_lens
@@ -1869,6 +1894,291 @@ def test_fused_decode_no_rotate(prefill, steps, batch, ratio):
                     assert_similar(
                         cached_ref, cached_comp, f"Fused decode no-rotate cache[{b}] step{step}"
                     )
+
+
+@pytest.mark.parametrize(
+    "prefill_len, decode_steps, batch, ratio, rotate",
+    [
+        # ratio=4 (overlap mode)
+        (1, 8, 1, 4, True),
+        (2, 8, 2, 4, True),
+        (3, 8, 1, 4, True),
+        (1, 4, 1, 4, False),
+        (3, 12, 2, 4, False),
+        # ratio=128 (non-overlap): these should pass
+        (64, 128, 1, 128, True),  # half-ratio prefill, decode rest
+        (1, 128, 1, 128, True),  # minimal prefill
+        (127, 4, 1, 128, True),  # one token short of compression at prefill
+    ],
+)
+def test_short_prefill_then_decode(prefill_len, decode_steps, batch, ratio, rotate):
+    """Test prefill with fewer tokens than compress_ratio, then decode until compression.
+
+    When prefill_len < compress_ratio, the prefill produces no compressed outputs;
+    all tokens are saved as remainder state. Subsequent decode tokens accumulate
+    in the state until compress_ratio is reached, at which point compression fires.
+    This tests the state handoff from prefill remainder to decode accumulation.
+    """
+    ref, comp = setup_compressors(ratio, rotate=rotate)
+    try:
+        freqs = precompute_freqs_cis(
+            ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+        ).to(DEVICE)
+
+        x_prefill = torch.randn(batch, prefill_len, DIM, device=DEVICE, dtype=DTYPE)
+
+        with torch.no_grad():
+            # Prefill: should produce no compressed tokens (prefill_len < ratio)
+            out_ref = ref(x_prefill, 0, freqs[:prefill_len])
+            out_comp = comp.forward(x_prefill, 0, freqs[:prefill_len])
+
+            if prefill_len < ratio:
+                # No compression expected from prefill
+                assert out_ref is None, (
+                    f"Ref should produce no output for prefill_len={prefill_len} < ratio={ratio}"
+                )
+
+            # Decode: step one token at a time
+            for step in range(decode_steps):
+                pos = prefill_len + step
+                x_decode = torch.randn(batch, 1, DIM, device=DEVICE, dtype=DTYPE)
+                out_ref = ref(x_decode, pos, freqs[pos : pos + 1])
+                out_comp = comp.forward(x_decode, pos, freqs[pos : pos + 1])
+
+                should_compress = (pos + 1) % ratio == 0
+                if should_compress:
+                    assert out_ref is not None, f"Ref should compress at step {step} (pos={pos})"
+                    assert_similar(out_ref, out_comp, f"Short prefill decode step {step}")
+
+                    # Verify cache parity
+                    num_comp_tokens = (pos + 1) // ratio
+                    for b in range(batch):
+                        cached_ref = ref.kv_cache[b : b + 1, :num_comp_tokens]
+                        cached_comp = read_paged_cache_tokens(
+                            comp.kv_cache,
+                            comp.block_offsets,
+                            b,
+                            num_comp_tokens,
+                            comp.tokens_per_block,
+                        ).unsqueeze(0)
+                        assert_similar(
+                            cached_ref,
+                            cached_comp,
+                            f"Short prefill cache parity[{b}] step{step}",
+                        )
+                else:
+                    assert out_ref is None, f"Ref should NOT compress at step {step} (pos={pos})"
+    finally:
+        comp.cleanup()
+
+
+@pytest.mark.parametrize(
+    "prefill_len, decode_steps, batch, ratio, next_n",
+    [
+        (128, 8, 1, 4, 2),
+        (128, 8, 1, 4, 3),
+        (128, 8, 2, 4, 2),
+    ],
+)
+def test_mtp_decode_overlap(prefill_len, decode_steps, batch, ratio, next_n):
+    """MTP decode: next_n > 1 tokens per step in overlap mode (ratio=4).
+
+    Verifies the decode kernel's multi-token path with overlap mode produces
+    correct output and cache contents at each compression point.  The reference
+    runs one token at a time while the wrapper receives all next_n tokens in a
+    single call via seq_lens.
+    """
+    ref, comp = setup_compressors(ratio, rotate=True)
+    try:
+        freqs = precompute_freqs_cis(
+            ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+        ).to(DEVICE)
+        x_prefill = torch.randn(batch, prefill_len, DIM, device=DEVICE, dtype=DTYPE)
+
+        with torch.no_grad():
+            ref(x_prefill, 0, freqs[:prefill_len])
+            comp.forward(x_prefill, 0, freqs[:prefill_len])
+
+            step = 0
+            while step < decode_steps:
+                n = min(next_n, decode_steps - step)
+                pos = prefill_len + step
+                x_decode = torch.randn(batch, n, DIM, device=DEVICE, dtype=DTYPE)
+
+                # Reference: run one token at a time, collect last compressing output
+                last_ref_out = None
+                last_comp_pos = None
+                for t in range(n):
+                    out_t = ref(x_decode[:, t : t + 1], pos + t, freqs[pos + t : pos + t + 1])
+                    if out_t is not None:
+                        last_ref_out = out_t
+                        last_comp_pos = pos + t
+
+                # Wrapper: pass all n tokens as a variable-length decode step
+                pos_tensor = torch.full((batch,), pos, dtype=torch.int32, device=DEVICE)
+                seq_lens_t = torch.full((batch,), n, dtype=torch.int32, device=DEVICE)
+                out_comp = comp.forward(
+                    x_decode, pos_tensor, freqs[pos : pos + n], seq_lens=seq_lens_t
+                )
+
+                if last_ref_out is not None:
+                    assert out_comp is not None, (
+                        f"MTP step {step}: wrapper produced no output but ref compressed"
+                    )
+                    assert_similar(last_ref_out, out_comp, f"MTP decode step {step}")
+
+                    num_comp_tokens = (last_comp_pos + 1) // ratio
+                    for b in range(batch):
+                        cached_ref = ref.kv_cache[b : b + 1, :num_comp_tokens]
+                        cached_comp = read_paged_cache_tokens(
+                            comp.kv_cache,
+                            comp.block_offsets,
+                            b,
+                            num_comp_tokens,
+                            comp.tokens_per_block,
+                        ).unsqueeze(0)
+                        assert_similar(cached_ref, cached_comp, f"MTP cache[{b}] step {step}")
+                else:
+                    assert out_comp is None, f"MTP step {step}: wrapper produced unexpected output"
+
+                step += n
+    finally:
+        comp.cleanup()
+
+
+@pytest.mark.parametrize(
+    "batch, ratio, rotate",
+    [
+        (1, 4, True),
+        (2, 4, True),
+        (1, 4, False),
+        (1, 128, True),
+    ],
+)
+def test_prefill_exact_ratio(batch, ratio, rotate):
+    """Prefill with seqlen == compress_ratio: exactly 1 full chunk, no remainder tokens.
+
+    In overlap mode (ratio=4) the single output has no predecessor chunk so the
+    overlap first-half should be zero-weighted.  In non-overlap mode (ratio=128)
+    this is a standard single-chunk prefill.  Both output and cache are verified.
+    """
+    ref, comp = setup_compressors(ratio, rotate=rotate)
+    try:
+        freqs = precompute_freqs_cis(
+            ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+        ).to(DEVICE)
+        x = torch.randn(batch, ratio, DIM, device=DEVICE, dtype=DTYPE)
+
+        with torch.no_grad():
+            out_ref = ref(x, 0, freqs[:ratio])
+            out_comp = comp.forward(x, 0, freqs[:ratio])
+
+        assert out_ref is not None, "Expected compression for seqlen==ratio"
+        assert out_comp is not None, "Expected compression for seqlen==ratio"
+        assert_similar(out_ref, out_comp, "exact_ratio prefill output")
+
+        for b in range(batch):
+            cached_ref = ref.kv_cache[b : b + 1, :1]
+            cached_comp = read_paged_cache_tokens(
+                comp.kv_cache, comp.block_offsets, b, 1, comp.tokens_per_block
+            ).unsqueeze(0)
+            assert_similar(cached_ref, cached_comp, f"exact_ratio cache[{b}]")
+    finally:
+        comp.cleanup()
+
+
+@pytest.mark.parametrize(
+    "seq_lens_list, ratio, rotate",
+    [
+        ([3, 8, 5], 4, True),  # short / long / medium — varied output counts
+        ([1, 4, 7], 4, False),  # minimal, exact-ratio, one-beyond-exact
+        ([64, 3, 128], 128, True),  # ratio=128, mixed short / long
+    ],
+)
+def test_mixed_seqlen_contexts(seq_lens_list, ratio, rotate):
+    """Prefill batch with variable seqlens: some < ratio (no compressed output), some >= ratio.
+
+    Verifies that zero-output sequences do not corrupt the cu_new_comp_kv layout
+    or the compressed token buffer for neighbouring sequences.  Each sequence is
+    also run through the reference independently so that the paged cache content
+    can be compared token-by-token.
+    """
+    batch = len(seq_lens_list)
+    max_sl = max(seq_lens_list)
+
+    ref, comp = setup_compressors(ratio, rotate=rotate)
+    try:
+        freqs = precompute_freqs_cis(
+            ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+        ).to(DEVICE)
+
+        xs = [torch.randn(1, sl, DIM, device=DEVICE, dtype=DTYPE) for sl in seq_lens_list]
+
+        with torch.no_grad():
+            # ---- Reference: run each sequence independently, save compressed cache ----
+            ref_caches = {}
+            for i, sl in enumerate(seq_lens_list):
+                n_out = sl // ratio
+                if n_out > 0:
+                    # Reset ref state so independent runs don't interfere
+                    ref.kv_state.zero_()
+                    ref.score_state.fill_(float("-inf"))
+                    ref(xs[i], 0, freqs[:sl])
+                    # ref writes to kv_cache[0]; save before next independent run
+                    ref_caches[i] = ref.kv_cache[0, :n_out].clone()
+
+            # ---- Wrapper: run all sequences in one variable-length prefill call ----
+            seq_lens_t = torch.tensor(seq_lens_list, dtype=torch.int32, device=DEVICE)
+            start_pos_t = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+
+            # Build flat (non-padded) 2D token tensor.  A padded 3D tensor would
+            # interleave padding zeros with real tokens after view(-1, DIM), so we
+            # concatenate actual token rows directly instead.
+            x_flat_input = torch.cat([xs[i][0] for i in range(batch)], dim=0)
+
+            comp.forward(x_flat_input, start_pos_t, freqs[:max_sl], seq_lens=seq_lens_t)
+
+            # ---- Compare per-sequence compressed caches ----
+            for rank, sl in enumerate(seq_lens_list):
+                n_out = sl // ratio
+                if n_out > 0 and rank in ref_caches:
+                    cached_comp = read_paged_cache_tokens(
+                        comp.kv_cache, comp.block_offsets, rank, n_out, comp.tokens_per_block
+                    )
+                    assert_similar(
+                        ref_caches[rank].unsqueeze(0),
+                        cached_comp.unsqueeze(0),
+                        f"mixed_seqlen cache seq[{rank}] sl={sl}",
+                    )
+
+            # ---- Decode from remainder state for sequences with leftover tokens ----
+            # Find the first sequence that has a non-zero remainder and run it to
+            # the next compression point; this validates state hand-off.
+            for rank, sl in enumerate(seq_lens_list):
+                remainder = sl % ratio
+                if remainder == 0:
+                    continue
+                steps_to_compress = ratio - remainder
+                for step in range(steps_to_compress):
+                    pos = sl + step
+                    x_dec = torch.randn(1, 1, DIM, device=DEVICE, dtype=DTYPE)
+                    pos_tensor = torch.tensor([pos], dtype=torch.int32, device=DEVICE)
+                    seq_lens_dec = torch.ones(1, dtype=torch.int32, device=DEVICE)
+                    out = comp.forward(
+                        x_dec, pos_tensor, freqs[pos : pos + 1], seq_lens=seq_lens_dec
+                    )
+                    should_compress = (pos + 1) % ratio == 0
+                    if should_compress:
+                        assert out is not None, (
+                            f"mixed_seqlen seq[{rank}]: expected compression at pos={pos}"
+                        )
+                    else:
+                        assert out is None, (
+                            f"mixed_seqlen seq[{rank}]: unexpected output at pos={pos}"
+                        )
+                break  # Only test the first remainder sequence for brevity
+    finally:
+        comp.cleanup()
 
 
 if __name__ == "__main__":

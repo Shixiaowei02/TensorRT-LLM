@@ -44,7 +44,6 @@ def paged_kv_compress_cutile_kernel(
     start_pos_tensor,  # [bsz]
     cu_seq_lens,  # [bsz+1]
     cu_kv_comp,  # [bsz+1]
-    compressed_mask,  # [bsz]
     # Runtime scalars
     page_size: int,
     state_dim: int,
@@ -137,8 +136,6 @@ def paged_kv_compress_cutile_kernel(
     # ================================================================
     last_token_idx = sp + NEXT_N - 1
     num_compressions = (last_token_idx + 1) // COMPRESS_RATIO - sp // COMPRESS_RATIO
-    if block_idx == 0:
-        ct.scatter(compressed_mask, batch_idx, num_compressions > 0)
 
     # ================================================================
     # Phase 3: Reduction (per-token loop + online softmax weighted avg)
@@ -168,47 +165,51 @@ def paged_kv_compress_cutile_kernel(
 
             if IS_OVERLAP:
                 # --- Previous chunk: first head_dim features ---
+                # Skip when no previous chunk (first compression window).
+                # Accumulators stay at initial values (-inf max, 0 sum/wsum)
+                # → zero softmax weight, matching the reference.
                 prev_start = curr_chunk_start - COMPRESS_RATIO
-                for r in range(COMPRESS_RATIO):
-                    pos = prev_start + r
-                    log_blk = pos // page_size
-                    blk_off = pos % page_size
-                    phys_kv = ct.gather(
-                        block_table_kv,
-                        (batch_idx, log_blk),
-                        padding_value=0,
-                        latency=1,
-                    )
-                    phys_sc = ct.gather(
-                        block_table_score,
-                        (batch_idx, log_blk),
-                        padding_value=0,
-                        latency=1,
-                    )
-                    k = ct.astype(
-                        ct.gather(
-                            paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0, latency=2
-                        ),
-                        ct.float32,
-                    )
-                    s = ct.astype(
-                        ct.gather(
-                            paged_score,
-                            (phys_sc, blk_off, state_offsets),
+                if prev_start >= 0:
+                    for r in range(COMPRESS_RATIO):
+                        pos = prev_start + r
+                        log_blk = pos // page_size
+                        blk_off = pos % page_size
+                        phys_kv = ct.gather(
+                            block_table_kv,
+                            (batch_idx, log_blk),
                             padding_value=0,
-                            latency=2,
-                        ),
-                        ct.float32,
-                    )
-                    k = k * head_mask_kv
-                    s = s + head_mask_score
+                            latency=1,
+                        )
+                        phys_sc = ct.gather(
+                            block_table_score,
+                            (batch_idx, log_blk),
+                            padding_value=0,
+                            latency=1,
+                        )
+                        k = ct.astype(
+                            ct.gather(
+                                paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0, latency=2
+                            ),
+                            ct.float32,
+                        )
+                        s = ct.astype(
+                            ct.gather(
+                                paged_score,
+                                (phys_sc, blk_off, state_offsets),
+                                padding_value=0,
+                                latency=2,
+                            ),
+                            ct.float32,
+                        )
+                        k = k * head_mask_kv
+                        s = s + head_mask_score
 
-                    new_max = ct.maximum(running_max, s)
-                    scale = ct.exp(running_max - new_max)
-                    term = ct.exp(s - new_max)
-                    running_sum = running_sum * scale + term
-                    running_wsum = running_wsum * scale + k * term
-                    running_max = new_max
+                        new_max = ct.maximum(running_max, s)
+                        scale = ct.exp(running_max - new_max)
+                        term = ct.exp(s - new_max)
+                        running_sum = running_sum * scale + term
+                        running_wsum = running_wsum * scale + k * term
+                        running_max = new_max
 
                 # --- Current chunk: second head_dim features ---
                 for r in range(COMPRESS_RATIO):
@@ -329,7 +330,6 @@ def kv_compress_cutile(
     cu_seq_lens: torch.Tensor,
     cu_new_comp_kv: torch.Tensor,
     kv_comp: torch.Tensor,
-    compressed_mask: torch.Tensor,
     paged_kv: torch.Tensor,
     paged_score: torch.Tensor,
     block_table_kv: torch.Tensor,
@@ -350,7 +350,6 @@ def kv_compress_cutile(
         cu_seq_lens: [bsz+1] cumulative input offsets
         cu_new_comp_kv: [bsz+1] cumulative output offsets
         kv_comp: [total_outputs, head_dim] pre-allocated output buffer
-        compressed_mask: [bsz] pre-allocated bool mask buffer
         paged_kv/paged_score: [num_blocks, page_size, state_dim]
         block_table_kv: [bsz, max_blocks]
         block_table_score: [bsz, max_blocks] (if None, uses block_table_kv)
@@ -390,7 +389,6 @@ def kv_compress_cutile(
             start_pos,
             cu_seq_lens,
             cu_new_comp_kv,
-            compressed_mask,
             page_size,
             state_dim,
             head_dim,
@@ -422,7 +420,6 @@ def prefill_reduction_cutile_kernel(
     start_pos_tensor,  # [bsz]
     cu_seq_lens,  # [bsz+1]
     cu_kv_comp,  # [bsz+1]
-    compressed_mask,  # [bsz]
     # Runtime scalars
     page_size: int,
     state_dim: int,
@@ -462,10 +459,6 @@ def prefill_reduction_cutile_kernel(
     coff = 2 if IS_OVERLAP else 1
     actual_num_outputs = seqlen // COMPRESS_RATIO
     should_compress = local_output_idx < actual_num_outputs
-
-    # Write compressed_mask (first output block and first head chunk only)
-    if local_output_idx == 0 and head_offset == 0:
-        ct.scatter(compressed_mask, batch_idx, actual_num_outputs > 0)
 
     # ================================================================
     # Phase 1: State Update (last output block only)
@@ -738,7 +731,6 @@ def kv_compress_prefill_cutile(
     cu_seq_lens: torch.Tensor,
     cu_new_comp_kv: torch.Tensor,
     kv_comp: torch.Tensor,
-    compressed_mask: torch.Tensor,
     paged_kv: torch.Tensor,
     paged_score: torch.Tensor,
     block_table_kv: torch.Tensor,
@@ -782,7 +774,6 @@ def kv_compress_prefill_cutile(
             start_pos,
             cu_seq_lens,
             cu_new_comp_kv,
-            compressed_mask,
             page_size,
             state_dim,
             head_dim,

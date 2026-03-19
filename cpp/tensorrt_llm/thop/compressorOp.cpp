@@ -37,7 +37,6 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     torch::Tensor start_pos,                             // [bsz] int32
     torch::Tensor cu_seq_lens,                           // [bsz+1] int32
     torch::Tensor cu_kv_comp,                            // [bsz+1] int32
-    torch::Tensor compressed_mask,                       // [bsz] bool
     int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, bool is_overlap, int64_t next_n)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -47,7 +46,7 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     tk::pagedKvCompressLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(), reinterpret_cast<bool*>(compressed_mask.data_ptr()),
+        cu_kv_comp.data_ptr<int32_t>(),
         static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
         static_cast<int>(head_dim), static_cast<int>(compress_ratio), is_overlap, static_cast<int>(next_n), io_eb,
         out_eb, stream);
@@ -57,7 +56,7 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
 void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, torch::Tensor paged_kv,
     torch::Tensor paged_score, torch::Tensor block_table_kv, torch::Tensor block_table_score, torch::Tensor output,
     torch::Tensor kv_lens, torch::Tensor start_pos, torch::Tensor cu_seq_lens, torch::Tensor cu_kv_comp,
-    torch::Tensor compressed_mask, int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio,
+    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio,
     bool is_overlap, int64_t max_outputs)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -67,7 +66,7 @@ void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, tor
     tk::prefillReductionLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(), reinterpret_cast<bool*>(compressed_mask.data_ptr()),
+        cu_kv_comp.data_ptr<int32_t>(),
         static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
         static_cast<int>(head_dim), static_cast<int>(compress_ratio), is_overlap, static_cast<int>(max_outputs), io_eb,
         out_eb, stream);
@@ -86,6 +85,7 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
     torch::Tensor cu_kv_comp,                              // [bsz+1] int32
     torch::Tensor start_pos,                               // [bsz] int32
     torch::Tensor block_offsets,                           // [bsz, max_blocks] int32
+    torch::Tensor compressed_mask,                         // [total_tokens] bool — per-token mask
     int64_t tokens_per_block, int64_t cache_mode, bool rotate_activation, std::optional<torch::Tensor> fp8_output,
     std::optional<torch::Tensor> scale_output)
 {
@@ -97,11 +97,15 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
     TORCH_CHECK(position_ids.scalar_type() == at::kInt,
         "position_ids must be int32, got ", position_ids.scalar_type());
     TORCH_CHECK(position_ids.is_contiguous(), "position_ids must be contiguous");
+    TORCH_CHECK(compressed_mask.scalar_type() == at::kBool,
+        "compressed_mask must be bool, got ", compressed_mask.scalar_type());
 
     tk::postProcessScatterLaunch(kv_comp.data_ptr(), kv_out.has_value() ? kv_out->data_ptr() : nullptr,
-        rms_weight.data_ptr(), static_cast<float>(rms_eps), cos_sin_table.data_ptr<float>(), position_ids.data_ptr<int32_t>(),
-        static_cast<int>(nope_dim), static_cast<int>(rope_dim), kv_cache.data_ptr(), num_outputs.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), block_offsets.data_ptr<int32_t>(),
+        rms_weight.data_ptr(), static_cast<float>(rms_eps), cos_sin_table.data_ptr<float>(),
+        position_ids.data_ptr<int32_t>(), static_cast<int>(nope_dim), static_cast<int>(rope_dim),
+        kv_cache.data_ptr(), num_outputs.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(),
+        start_pos.data_ptr<int32_t>(), block_offsets.data_ptr<int32_t>(),
+        reinterpret_cast<bool const*>(compressed_mask.data_ptr()),
         static_cast<int>(num_outputs.size(0)),    // batch_size
         static_cast<int>(tokens_per_block),
         static_cast<int>(kv_comp.size(1)),        // head_dim
@@ -124,7 +128,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(c!) output, "
         "Tensor kv_lens, Tensor start_pos, "
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
-        "Tensor(d!) compressed_mask, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "
         "bool is_overlap, int next_n) -> ()");
@@ -137,7 +140,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(c!) output, "
         "Tensor kv_lens, Tensor start_pos, "
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
-        "Tensor(d!) compressed_mask, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "
         "bool is_overlap, int max_outputs) -> ()");
@@ -151,6 +153,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(b!) kv_cache, "
         "Tensor num_outputs, Tensor cu_kv_comp, "
         "Tensor start_pos, Tensor block_offsets, "
+        "Tensor compressed_mask, "
         "int tokens_per_block, int cache_mode, "
         "bool rotate_activation, "
         "Tensor(c!)? fp8_output, Tensor(d!)? scale_output) -> ()");
