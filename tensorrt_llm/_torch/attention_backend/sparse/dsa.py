@@ -1589,15 +1589,15 @@ class Indexer(nn.Module):
         request_ids = metadata.request_ids
         seq_lens = metadata.seq_lens
         head_dim = metadata.indexer_head_dim
-        tokens_per_block = kv_cache_manager.tokens_per_block
         quant_block_size = metadata.indexer_quant_block_size
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         # Only support compression ratio of 4 and 1 for now
         compress_ratio = 4 if 4 in metadata.compress_ratios else 1
-
-        # For the indexer's K cache pool, the physical block size is
-        # tokens_per_block // compress_ratio (= compressed_block_sizes).
-        indexer_tokens_per_block = tokens_per_block // compress_ratio
+        if hasattr(kv_cache_manager, 'compressed_block_sizes'):
+            indexer_tokens_per_block = kv_cache_manager.compressed_block_sizes[
+                self.layer_idx]
+        else:
+            indexer_tokens_per_block = kv_cache_manager.tokens_per_block
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
