@@ -155,8 +155,7 @@ class Compressor(nn.Module):
         kv_lens = metadata.kv_lens_cuda_runtime
         total_num_comp_tokens = metadata.num_total_compressed_tokens[self.compress_ratio]
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
-        max_num_comp_tokens = metadata.max_num_compressed_tokens[self.compress_ratio]
-        max_ctx_comp_kv_lens, _, _ = max_num_comp_tokens
+        max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
         # Project input to KV and score
         kv_score = self.wkv_gate(x.float())

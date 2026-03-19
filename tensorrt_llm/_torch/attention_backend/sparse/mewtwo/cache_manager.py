@@ -715,6 +715,40 @@ class MewtwoCacheManager(KVCacheManagerV2):
         offsets[offsets == -scale] = -1
         return offsets
 
+    def get_batch_block_offsets(
+        self,
+        request_ids: List[int],
+        num_contexts: int,
+        attention_type_set: set,
+    ) -> Dict[Tuple[int, "MewtwoAttentionType"], torch.Tensor]:
+        """Get block offsets for all attention types in a single call.
+
+        Calls get_copy_index once and deduplicates offset computation by
+        (pool_id, scale) to avoid redundant work.
+
+        Args:
+            request_ids: The request ids.
+            num_contexts: The number of context requests.
+            attention_type_set: Set of (compress_ratio, attention_type) tuples.
+
+        Returns:
+            Dict mapping (compress_ratio, attention_type) -> offset tensor.
+        """
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, 1)
+
+        offset_cache = {}  # (pool_id, scale) -> offsets tensor
+        result = {}
+        for compress_ratio, attention_type in attention_type_set:
+            pool_id = self._attn_ratio_to_pool_id[attention_type][compress_ratio]
+            scale = self._attn_ratio_to_scale[attention_type][compress_ratio]
+            cache_key = (pool_id, scale)
+            if cache_key not in offset_cache:
+                offsets = self.host_kv_cache_block_offsets[pool_id, copy_idx, 0] * scale
+                offsets[offsets == -scale] = -1
+                offset_cache[cache_key] = offsets
+            result[(compress_ratio, attention_type)] = offset_cache[cache_key]
+        return result
+
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):
         config = model_config.pretrained_config

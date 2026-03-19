@@ -79,7 +79,7 @@ class DummyAttentionMetadata:
         past_kv_lens: dict,
         new_comp_kv_lens_cuda: dict,
         num_total_compressed_tokens: dict,
-        max_num_compressed_tokens: dict,
+        max_ctx_compressed_tokens: dict,
         slot_mapping_fp8: torch.Tensor = None,
         slot_mapping_scale: torch.Tensor = None,
     ):
@@ -98,7 +98,7 @@ class DummyAttentionMetadata:
         self.slot_mapping_scale = slot_mapping_scale
         self.new_comp_kv_lens_cuda = new_comp_kv_lens_cuda
         self.num_total_compressed_tokens = num_total_compressed_tokens
-        self.max_num_compressed_tokens = max_num_compressed_tokens
+        self.max_ctx_compressed_tokens = max_ctx_compressed_tokens
         self.num_gen_tokens_per_seq = 0  # Set by caller
         self.kv_lens_cuda_runtime = None  # Set by caller
         self.cached_token_lens_cuda = None  # Set by caller
@@ -994,12 +994,7 @@ class CompressorWrapper:
 
         cu_new_comp_kv = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
         cu_new_comp_kv[1:] = num_comp.cumsum(0)
-        max_ctx_comp_kv_lens, max_gen_comp_kv_lens = 0, 0
-        if num_contexts > 0:
-            max_ctx_comp_kv_lens = num_comp[:num_contexts].max().item()
-        if num_generations > 0:
-            max_gen_comp_kv_lens = num_comp[num_contexts:].max().item()
-        max_comp_kv_lens = max(max_ctx_comp_kv_lens, max_gen_comp_kv_lens)
+        max_ctx_comp_kv_lens = num_comp[:num_contexts].max().item() if num_contexts > 0 else 0
 
         # Create position IDs for compressed outputs
         position_ids = torch.zeros(num_total_compressed_tokens, dtype=torch.int32, device=DEVICE)
@@ -1074,9 +1069,7 @@ class CompressorWrapper:
         past_kv_lens_dict = {ratio: past_kv_lens // ratio}
         new_comp_kv_lens_cuda_dict = {ratio: num_comp}
         num_total_compressed_tokens_dict = {ratio: num_total_compressed_tokens}
-        max_num_compressed_tokens_dict = {
-            ratio: (max_ctx_comp_kv_lens, max_gen_comp_kv_lens, max_comp_kv_lens)
-        }
+        max_ctx_compressed_tokens_dict = {ratio: max_ctx_comp_kv_lens}
 
         # Build attention metadata using MewtwoCacheManager
         metadata = DummyAttentionMetadata(
@@ -1093,7 +1086,7 @@ class CompressorWrapper:
             past_kv_lens=past_kv_lens_dict,
             new_comp_kv_lens_cuda=new_comp_kv_lens_cuda_dict,
             num_total_compressed_tokens=num_total_compressed_tokens_dict,
-            max_num_compressed_tokens=max_num_compressed_tokens_dict,
+            max_ctx_compressed_tokens=max_ctx_compressed_tokens_dict,
         )
         # kv_lens_cuda_runtime: [num_seqs] total KV length per sequence (past + current)
         metadata.kv_lens_cuda_runtime = kv_lens

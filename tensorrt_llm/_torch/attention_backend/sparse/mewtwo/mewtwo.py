@@ -157,8 +157,8 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     attention_type_set: Set[Tuple[int, MewtwoAttentionType]]
     # The number of total compressed tokens for each compress ratio
     num_total_compressed_tokens: Dict[int, int] = {}
-    # The max number of compressed tokens for each compress ratio
-    max_num_compressed_tokens: Dict[int, Tuple[int, int, int]] = {}
+    # The max number of context compressed tokens for each compress ratio
+    max_ctx_compressed_tokens: Dict[int, int] = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -229,12 +229,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
             for compress_ratio in self.compress_ratio_set
         }
-        self.new_comp_kv_lens = {
-            compress_ratio: torch.empty_like(
-                self.new_comp_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
 
         # cu_new_comp_kv_cuda is the cumulative number of new compressed tokens for the requests
         self.cu_new_comp_kv_cuda = {
@@ -247,14 +241,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
             for compress_ratio in self.compress_ratio_set
         }
-        self.cu_new_comp_kv = {
-            compress_ratio: torch.empty_like(
-                self.cu_new_comp_kv_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
-        for compress_ratio in self.compress_ratio_set:
-            self.cu_new_comp_kv[compress_ratio][0] = 0
 
         # compressed_kv_lens_cuda is the number of compressed tokens for the requests
         self.compressed_kv_lens_cuda = {
@@ -264,14 +250,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 dtype=torch.int,
                 cache_name=f"compressed_kv_lens_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
-        self.compressed_kv_lens = {
-            compress_ratio: torch.empty_like(
-                self.compressed_kv_lens_cuda[compress_ratio],
-                device="cpu",
-                pin_memory=prefer_pinned(),
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -287,12 +265,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
             for compress_ratio in self.compress_ratio_set
         }
-        self.past_kv_lens = {
-            compress_ratio: torch.empty_like(
-                self.past_kv_lens_cuda[compress_ratio], device="cpu", pin_memory=prefer_pinned()
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
 
         # compressed_position_ids_cuda is the compressed position ids for the requests
         self.compressed_position_ids_cuda = {
@@ -302,14 +274,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 dtype=torch.int,
                 cache_name=f"compressed_position_ids_cuda_{compress_ratio}",
                 capture_graph=capture_graph,
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
-        self.compressed_position_ids = {
-            compress_ratio: torch.empty_like(
-                self.compressed_position_ids_cuda[compress_ratio],
-                device="cpu",
-                pin_memory=prefer_pinned(),
             )
             for compress_ratio in self.compress_ratio_set
         }
@@ -354,26 +318,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        # Block tables for cache buffers
-        self.cache_buffer_block_offsets = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
-                cache_name=f"cache_buffer_block_offsets_{compress_ratio}",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
-        self.host_cache_buffer_block_offsets = {
-            compress_ratio: torch.empty_like(
-                self.cache_buffer_block_offsets[compress_ratio],
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-            for compress_ratio in self.compress_ratio_set
-        }
-
         self.block_tables = {
             attention_type: self.get_empty(
                 self.cuda_graph_buffers,
@@ -416,45 +360,29 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cached_token_lens_cuda, device="cpu", pin_memory=prefer_pinned()
         )
 
+        # Cache buffer data pointers are constant after KV cache allocation,
+        # so compute them once during initialization instead of every prepare().
+        self._init_cache_buffer_data_pointers()
+
     def prepare_for_block_tables(self):
-        """
-        Prepare block tables for cache buffers.
-        """
-        for compress_ratio, attention_type in self.attention_type_set:
-            host_block_table = self.kv_cache_manager.get_batch_attn_offset(
-                request_ids=self.request_ids,
-                beam_width=1,
-                num_contexts=self.num_contexts,
-                num_seqs=self.num_seqs,
-                attn_type=attention_type,
-                compress_ratio=compress_ratio,
-            )
-            key = (compress_ratio, attention_type)
-            self.host_block_tables[key][: self.num_seqs] = host_block_table[: self.num_seqs]
-            self.block_tables[key][: self.num_seqs].copy_(
-                self.host_block_tables[key][: self.num_seqs], non_blocking=True
-            )
+        """Prepare block tables for all attention types.
 
-        # Build cache buffer block offsets for all compress_ratios
-        for compress_ratio in self.compress_ratio_set:
-            if compress_ratio == 1:
-                attn_type = MewtwoAttentionType.SWA
-            else:
-                attn_type = MewtwoAttentionType.COMPRESS
+        Delegates offset computation to MewtwoCacheManager.get_batch_block_offsets
+        (single get_copy_index call, deduplicated by pool), then copies to device.
+        """
+        num_seqs = self.num_seqs
+        offsets_map = self.kv_cache_manager.get_batch_block_offsets(
+            self.request_ids, self.num_contexts, self.attention_type_set
+        )
 
-            self.host_cache_buffer_block_offsets[compress_ratio][: self.num_seqs].copy_(
-                self.kv_cache_manager.get_batch_attn_offset(
-                    self.request_ids,
-                    beam_width=self.beam_width,
-                    num_contexts=self.num_contexts,
-                    num_seqs=self.num_seqs,
-                    attn_type=attn_type,
-                    compress_ratio=compress_ratio,
-                )
-            )
-            self.cache_buffer_block_offsets[compress_ratio][: self.num_seqs].copy_(
-                self.host_cache_buffer_block_offsets[compress_ratio][: self.num_seqs],
-                non_blocking=True,
+        # Phase 1: write host buffers.
+        for key, offsets in offsets_map.items():
+            self.host_block_tables[key][:num_seqs] = offsets[:num_seqs]
+
+        # Phase 2: batch H2D copies.
+        for key in self.attention_type_set:
+            self.block_tables[key][:num_seqs].copy_(
+                self.host_block_tables[key][:num_seqs], non_blocking=True
             )
 
     def prepare_for_mewtwo_indices(self, token_positions=None):
@@ -464,20 +392,17 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         if token_positions is None:
             # Initial prepare() path — build token_positions from CPU data.
+            num_tokens = self.num_tokens
             num_requests = self.num_seqs
-            cached_token_lens = self.cached_token_lens_cpu[:num_requests].to(
-                device, non_blocking=True
-            )
-            token_positions = torch.zeros(self.num_tokens, dtype=torch.int32, device=device)
-            token_idx = 0
-            for req_idx in range(num_requests):
-                seq_len = self.seq_lens[req_idx]
-                base_pos = cached_token_lens[req_idx]
-                token_positions[token_idx : token_idx + seq_len] = base_pos + torch.arange(
-                    seq_len, dtype=torch.int32, device=device
-                )
-                token_idx += seq_len
-            token_positions = token_positions[: self.num_tokens]
+
+            # cu_seq_lens_cuda must already be populated before this call
+            cu_seq_lens = self.cu_seq_lens_cuda[: num_requests + 1]
+            cached_tokens = self.cached_token_lens_cuda[:num_requests]
+
+            token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+            req_idx = torch.searchsorted(cu_seq_lens[1:].to(torch.int32), token_idx, right=True)
+            offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
+            token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
         self._prepare_mewtwo_indices_compiled(
             token_positions,
@@ -553,7 +478,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 raise ValueError(f"Unsupported compress_ratio: {compress_ratio}")
             sparse_mla_topk_lens_bufs[compress_ratio][:num_tokens] = total_count.to(torch.int32)
 
-    def prepare_for_cache_buffer_data_pointers(self):
+    def _init_cache_buffer_data_pointers(self):
         # If MTP is enabled, enlarge the compress ratios by max_draft_tokens - 1
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
@@ -596,8 +521,11 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cached_token_lens[:num_requests], non_blocking=True
         )
 
-        # Cache buffer data pointers
-        self.prepare_for_cache_buffer_data_pointers()
+        # Prepare cu_seq_lens early — needed by prepare_for_mewtwo_indices
+        self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
+        self.cu_seq_lens_cuda[: num_requests + 1].copy_(
+            self.cu_seq_lens[: num_requests + 1], non_blocking=True
+        )
 
         # For indices conversion
         self.prepare_for_indices_conversion()
@@ -618,104 +546,65 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if has_sparse_layers:
             MewtwoIndexer.prepare(metadata=self)
 
-        # Prepare buffers for the compressor
-        # prepare cu_seq_lens_cuda and cu_seq_lens
-        self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
-        self.cu_seq_lens_cuda[: num_requests + 1].copy_(
-            self.cu_seq_lens[: num_requests + 1], non_blocking=True
-        )
-
-        # Prepare num_total_compressed_tokens, cu_new_comp_kv_cuda/cu_new_comp_kv and,
-        # compressed_kv_lens_cuda/compressed_kv_lens
+        # --- Per-ratio metadata ---
+        # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
+        # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
         num_gen_tokens_per_seq = (
             num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
         )
         self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
-        for compress_ratio in self.compress_ratio_set:
-            num_comp_kv_lens = kv_lens[:num_requests] // compress_ratio
-            past_comp_kv_lens = cached_token_lens[:num_requests] // compress_ratio
-            new_comp_kv_lens = num_comp_kv_lens - past_comp_kv_lens
-            self.new_comp_kv_lens[compress_ratio][:num_requests] = new_comp_kv_lens
-            self.new_comp_kv_lens_cuda[compress_ratio][:num_requests].copy_(
-                self.new_comp_kv_lens[compress_ratio][:num_requests], non_blocking=True
-            )
-            self.cu_new_comp_kv[compress_ratio][1 : num_requests + 1] = new_comp_kv_lens.cumsum(0)
-            self.cu_new_comp_kv_cuda[compress_ratio][: num_requests + 1].copy_(
-                self.cu_new_comp_kv[compress_ratio][: num_requests + 1], non_blocking=True
-            )
-            self.compressed_kv_lens[compress_ratio][:num_requests] = num_comp_kv_lens
-            self.compressed_kv_lens_cuda[compress_ratio][:num_requests].copy_(
-                self.compressed_kv_lens[compress_ratio][:num_requests], non_blocking=True
-            )
-            num_ctx_compressed_tokens = new_comp_kv_lens[: self.num_contexts].sum().item()
-            # To support CUDA graph, generation requests should use a constant number of compressed tokens.
-            num_gen_compressed_tokens = self.num_generations * (
-                (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-            )
-            self.num_total_compressed_tokens[compress_ratio] = (
-                num_ctx_compressed_tokens + num_gen_compressed_tokens
-            )
-            max_ctx_comp_kv_lens, max_gen_comp_kv_lens = 0, 0
-            if self.num_contexts > 0:
-                max_ctx_comp_kv_lens = new_comp_kv_lens[: self.num_contexts].max().item()
-            if self.num_generations > 0:
-                max_gen_comp_kv_lens = (
-                    new_comp_kv_lens[self.num_contexts : self.num_seqs].max().item()
-                )
-            max_comp_kv_lens = max(max_ctx_comp_kv_lens, max_gen_comp_kv_lens)
-            self.max_num_compressed_tokens[compress_ratio] = (
-                max_ctx_comp_kv_lens,
-                max_gen_comp_kv_lens,
-                max_comp_kv_lens,
-            )
-
-        # Prepare past_kv_lens_cuda/past_kv_lens
-        for compress_ratio in self.compress_ratio_set:
-            self.past_kv_lens[compress_ratio][:num_requests] = (
-                cached_token_lens[:num_requests] // compress_ratio
-            )
-            self.past_kv_lens_cuda[compress_ratio][:num_requests].copy_(
-                self.past_kv_lens[compress_ratio][:num_requests], non_blocking=True
-            )
-
-        # Prepare compressed_position_ids_cuda/compressed_position_ids
-        for compress_ratio in self.compress_ratio_set:
-            position_ids = []
-            for i in range(self.num_contexts):
-                past_kv_lens = self.past_kv_lens[compress_ratio][i].item()
-                kv_lens = self.compressed_kv_lens[compress_ratio][i].item()
-                position_ids.extend(list(range(past_kv_lens, kv_lens)))
-            for i in range(self.num_generations):
-                # Use a constant number of new compressed KV tokens for each generation request
-                # to support CUDA graph.
-                past_kv_lens = self.past_kv_lens[compress_ratio][self.num_contexts + i].item()
-                new_kv_lens = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-                position_ids.extend(list(range(past_kv_lens, past_kv_lens + new_kv_lens)))
-            compressed_num_tokens = len(position_ids)
-            self.compressed_position_ids[compress_ratio][:compressed_num_tokens] = (
-                torch.tensor(position_ids, dtype=torch.int) * compress_ratio
-            )
-            self.compressed_position_ids_cuda[compress_ratio][:compressed_num_tokens].copy_(
-                self.compressed_position_ids[compress_ratio][:compressed_num_tokens],
-                non_blocking=True,
-            )
-
-    def on_update_kv_lens(self):
-        """Recompute kv-lens-dependent mewtwo metadata on device."""
-        super().on_update_kv_lens()
-
-        batch_size = self.num_seqs
         num_contexts = self.num_contexts
         num_generations = self.num_generations
-        num_tokens = self.num_tokens
-        kv_lens = self.kv_lens_cuda[:batch_size]
-        seq_lens = self._seq_lens_cuda[:batch_size]
-        cached_tokens = kv_lens - seq_lens
+        kv_lens_slice = kv_lens[:num_requests]
+        cached_slice = cached_token_lens[:num_requests]
 
-        num_gen_tokens = num_tokens - self.num_ctx_tokens
-        self.num_gen_tokens_per_seq = (
-            num_gen_tokens // num_generations if num_generations > 0 else 0
+        if num_contexts > 0:
+            # Prefill path: need per-request tensor ops for ctx scalar metadata.
+            for compress_ratio in self.compress_ratio_set:
+                new_comp_kv_lens = kv_lens_slice // compress_ratio - cached_slice // compress_ratio
+                cu_new = new_comp_kv_lens.cumsum(0)
+                num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
+                num_gen_compressed_tokens = num_generations * (
+                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+                )
+                self.num_total_compressed_tokens[compress_ratio] = (
+                    num_ctx_compressed_tokens + num_gen_compressed_tokens
+                )
+                self.max_ctx_compressed_tokens[compress_ratio] = (
+                    new_comp_kv_lens[:num_contexts].max().item()
+                )
+        else:
+            # Decode-only: scalars depend only on num_generations and
+            # num_gen_tokens_per_seq, no per-request tensor ops needed.
+            for compress_ratio in self.compress_ratio_set:
+                self.num_total_compressed_tokens[compress_ratio] = num_generations * (
+                    (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+                )
+                self.max_ctx_compressed_tokens[compress_ratio] = 0
+
+        # 2) CUDA-side: fill *_cuda buffers on device.
+        kv_lens_cuda = (
+            self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
         )
+        cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
+        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda)
+
+    def prepare_compressed_kv_metadata(
+        self,
+        kv_lens: torch.Tensor,
+        cached_tokens: torch.Tensor,
+    ):
+        """Compute per-ratio compressed KV lens and position IDs on device.
+
+        Shared by prepare() and on_update_kv_lens() to avoid duplicated logic.
+
+        Args:
+            kv_lens: Total KV lengths per request (device tensor, [batch_size]).
+            cached_tokens: Cached token counts per request (device tensor, [batch_size]).
+        """
+        batch_size = kv_lens.shape[0]
+        num_contexts = self.num_contexts
+        num_generations = self.num_generations
 
         self._compute_per_ratio_kv_lens(
             kv_lens,
@@ -728,15 +617,6 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self._compress_ratios_sorted,
         )
 
-        token_positions = self._compute_token_positions(
-            seq_lens,
-            cached_tokens,
-            batch_size,
-            num_tokens,
-            self.cu_seq_lens_cuda,
-            self.req_idx_per_token,
-        )
-
         if num_contexts > 0:
             self._compute_ctx_compressed_position_ids(
                 self.past_kv_lens_cuda,
@@ -747,15 +627,50 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
+            # Extract output_offset as Python int per ratio to avoid
+            # tensor-scalar slice inside compiled function.
+            # For decode-only batches (num_contexts == 0), offset is 0.
+            gen_output_offsets = {
+                r: self.cu_new_comp_kv_cuda[r][num_contexts].item()
+                if num_contexts > 0
+                else 0
+                for r in self._compress_ratios_sorted
+            }
             self._compute_gen_compressed_position_ids(
                 self.past_kv_lens_cuda,
-                self.cu_new_comp_kv_cuda,
                 self.compressed_position_ids_cuda,
-                batch_size,
+                num_contexts,
                 num_generations,
                 self.num_gen_tokens_per_seq,
                 self._compress_ratios_sorted,
+                gen_output_offsets,
             )
+
+    def on_update_kv_lens(self):
+        """Recompute kv-lens-dependent mewtwo metadata on device."""
+        super().on_update_kv_lens()
+
+        batch_size = self.num_seqs
+        num_tokens = self.num_tokens
+        kv_lens = self.kv_lens_cuda[:batch_size]
+        seq_lens = self._seq_lens_cuda[:batch_size]
+        cached_tokens = kv_lens - seq_lens
+
+        num_gen_tokens = num_tokens - self.num_ctx_tokens
+        self.num_gen_tokens_per_seq = (
+            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+        )
+
+        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+
+        token_positions = self._compute_token_positions(
+            seq_lens,
+            cached_tokens,
+            batch_size,
+            num_tokens,
+            self.cu_seq_lens_cuda,
+            self.req_idx_per_token,
+        )
 
         self.prepare_for_mewtwo_indices(token_positions)
 
@@ -817,36 +732,34 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         return base_pos + offsets
 
     @staticmethod
-    @maybe_compile(options={"max-autotune": True})
+    @maybe_compile(dynamic=True, options={"max-autotune": True})
     def _compute_gen_compressed_position_ids(
         past_kv_lens_bufs: Dict[int, torch.Tensor],
-        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
-        batch_size: int,
+        num_contexts: int,
         num_generations: int,
         num_gen_tokens_per_seq: int,
         compress_ratios: list,
+        gen_output_offsets: Dict[int, int],
     ):
         """Generation compressed position IDs.
 
-        gen_start = batch_size - num_generations avoids num_contexts as a
-        compile-time constant. All int args are stable during decode."""
+        gen_output_offsets: dict mapping compress_ratio -> Python int offset,
+        pre-extracted by the caller to avoid tensor-scalar .item() inside
+        compiled code.  0 for decode-only batches."""
         device = past_kv_lens_bufs[compress_ratios[0]].device
-        gen_start = batch_size - num_generations
+        batch_size = num_contexts + num_generations
         for compress_ratio in compress_ratios:
-            gen_past = past_kv_lens_bufs[compress_ratio][gen_start:batch_size]
+            gen_past = past_kv_lens_bufs[compress_ratio][num_contexts:batch_size]
             new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
             gen_offsets = torch.arange(new_gen_comp, dtype=torch.int32, device=device)
             gen_pos = gen_past.unsqueeze(1) + gen_offsets.unsqueeze(0)
             gen_comp = num_generations * new_gen_comp
             result = (gen_pos.reshape(-1) * compress_ratio).to(torch.int)
-            if gen_start == 0:
-                compressed_position_ids_bufs[compress_ratio][:gen_comp] = result
-            else:
-                output_offset = cu_new_comp_kv_bufs[compress_ratio][gen_start]
-                compressed_position_ids_bufs[compress_ratio][
-                    output_offset : output_offset + gen_comp
-                ] = result
+            output_offset = gen_output_offsets[compress_ratio]
+            compressed_position_ids_bufs[compress_ratio][
+                output_offset : output_offset + gen_comp
+            ] = result
 
     @staticmethod
     def _compute_ctx_compressed_position_ids(
@@ -1096,12 +1009,14 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         # Use global req_id directly
         req_id = metadata.req_idx_per_token[start_idx:end_idx]
         swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
-        block_table_swa = metadata.cache_buffer_block_offsets[1]
+        block_table_swa = metadata.block_tables[(1, MewtwoAttentionType.SWA)]
 
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
-            block_table_compressed = metadata.cache_buffer_block_offsets[self.compress_ratio]
+            block_table_compressed = metadata.block_tables[
+                (self.compress_ratio, MewtwoAttentionType.COMPRESS)
+            ]
             if self.compress_ratio == 4:
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
