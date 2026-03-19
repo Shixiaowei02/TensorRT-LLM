@@ -2005,19 +2005,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._compute_flash_mla_metadata(metadata)
             metadata._flash_mla_metadata_valid = True
 
-        # TODO(yuhangh): need to refactor this part of code.
-        is_variable_sparse_mla = (self.is_mla_enable
-                                  and self.sparse_attention_config is not None
-                                  and self.wrapper.rope_append is False)
-        if is_variable_sparse_mla and sparse_attn_indices is not None:
-            if sparse_lens is None:
-                sparse_lens = (sparse_attn_indices >= 0).sum(dim=-1,
-                                                             dtype=torch.int32)
-            if sparse_lens.dim() != 1:
-                raise ValueError(
-                    "sparse_lens must be a 1D tensor with shape [num_tokens]")
-            sparse_mla_topk_lens = sparse_lens
-
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,

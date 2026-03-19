@@ -178,7 +178,9 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     scheduled_batch = ScheduledRequests()
     for req in requests:
         scheduled_batch.append_context_request(req)
-    cache_manager.prepare_resources(scheduled_batch)
+    for req in requests:
+        cache_manager.prepare_context(req)
+        cache_manager.resize_context(req, req.context_chunk_size)
 
     # Get pointers and offsets
     swa_pool_base_ptr = cache_manager.swa_pool_ptr

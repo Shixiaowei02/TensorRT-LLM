@@ -1593,11 +1593,12 @@ class Indexer(nn.Module):
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         # Only support compression ratio of 4 and 1 for now
         compress_ratio = 4 if 4 in metadata.compress_ratios else 1
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        # For MewtwoCacheManager, the indexer tokens per block is the compressed block size
         if hasattr(kv_cache_manager, 'compressed_block_sizes'):
-            indexer_tokens_per_block = kv_cache_manager.compressed_block_sizes[
-                self.layer_idx]
+            indexer_tokens_per_block = tokens_per_block // compress_ratio
         else:
-            indexer_tokens_per_block = kv_cache_manager.tokens_per_block
+            indexer_tokens_per_block = tokens_per_block
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,

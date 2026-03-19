@@ -826,6 +826,8 @@ def init_layers(mla_layers: List[MLA], sparse_attn_algo: str,
                                                         std=nn_init_std)
                 mla_layer.mqa.indexer.weights_proj.weight.normal_(
                     mean=0.0, std=nn_init_std)
+                # Build fused wk+weights_proj weight after random init
+                mla_layer.mqa.indexer.post_load_weights()
     elif sparse_attn_algo == "mewtwo":
         nn_init_std = 0.02
         with torch.no_grad():
@@ -1117,7 +1119,6 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
         hidden_states,
         attn_metadata,
         position_ids,
-        indexer_k=mla.mqa.indexer.wk(hidden_states),  # indexer_k
     )
 
     # Validate indexer output against expected causal indices (since seq_len < topk=2048)

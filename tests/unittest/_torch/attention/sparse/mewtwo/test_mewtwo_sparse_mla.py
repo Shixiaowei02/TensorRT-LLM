@@ -551,7 +551,9 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
     scheduled_batch = ScheduledRequests()
     for req in requests:
         scheduled_batch.append_context_request(req)
-    cache_manager.prepare_resources(scheduled_batch)
+    for req in requests:
+        cache_manager.prepare_context(req)
+        cache_manager.resize_context(req, req.context_chunk_size)
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
@@ -1062,7 +1064,9 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
     scheduled_batch = ScheduledRequests()
     for req in requests:
         scheduled_batch.append_context_request(req)
-    cache_manager.prepare_resources(scheduled_batch)
+    for req in requests:
+        cache_manager.prepare_context(req)
+        cache_manager.resize_context(req, req.context_chunk_size)
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     rope_config = RopeConfig(

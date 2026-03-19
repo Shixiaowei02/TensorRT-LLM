@@ -955,11 +955,17 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    mla_layer.forward_impl(position_ids,
-                           hidden_states,
-                           metadata,
-                           output=output,
-                           latent_cache_gen=latent_cache_gen)
+    if mla_layer.is_mewtwo:
+        mla_layer.forward_impl_with_mewtwo(position_ids,
+                                           hidden_states,
+                                           metadata,
+                                           output=output)
+    else:
+        mla_layer.forward_impl(position_ids,
+                               hidden_states,
+                               metadata,
+                               output=output,
+                               latent_cache_gen=latent_cache_gen)
 
 
 @torch.library.custom_op("trtllm::mla_dsa_proj", mutates_args=())

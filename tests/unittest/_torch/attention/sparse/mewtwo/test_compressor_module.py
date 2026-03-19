@@ -854,7 +854,11 @@ class CompressorWrapper:
         for req in context_requests:
             scheduled_batch.append_context_request(req)
         scheduled_batch.generation_requests = generation_requests
-        self.cache_manager.prepare_resources(scheduled_batch)
+        for req in context_requests:
+            self.cache_manager.prepare_context(req)
+            self.cache_manager.resize_context(req, req.context_chunk_size)
+        for req in generation_requests:
+            self.cache_manager.try_allocate_generation(req)
 
         return requests, scheduled_batch
 

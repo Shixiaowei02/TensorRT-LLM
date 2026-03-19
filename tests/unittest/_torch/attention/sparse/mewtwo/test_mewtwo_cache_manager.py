@@ -690,7 +690,9 @@ class TestMewtwoCacheManager:
         # Simulate the prefill phrase
         scheduled_batch = ScheduledRequests()
         scheduled_batch.context_requests_last_chunk = requests
-        cache_manager.prepare_resources(scheduled_batch)
+        for req in requests:
+            cache_manager.prepare_context(req)
+            cache_manager.resize_context(req, req.context_chunk_size)
 
         # Write context to cache
         for req in requests:
@@ -727,7 +729,8 @@ class TestMewtwoCacheManager:
             seq_lens = [prompt_len + i + 1 for prompt_len in prompt_lens]
             scheduled_batch = ScheduledRequests()
             scheduled_batch.generation_requests = requests
-            cache_manager.prepare_resources(scheduled_batch)
+            for req in requests:
+                cache_manager.try_allocate_generation(req)
 
             # Write new token to cache
             for req in requests:
