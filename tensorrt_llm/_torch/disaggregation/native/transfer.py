@@ -22,6 +22,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
+    MemoryDesc,
     MemoryDescs,
     MemoryType,
     RegMemoryDescs,
@@ -179,7 +180,6 @@ class Sender(SenderBase):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
-        # unique_rid -> instance_rank -> RecvReqInfo
         self._peer_requests: dict = {}
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
@@ -310,13 +310,15 @@ class Sender(SenderBase):
             src_dev, dst_dev, mem_type = device_id, write_meta.dst_device_id, MemoryType.VRAM
 
         src_list = [
-            (ptr, size, src_dev) for ptr, size in zip(write_meta.src_ptrs, write_meta.sizes)
+            MemoryDesc(ptr, size, src_dev)
+            for ptr, size in zip(write_meta.src_ptrs, write_meta.sizes)
         ]
         dst_list = [
-            (ptr, size, dst_dev) for ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes)
+            MemoryDesc(ptr, size, dst_dev)
+            for ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes)
         ]
         return TransferRequest(
-            TransferOp.WRITE,
+            TransferOp.WRITE,  # type: ignore[arg-type]
             MemoryDescs(mem_type, src_list),
             MemoryDescs(mem_type, dst_list),
             write_meta.peer_name,
@@ -477,12 +479,10 @@ class Sender(SenderBase):
             peer_extractor = self._registrar.peer_extractor(
                 peer_ri.instance_name, peer_ri.instance_rank
             )
-            # Get pool mapping: (self_lg, self_pi) -> (peer_lg, peer_pi)
             pool_mapping = self._registrar.get_pool_mapping(peer_ri)
             dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
             src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-            # Aggregate fragments from all matching pools
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
@@ -680,7 +680,6 @@ class Sender(SenderBase):
         return False
 
     def _has_all_peer_req_infos(self, req_info: RecvReqInfo) -> bool:
-        """Checks if all peer info for the request are ready."""
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
         return self._is_req_ready(req_info.unique_rid, expected_transfers)
@@ -696,7 +695,6 @@ class Sender(SenderBase):
             return
         self._shutdown = True
 
-        # Stop all worker threads by sending None to each queue
         for q in self._send_task_queues:
             q.put(None)
         for t in self._worker_threads:
@@ -1357,13 +1355,17 @@ def _create_nixl_agent(name: str) -> NixlTransferAgent:
     return NixlTransferAgent(name, True, num_threads=num_threads, **kwargs)
 
 
-def _make_aux_buffer(kvm: KVCacheManager, max_slots: int) -> Optional[AuxBuffer]:
+def _make_aux_buffer(
+    kvm: KVCacheManager, max_slots: int, max_draft_len: Optional[int] = None
+) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
+    if max_draft_len is None:
+        max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
     return AuxBuffer(
         max_slot_num=max_slots,
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
-        max_draft_len=max(0, int(getattr(kvm, "max_draft_len", 0))),
+        max_draft_len=max_draft_len,
         device="cpu",
     )
 
@@ -1390,12 +1392,15 @@ class TransferWorkerConfig:
     device_id: int
     instance_name: str
     max_concurrent_sessions: int = 0
+    max_draft_len: Optional[int] = None
 
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         kvm = config.kv_cache_manager
-        self._aux_buffer = _make_aux_buffer(kvm, config.max_concurrent_sessions)
+        self._aux_buffer = _make_aux_buffer(
+            kvm, config.max_concurrent_sessions, config.max_draft_len
+        )
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,
             kvm,
@@ -1411,9 +1416,6 @@ class TransferWorker:
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
     def create_tx_session(self, request: LlmRequest) -> TxSession:
-        """
-        Create a txSession for the request.
-        """
         params = request.py_disaggregated_params
         assert params is not None
         return TxSession(
@@ -1424,9 +1426,6 @@ class TransferWorker:
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
-        """
-        Create a rxSession for the request.
-        """
         params = request.py_disaggregated_params
         assert params is not None
         return RxSession(

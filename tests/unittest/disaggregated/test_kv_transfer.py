@@ -15,8 +15,7 @@ import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
@@ -93,10 +92,6 @@ def create_transfer_worker_setup(
                 )
             )
 
-    meta_max_batch_size = 32
-    beam_width = 1
-    max_draft_len = 4
-
     ctx_instance_num = ctx_tp * ctx_pp
     gen_instance_num = gen_tp * gen_pp
     num_layers = 4
@@ -120,7 +115,6 @@ def create_transfer_worker_setup(
     request_len = 16
 
     for i in range(ctx_instance_num):
-        ctx_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
@@ -238,11 +232,13 @@ def create_transfer_worker_setup(
         ctx_kv_cache_managers.append(ctx_kv_cache_manager)
         ctx_transfer_workers.append(
             TransferWorker(
-                kv_cache_manager=ctx_kv_cache_manager,
-                mapping=ctx_mappings[i],
-                device_id=device_id,
-                instance_name=ctx_instance_name,
-                aux_buffer=ctx_aux_buffer,
+                TransferWorkerConfig(
+                    kv_cache_manager=ctx_kv_cache_manager,
+                    device_id=device_id,
+                    instance_name=ctx_instance_name,
+                    max_concurrent_sessions=max_batch_size * 2,
+                    max_draft_len=4,
+                )
             )
         )
 
@@ -252,9 +248,7 @@ def create_transfer_worker_setup(
     ]
     ctx_layer_num_per_pp = []
     for pp_rank in range(ctx_pp):
-        ctx_layer_num_per_pp.append(
-            len(ctx_transfer_workers[pp_rank * ctx_tp]._kv_cache_manager.pp_layers)
-        )
+        ctx_layer_num_per_pp.append(len(ctx_kv_cache_managers[pp_rank * ctx_tp].pp_layers))
 
     for ctx_transfer_worker in ctx_transfer_workers:
         ctx_transfer_worker.populate_instance_and_rank_info(
@@ -264,7 +258,6 @@ def create_transfer_worker_setup(
     gen_transfer_workers = []
     gen_kv_cache_managers = []
     for i in range(gen_instance_num):
-        gen_aux_buffer = AuxBuffer(meta_max_batch_size, beam_width, max_draft_len)
         cache_type = (
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             if not is_mla
@@ -355,11 +348,13 @@ def create_transfer_worker_setup(
         gen_kv_cache_managers.append(gen_kv_cache_manager)
         gen_transfer_workers.append(
             TransferWorker(
-                kv_cache_manager=gen_kv_cache_manager,
-                mapping=gen_mappings[i],
-                device_id=device_id,
-                instance_name=gen_instance_name,
-                aux_buffer=gen_aux_buffer,
+                TransferWorkerConfig(
+                    kv_cache_manager=gen_kv_cache_manager,
+                    device_id=device_id,
+                    instance_name=gen_instance_name,
+                    max_concurrent_sessions=max_batch_size * 2,
+                    max_draft_len=4,
+                )
             )
         )
     _ = gen_transfer_workers[0]._rank_info_server.endpoint  # noqa: F841
@@ -368,9 +363,7 @@ def create_transfer_worker_setup(
     ]
     gen_layer_num_per_pp = []
     for pp_rank in range(gen_pp):
-        gen_layer_num_per_pp.append(
-            len(gen_transfer_workers[pp_rank * gen_tp]._kv_cache_manager.pp_layers)
-        )
+        gen_layer_num_per_pp.append(len(gen_kv_cache_managers[pp_rank * gen_tp].pp_layers))
     for gen_transfer_worker in gen_transfer_workers:
         gen_transfer_worker.populate_instance_and_rank_info(
             endpoints=gen_endpoints, layer_num_per_pp=gen_layer_num_per_pp
@@ -817,7 +810,6 @@ def add_and_verify_request(
     if not send_first:
         for pp_rank in range(gen_pp):
             for tp_rank in range(valid_gen_tp):
-                transfer_worker = valid_gen_transfer_workers[pp_rank * valid_gen_tp + tp_rank]
                 recv_session = receiver_sessions[pp_rank * valid_gen_tp + tp_rank]
                 recv_session.unpack_aux(gen_request)
 
@@ -828,10 +820,10 @@ def add_and_verify_request(
                     11 + ctx_request_id,
                     12 + ctx_request_id,
                 ]
-    for transfer_worker, receiver_session in zip(valid_gen_transfer_workers, receiver_sessions):
-        transfer_worker.clear_session(receiver_session)
-    for transfer_worker, sender_session in zip(valid_ctx_transfer_workers, sender_sessions):
-        transfer_worker.clear_session(sender_session)
+    for receiver_session in receiver_sessions:
+        receiver_session.close()
+    for sender_session in sender_sessions:
+        sender_session.close()
 
     # V2: Close kv_caches to release slots
     if use_v2:
