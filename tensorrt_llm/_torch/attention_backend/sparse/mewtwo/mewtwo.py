@@ -608,6 +608,15 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda)
 
+        self._compute_compressed_mask(
+            self.new_comp_kv_lens_cuda,
+            self.cu_new_comp_kv_cuda,
+            self.compressed_mask_cuda,
+            num_requests,
+            self.num_total_compressed_tokens,
+            self._compress_ratios_sorted,
+        )
+
     def prepare_compressed_kv_metadata(
         self,
         kv_lens: torch.Tensor,

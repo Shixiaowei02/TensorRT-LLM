@@ -188,7 +188,10 @@ def paged_kv_compress_cutile_kernel(
                         )
                         k = ct.astype(
                             ct.gather(
-                                paged_kv, (phys_kv, blk_off, state_offsets), padding_value=0, latency=2
+                                paged_kv,
+                                (phys_kv, blk_off, state_offsets),
+                                padding_value=0,
+                                latency=2,
                             ),
                             ct.float32,
                         )
@@ -634,6 +637,66 @@ def prefill_reduction_cutile_kernel(
                 s = s + a
                 k = k * head_mask_kv
                 s = s + head_mask_score
+
+                new_max = ct.maximum(running_max, s)
+                scale = ct.exp(running_max - new_max)
+                term = ct.exp(s - new_max)
+                running_sum = running_sum * scale + term
+                running_wsum = running_wsum * scale + k * term
+                running_max = new_max
+        if sp >= COMPRESS_RATIO:
+            # Chunked prefill: output[0]'s prev-segment comes from paged state.
+            # Positions [sp - COMPRESS_RATIO : sp] were written by a prior decode/prefill step.
+            # paged_score already has APE fused; do NOT add ape again.
+            # For local_output_idx > 0, zero out the contribution via ct.where.
+            for r in range(COMPRESS_RATIO):
+                read_pos = sp - COMPRESS_RATIO + r
+                log_blk = read_pos // page_size
+                blk_off = read_pos % page_size
+                phys_kv = ct.gather(
+                    block_table_kv,
+                    (batch_idx, log_blk),
+                    padding_value=0,
+                    latency=1,
+                )
+                phys_sc = ct.gather(
+                    block_table_score,
+                    (batch_idx, log_blk),
+                    padding_value=0,
+                    latency=1,
+                )
+                k = ct.astype(
+                    ct.gather(
+                        paged_kv,
+                        (phys_kv, blk_off, head_offset + head_offsets),
+                        padding_value=0,
+                        latency=2,
+                    ),
+                    ct.float32,
+                )
+                s = ct.astype(
+                    ct.gather(
+                        paged_score,
+                        (phys_sc, blk_off, head_offset + head_offsets),
+                        padding_value=0,
+                        latency=2,
+                    ),
+                    ct.float32,
+                )
+                # APE already fused in paged_score; apply masks only
+                k = k * head_mask_kv
+                s = s + head_mask_score
+                # Zero out contribution for local_output_idx > 0 (only output[0] needs paged prev)
+                k = ct.where(
+                    local_output_idx > 0,
+                    ct.full((BLOCK_SIZE,), 0.0, dtype=ct.float32),
+                    k,
+                )
+                s = ct.where(
+                    local_output_idx > 0,
+                    ct.full((BLOCK_SIZE,), -math.inf, dtype=ct.float32),
+                    s,
+                )
 
                 new_max = ct.maximum(running_max, s)
                 scale = ct.exp(running_max - new_max)
