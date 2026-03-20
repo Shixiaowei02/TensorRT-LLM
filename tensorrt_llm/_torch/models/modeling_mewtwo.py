@@ -28,7 +28,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -1312,10 +1312,9 @@ class MewtwoDecoderLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
         post_mix, res_mix, hidden_states = self.hc_ffn.pre_mapping(hidden_states)
-        hidden_states, _ = self.forward_MoE(
+        hidden_states = self.forward_MoE(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            residual=torch.zeros_like(hidden_states),
             spec_metadata=spec_metadata,
             input_ids=input_ids,
         )
@@ -1328,10 +1327,9 @@ class MewtwoDecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: MewtwoTrtllmAttentionMetadata,
-        residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, input_ids):
             return self.mlp(
                 hidden_states,
@@ -1347,21 +1345,21 @@ class MewtwoDecoderLayer(DecoderLayer):
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
-            # moe_backend can be either CUTLASS or TRTLLM here
-            # TODO: unify the two min-latency MoE backends by enabling quant fusion
-            hidden_states, residual = self.allreduce(
+            # In Mewtwo the external residual connection is handled by mHC
+            # (hc_ffn.post_mapping), so there is no residual to add here.
+            # Use fused allreduce + RMSNorm (no residual addition).
+            hidden_states = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
+                    fusion_op=AllReduceFusionOp.RMS_NORM,
                     norm_weight=self.post_attention_layernorm.weight,
                     eps=self.post_attention_layernorm.variance_epsilon,
                     trigger_completion_at_end=False,
                 ),
             )
         else:
-            # No fusion
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            # No fusion: just normalize.
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
         do_finalize = self.mapping.is_multi_node() or (
@@ -1380,11 +1378,11 @@ class MewtwoDecoderLayer(DecoderLayer):
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                hidden_states, residual = self.allreduce(
+                # Fused allreduce + RMSNorm, no residual needed (mHC handles it).
+                hidden_states = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
+                        fusion_op=AllReduceFusionOp.RMS_NORM,
                         norm_weight=self.next_layer_layernorm.weight,
                         eps=self.next_layer_layernorm.variance_epsilon,
                         trigger_completion_at_end=False,
@@ -1402,21 +1400,21 @@ class MewtwoDecoderLayer(DecoderLayer):
                     expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
                     expert_scale_factor=expert_scale_factor,
                     shared_expert_output=shared_output,
-                    residual=residual,
+                    residual=None,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
                     is_cutlass_min_latency=False,
                 )
-                hidden_states, residual = self.moe_allreduce(
+                (hidden_states,) = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params
                 )
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
-                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
             if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
+                hidden_states = self.next_layer_layernorm(hidden_states)
 
-        return hidden_states, residual
+        return hidden_states
 
 
 class MewtwoMTP(MewtwoDecoderLayer):
