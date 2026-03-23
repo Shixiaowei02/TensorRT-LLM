@@ -12,7 +12,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
@@ -32,6 +31,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
+
+from .kernel import triton_convert_req_index_to_global_index
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -1123,15 +1124,28 @@ class IndexerParams:
     num_past_tokens: List[int]
     seq_lens: torch.Tensor
 
+    def __post_init__(self):
+        # Pre-compute frequently used tensors once instead of on every property access
+        num_past_tokens_tensor = torch.tensor(self.num_past_tokens,
+                                              dtype=torch.int32)
+        self._num_past_tokens_tensor = num_past_tokens_tensor
+        compress_ratio = self.compress_ratio
+        self._cached_kv_tokens = num_past_tokens_tensor // compress_ratio
+        self._all_kv_tokens = (self.seq_lens +
+                               num_past_tokens_tensor) // compress_ratio
+        self._new_kv_tokens = self._all_kv_tokens - self._cached_kv_tokens
+        self._kv_lens = self._all_kv_tokens
+        self._scale_size = self.head_dim // self.quant_block_size * 4
+        self._block_stride = self.tokens_per_block * (self.head_dim +
+                                                      self._scale_size)
+
     @property
     def batch_size(self):
         return len(self.request_ids)
 
     @property
     def kv_lens(self):
-        num_past_tokens_tensor = torch.tensor(self.num_past_tokens,
-                                              dtype=torch.int32)
-        return (num_past_tokens_tensor + self.seq_lens) // self.compress_ratio
+        return self._kv_lens
 
     @property
     def total_tokens(self):
@@ -1139,29 +1153,23 @@ class IndexerParams:
 
     @property
     def cached_kv_tokens(self):
-        cached_kv_tokens_list = [
-            item // self.compress_ratio for item in self.num_past_tokens
-        ]
-        return torch.tensor(cached_kv_tokens_list, dtype=torch.int32)
+        return self._cached_kv_tokens
 
     @property
     def all_kv_tokens(self):
-        num_past_tokens_tensor = torch.tensor(self.num_past_tokens,
-                                              dtype=torch.int32)
-        return (self.seq_lens + num_past_tokens_tensor) // self.compress_ratio
+        return self._all_kv_tokens
 
     @property
     def new_kv_tokens(self):
-        return self.all_kv_tokens - self.cached_kv_tokens
+        return self._new_kv_tokens
 
     @property
     def scale_size(self):
-        return self.head_dim // self.quant_block_size * 4  # float32 = 4 bytes
+        return self._scale_size
 
     @property
     def block_stride(self):
-        return self.tokens_per_block * (self.head_dim + self.scale_size
-                                        )  # Bytes per block
+        return self._block_stride
 
 
 class Indexer(nn.Module):
@@ -1385,17 +1393,19 @@ class Indexer(nn.Module):
         head_dim = indexer_params.head_dim
         scale_size = indexer_params.scale_size
         block_stride = indexer_params.block_stride
-        total_new_kv_tokens = indexer_params.new_kv_tokens.sum().item()
+        new_kv_tokens = indexer_params.new_kv_tokens
+        total_new_kv_tokens = new_kv_tokens.sum().item()
 
-        # Compute global positions for all kv tokens in the batch
+        # Compute global positions for all kv tokens in the batch (fully vectorized)
         req_indices = torch.repeat_interleave(
             torch.arange(batch_size, dtype=torch.int64, device='cpu'),
-            indexer_params.new_kv_tokens)
-        token_offsets = torch.cat([
-            torch.arange(indexer_params.new_kv_tokens[i],
-                         dtype=torch.int64,
-                         device='cpu') for i in range(batch_size)
-        ])
+            new_kv_tokens)
+        # Vectorized token_offsets: arange(total) - cumulative start per request
+        cu_new_kv = torch.zeros(batch_size + 1, dtype=torch.int64, device='cpu')
+        cu_new_kv[1:] = new_kv_tokens.to(torch.int64).cumsum(0)
+        token_offsets = (
+            torch.arange(total_new_kv_tokens, dtype=torch.int64, device='cpu') -
+            cu_new_kv[:-1].repeat_interleave(new_kv_tokens))
         global_positions = indexer_params.cached_kv_tokens[
             req_indices] + token_offsets
 
@@ -1494,11 +1504,13 @@ class Indexer(nn.Module):
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
                 total_kv_per_request)
 
-            kv_positions = torch.cat([
-                torch.arange(total_kv_per_request[i].item(),
-                             dtype=torch.int64,
-                             device='cpu') for i in range(num_contexts)
-            ])
+            cu_kv = torch.zeros(num_contexts + 1,
+                                dtype=torch.int64,
+                                device='cpu')
+            cu_kv[1:] = total_kv_per_request.to(torch.int64).cumsum(0)
+            kv_positions = (
+                torch.arange(total_kv_len, dtype=torch.int64, device='cpu') -
+                cu_kv[:-1].repeat_interleave(total_kv_per_request))
 
             block_indices_in_seq = kv_positions // tokens_per_block
             pos_in_blocks = kv_positions % tokens_per_block
@@ -1626,9 +1638,8 @@ class Indexer(nn.Module):
             # cu_seqlen_ks[i]: start index in global KV for query token i
             # cu_seqlen_ke[i]: end index (exclusive) in global KV for query token i
             host_seq_lens = seq_lens[:num_contexts]
-            host_num_past_tokens = torch.tensor(num_past_tokens[:num_contexts],
-                                                dtype=torch.int32,
-                                                device='cpu')
+            host_num_past_tokens = indexer_params._num_past_tokens_tensor[:
+                                                                          num_contexts]
             host_kv_lens = indexer_params.kv_lens[:num_contexts]
             host_cu_seqlen_ks, host_cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
                 host_seq_lens, num_contexts, num_ctx_tokens,

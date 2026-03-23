@@ -383,6 +383,29 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # so compute them once during initialization instead of every prepare().
         self._init_cache_buffer_data_pointers()
 
+    def prepare_for_indexer_k_cache(self):
+        """Optimized: bulk tensor copy instead of per-row Python loop.
+
+        Note: must use num_contexts=0 for get_batch_attn_offset because the
+        indexer k cache always uses generation-style copy indices regardless
+        of request type.
+        """
+        num_seqs = self.num_seqs
+        offsets = self.kv_cache_manager.get_batch_attn_offset(
+            self.request_ids,
+            1,  # beam_width
+            0,  # num_contexts=0 (indexer always uses gen-style copy index)
+            num_seqs,
+            MewtwoAttentionType.INDEXER_COMPRESS,
+            MEWTWO_SPARSE_RATIO,
+        )
+        num_cols = offsets.shape[1]
+        self.host_indexer_k_cache_block_offsets[:num_seqs, :num_cols] = offsets[:num_seqs]
+        self.indexer_k_cache_block_offsets[:num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[:num_seqs],
+            non_blocking=True,
+        )
+
     def prepare_for_block_tables(self):
         """Prepare block tables for all attention types.
 
