@@ -207,8 +207,6 @@ class Sender(SenderBase):
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
         self._loaded_remote_agents: set[str] = set()
-
-        # Multi-threaded task queue support
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)

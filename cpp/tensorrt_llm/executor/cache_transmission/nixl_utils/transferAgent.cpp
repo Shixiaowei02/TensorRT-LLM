@@ -24,7 +24,6 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
-#include <cuda.h>
 #include <chrono>
 #include <cuda.h>
 #include <dirent.h>
