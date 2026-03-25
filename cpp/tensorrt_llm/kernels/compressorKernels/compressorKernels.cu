@@ -859,16 +859,16 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     {
         for (int r = write_r_start; r < range_end - range_start; r++)
         {
-            int const pos       = range_start + r;
-            int const input_row = pos - sp;     // >= 0 since pos >= sp (loop starts at write_r_start)
-            int const log_blk   = pos / page_size;
-            int const blk_off   = pos % page_size;
-            int const phys_kv   = block_table_kv  [batch_idx * max_blocks + log_blk];
-            int const phys_sc   = block_table_score[batch_idx * max_blocks + log_blk];
+            int const pos = range_start + r;
+            int const input_row = pos - sp; // >= 0 since pos >= sp (loop starts at write_r_start)
+            int const log_blk = pos / page_size;
+            int const blk_off = pos % page_size;
+            int const phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
+            int const phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
 
             for (int col_idx = 0; col_idx < coff; col_idx++)
             {
-                int const col     = col_idx * HEAD_DIM;
+                int const col = col_idx * HEAD_DIM;
                 int64_t const src = static_cast<int64_t>(input_offset + input_row) * two_sd + col;
                 int64_t const dkv = static_cast<int64_t>(phys_kv) * page_sd + blk_off * state_dim + col;
                 int64_t const dsc = static_cast<int64_t>(phys_sc) * page_sd + blk_off * state_dim + col;
@@ -884,7 +884,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
                 for (int i = 0; i < VEC; i += 4)
                 {
                     float4 av = *reinterpret_cast<float4 const*>(&ape[r * state_dim + col + tid * VEC + i]);
-                    sc_o[i]     = static_cast<IoElemT>(static_cast<float>(sc_e[i])     + av.x);
+                    sc_o[i] = static_cast<IoElemT>(static_cast<float>(sc_e[i]) + av.x);
                     sc_o[i + 1] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
                     sc_o[i + 2] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
                     sc_o[i + 3] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
@@ -910,8 +910,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     // rem_write_start skips those already-paged positions without a per-iteration branch.
     if (local_output_idx == num_outputs - 1)
     {
-        int const rem_start_pos  = last_abs_idx * COMPRESS_RATIO;
-        int const rem_count      = kv_len - rem_start_pos;
+        int const rem_start_pos = last_abs_idx * COMPRESS_RATIO;
+        int const rem_count = kv_len - rem_start_pos;
         int const rem_write_start = (rem_start_pos < sp) ? (sp - rem_start_pos) : 0;
         write_to_paged(rem_start_pos, rem_start_pos + rem_count, rem_write_start);
     }
@@ -946,27 +946,26 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     auto reduce_window = [&](int range_start, int kv_col_off, int ape_col_off)
     {
         // Precompute split once for the whole window.
-        int const new_start = (range_start < sp)
-            ? min(sp - range_start, COMPRESS_RATIO) : 0;
+        int const new_start = (range_start < sp) ? min(sp - range_start, COMPRESS_RATIO) : 0;
 
         // Paged portion — APE already fused when tokens were stored.
         for (int r = 0; r < new_start; r++)
         {
             int const pos = range_start + r;
-            int log_blk   = pos / page_size;
-            int blk_off   = pos % page_size;
-            int phys_kv   = block_table_kv  [batch_idx * max_blocks + log_blk];
-            int phys_sc   = block_table_score[batch_idx * max_blocks + log_blk];
-            decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, state_dim,
-                phys_kv, phys_sc, blk_off, kv_col_off, tid, rmax, rsum, rwsum);
+            int log_blk = pos / page_size;
+            int blk_off = pos % page_size;
+            int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
+            int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
+            decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, state_dim, phys_kv,
+                phys_sc, blk_off, kv_col_off, tid, rmax, rsum, rwsum);
         }
 
         // New-token portion — read from kv_score and add APE live.
         for (int r = new_start; r < COMPRESS_RATIO; r++)
         {
-            int const pos       = range_start + r;
+            int const pos = range_start + r;
             int const input_row = pos - sp;
-            int64_t const row   = static_cast<int64_t>(input_offset + input_row) * two_sd;
+            int64_t const row = static_cast<int64_t>(input_offset + input_row) * two_sd;
             prefillSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(
                 kv_score_raw, ape, row, kv_col_off, r * state_dim + ape_col_off, state_dim, tid, rmax, rsum, rwsum);
         }
@@ -978,8 +977,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
         //   prev-segment (first head_dim,  kv_col=0)    from window (abs_idx-1)
         //   curr-segment (second head_dim, kv_col=HD)   from window abs_idx
         if (abs_idx > 0)
-            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0);           // prev window, first half
-        reduce_window(win_start, HEAD_DIM, HEAD_DIM);                        // curr window, second half
+            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0); // prev window, first half
+        reduce_window(win_start, HEAD_DIM, HEAD_DIM);            // curr window, second half
     }
     else
     {

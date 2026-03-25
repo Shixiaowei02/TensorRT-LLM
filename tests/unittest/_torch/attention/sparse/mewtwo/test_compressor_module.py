@@ -268,10 +268,15 @@ class RefCompressor(nn.Module):
                     self.score_state[:bsz, ratio + pos % ratio] = sc_t
                     if (pos + 1) % ratio == 0:
                         kv_state = torch.cat(
-                            [self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]], dim=1
+                            [self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]],
+                            dim=1,
                         )
                         score_state = torch.cat(
-                            [self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]], dim=1
+                            [
+                                self.score_state[:bsz, :ratio, :d],
+                                self.score_state[:bsz, ratio:, d:],
+                            ],
+                            dim=1,
                         )
                         comp = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
                         self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
@@ -995,8 +1000,8 @@ class CompressorWrapper:
                     past_kv_lens = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
                 kv_lens_local = past_kv_lens + seq_lens
                 num_ctx_compressed_tokens = (
-                    kv_lens_local // ratio - past_kv_lens // ratio
-                ).sum().item()
+                    (kv_lens_local // ratio - past_kv_lens // ratio).sum().item()
+                )
                 num_gen_compressed_tokens = 0
 
             # Use batch_indices for request mapping if provided
@@ -2297,9 +2302,11 @@ def test_chunked_prefill_module(total_seqlen, split_pos, batch, ratio):
             assert len(parts) == 0, "Comp produced output but ref did not"
             return
         assert len(parts) > 0, "Ref produced output but comp did not"
-        combined = torch.cat(parts, dim=1) if all(
-            p.dim() == out_ref.dim() for p in parts
-        ) else torch.cat(parts, dim=0).unsqueeze(0)
+        combined = (
+            torch.cat(parts, dim=1)
+            if all(p.dim() == out_ref.dim() for p in parts)
+            else torch.cat(parts, dim=0).unsqueeze(0)
+        )
 
         assert_similar(out_ref, combined, "Chunked prefill module: ref vs comp")
     finally:

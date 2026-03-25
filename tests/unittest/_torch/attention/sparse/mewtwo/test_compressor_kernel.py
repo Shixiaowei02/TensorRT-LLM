@@ -32,7 +32,9 @@ def prefill_kernel(
 ):
     """CUDA prefill kernel wrapper with head_dim skip guard."""
     if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
-        pytest.skip(f"CUDA prefill kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}")
+        pytest.skip(
+            f"CUDA prefill kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}"
+        )
     if block_table_score is None:
         block_table_score = block_table_kv
 
@@ -40,10 +42,22 @@ def prefill_kernel(
     paged_score_2d = paged_score.flatten(1) if paged_score.dim() == 3 else paged_score
 
     torch.ops.trtllm.compressor_prefill_reduction(
-        kv_score, ape, paged_kv_2d, paged_score_2d,
-        block_table_kv, block_table_score, kv_comp,
-        kv_lens, start_pos, cu_seq_lens, cu_new_comp_kv,
-        kv_lens.shape[0], page_size, head_dim, compress_ratio, max_outputs,
+        kv_score,
+        ape,
+        paged_kv_2d,
+        paged_score_2d,
+        block_table_kv,
+        block_table_score,
+        kv_comp,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_new_comp_kv,
+        kv_lens.shape[0],
+        page_size,
+        head_dim,
+        compress_ratio,
+        max_outputs,
     )
 
 
@@ -90,7 +104,9 @@ def decode_kernel(
 ):
     """CUDA decode kernel wrapper with head_dim skip guard."""
     if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
-        pytest.skip(f"CUDA decode kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}")
+        pytest.skip(
+            f"CUDA decode kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}"
+        )
     if block_table_score is None:
         block_table_score = block_table_kv
     if start_pos is None:
@@ -568,9 +584,9 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     kv = torch.arange(batch_size * seqlen * state_dim, dtype=torch.float32, device="cuda").reshape(
         batch_size, seqlen, state_dim
     )
-    score = torch.arange(batch_size * seqlen * state_dim, dtype=torch.float32, device="cuda").reshape(
-        batch_size, seqlen, state_dim
-    )
+    score = torch.arange(
+        batch_size * seqlen * state_dim, dtype=torch.float32, device="cuda"
+    ).reshape(batch_size, seqlen, state_dim)
     ape = torch.randn(compress_ratio, state_dim, device="cuda")
 
     kv_state_py = torch.zeros(batch_size, state_len, state_dim, device="cuda")
@@ -646,8 +662,7 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
             got_kv = paged_kv[phys_block, block_offset].float()
             exp_kv = kv[b, p].float()
             assert torch.allclose(got_kv, exp_kv, atol=1e-5), (
-                f"batch={b} pos={p}: paged_kv mismatch "
-                f"max_diff={(got_kv - exp_kv).abs().max():.6f}"
+                f"batch={b} pos={p}: paged_kv mismatch max_diff={(got_kv - exp_kv).abs().max():.6f}"
             )
 
             got_sc = paged_score[phys_block, block_offset].float()
@@ -698,10 +713,10 @@ PREFILL_ALL_BLOCKS_CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("batch_size,seqlen,compress_ratio,head_dim,overlap", PREFILL_ALL_BLOCKS_CONFIGS)
-def test_prefill_paged_state_all_blocks(
-    batch_size, seqlen, compress_ratio, head_dim, overlap
-):
+@pytest.mark.parametrize(
+    "batch_size,seqlen,compress_ratio,head_dim,overlap", PREFILL_ALL_BLOCKS_CONFIGS
+)
+def test_prefill_paged_state_all_blocks(batch_size, seqlen, compress_ratio, head_dim, overlap):
     """Verify prefill writes ALL token positions to paged cache (block reuse requirement).
 
     Before the fix, only the last full chunk + remainder were written to paged cache.
@@ -728,13 +743,27 @@ def test_prefill_paged_state_all_blocks(
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
     )
-    kv_comp = prepare_compress_output(cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16)
+    kv_comp = prepare_compress_output(
+        cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
+    )
     max_outputs = torch.clamp((kv_lens - start_pos) // compress_ratio, min=1).max().item()
 
     prefill_kernel(
-        kv_score, ape, kv_lens, start_pos, cu_seq_lens, cu_outputs,
-        kv_comp, paged_kv, paged_score, block_table, max_outputs, block_table,
-        compress_ratio, head_dim, page_size,
+        kv_score,
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp,
+        paged_kv,
+        paged_score,
+        block_table,
+        max_outputs,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
     )
 
     # Verify every full-chunk position is correctly written
@@ -749,8 +778,7 @@ def test_prefill_paged_state_all_blocks(
             got_kv = paged_kv[phys, blk_off].float()
             exp_kv = kv[b, p].float()
             assert torch.allclose(got_kv, exp_kv, atol=1e-5), (
-                f"batch={b} pos={p}: paged_kv mismatch "
-                f"max_diff={(got_kv - exp_kv).abs().max():.6f}"
+                f"batch={b} pos={p}: paged_kv mismatch max_diff={(got_kv - exp_kv).abs().max():.6f}"
             )
 
             got_sc = paged_score[phys, blk_off].float()
@@ -826,10 +854,21 @@ def test_prefill_block_reuse_decode(
     max_outputs = torch.clamp((kv_lens_pre - start_pos_pre) // compress_ratio, min=1).max().item()
 
     prefill_kernel(
-        kv_score_prefill, ape, kv_lens_pre, start_pos_pre,
-        cu_seq_lens, cu_outputs, kv_comp_pre,
-        paged_kv, paged_score, block_table, max_outputs, block_table,
-        compress_ratio, head_dim, page_size,
+        kv_score_prefill,
+        ape,
+        kv_lens_pre,
+        start_pos_pre,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp_pre,
+        paged_kv,
+        paged_score,
+        block_table,
+        max_outputs,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
     )
 
     # --- Step 2: Build PyTorch reference state at reuse_at ---
@@ -842,10 +881,9 @@ def test_prefill_block_reuse_decode(
     if overlap and reuse_at >= compress_ratio:
         # Overlap window = last full chunk before reuse_at: [reuse_at-CR .. reuse_at-1]
         kv_state_py[:, :compress_ratio] = kv_prefill[:, reuse_at - compress_ratio : reuse_at]
-        score_state_py[:, :compress_ratio] = (
-            score_prefill[:, reuse_at - compress_ratio : reuse_at]
-            + ape.unsqueeze(0)
-        )
+        score_state_py[:, :compress_ratio] = score_prefill[
+            :, reuse_at - compress_ratio : reuse_at
+        ] + ape.unsqueeze(0)
     # (non-overlap, or overlap with reuse_at < compress_ratio: state stays zero/-inf)
 
     # --- Step 3: Decode from reuse_at and verify outputs match reference ---
@@ -865,8 +903,15 @@ def test_prefill_block_reuse_decode(
 
         # PyTorch reference (uses ground-truth kv_state_py)
         out_py = run_pytorch_reference(
-            new_kv.unsqueeze(1), new_score.unsqueeze(1), ape,
-            kv_state_py, score_state_py, token_idx, compress_ratio, head_dim, overlap,
+            new_kv.unsqueeze(1),
+            new_score.unsqueeze(1),
+            ape,
+            kv_state_py,
+            score_state_py,
+            token_idx,
+            compress_ratio,
+            head_dim,
+            overlap,
         )
 
         # CUDA decode (reads overlap window from paged cache written during prefill)
@@ -875,10 +920,21 @@ def test_prefill_block_reuse_decode(
         start_pos = torch.full((batch_size,), token_idx, device="cuda", dtype=torch.int32)
 
         decode_kernel(
-            kv_score, ape, kv_lens, start_pos,
-            cu_seq_lens_dec, cu_outputs_dec, kv_comp_dec,
-            paged_kv, paged_score, block_table, block_table,
-            compress_ratio, head_dim, page_size, next_n=1,
+            kv_score,
+            ape,
+            kv_lens,
+            start_pos,
+            cu_seq_lens_dec,
+            cu_outputs_dec,
+            kv_comp_dec,
+            paged_kv,
+            paged_score,
+            block_table,
+            block_table,
+            compress_ratio,
+            head_dim,
+            page_size,
+            next_n=1,
         )
 
         should_compress = (token_idx + 1) % compress_ratio == 0
@@ -1333,9 +1389,7 @@ CHUNKED_PREFILL_CONFIGS = [
     "compress_ratio,head_dim,overlap,batch_size,start_pos_val,new_seqlen",
     CHUNKED_PREFILL_CONFIGS,
 )
-def test_chunked_prefill(
-    compress_ratio, head_dim, overlap, batch_size, start_pos_val, new_seqlen
-):
+def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_pos_val, new_seqlen):
     """End-to-end chunked prefill: reference (one-shot full prefill) vs
     kernel (initial prefill + chunked prefill on same paged cache).
 
@@ -1371,12 +1425,16 @@ def test_chunked_prefill(
     # ---- Reference: one-shot full prefill (sp=0) ----
     state_len = coff * ratio
     kv_state_ref = torch.zeros(batch_size, state_len, state_dim, device=device)
-    score_state_ref = torch.full(
-        (batch_size, state_len, state_dim), float("-inf"), device=device
-    )
+    score_state_ref = torch.full((batch_size, state_len, state_dim), float("-inf"), device=device)
     ref_out = run_pytorch_prefill_reference(
-        kv_full.clone(), score_full.clone(), ape,
-        kv_state_ref, score_state_ref, ratio, head_dim, overlap,
+        kv_full.clone(),
+        score_full.clone(),
+        ape,
+        kv_state_ref,
+        score_state_ref,
+        ratio,
+        head_dim,
+        overlap,
     )
     assert ref_out is not None, "Reference should produce output"
 
@@ -1389,22 +1447,39 @@ def test_chunked_prefill(
             kv_full[:, :start_pos_val].reshape(-1, state_dim),
             score_full[:, :start_pos_val].reshape(-1, state_dim),
         )
-        kv_lens_1 = torch.full(
-            (batch_size,), start_pos_val, device=device, dtype=torch.int32
-        )
+        kv_lens_1 = torch.full((batch_size,), start_pos_val, device=device, dtype=torch.int32)
         start_pos_1 = torch.zeros(batch_size, device=device, dtype=torch.int32)
         cu_seq_lens_1, cu_outputs_1 = prepare_prefill_metadata(
-            kv_lens_1, start_pos_1, ratio, head_dim, device,
+            kv_lens_1,
+            start_pos_1,
+            ratio,
+            head_dim,
+            device,
         )
         kv_comp_1 = prepare_compress_output(
-            cu_outputs_1, batch_size, head_dim, device, torch.bfloat16,
+            cu_outputs_1,
+            batch_size,
+            head_dim,
+            device,
+            torch.bfloat16,
         )
         max_outputs_1 = max(actual_num_out_1, 1)
         prefill_kernel(
-            kv_score_1, ape, kv_lens_1, start_pos_1,
-            cu_seq_lens_1, cu_outputs_1, kv_comp_1,
-            paged_kv, paged_score, block_table, max_outputs_1,
-            block_table, ratio, head_dim, page_size,
+            kv_score_1,
+            ape,
+            kv_lens_1,
+            start_pos_1,
+            cu_seq_lens_1,
+            cu_outputs_1,
+            kv_comp_1,
+            paged_kv,
+            paged_score,
+            block_table,
+            max_outputs_1,
+            block_table,
+            ratio,
+            head_dim,
+            page_size,
         )
 
     # ---- Kernel call 2: chunked prefill (sp=start_pos_val, kv_len=total_seqlen) ----
@@ -1413,24 +1488,39 @@ def test_chunked_prefill(
         kv_full[:, start_pos_val:].reshape(-1, state_dim),
         score_full[:, start_pos_val:].reshape(-1, state_dim),
     )
-    kv_lens_2 = torch.full(
-        (batch_size,), total_seqlen, device=device, dtype=torch.int32
-    )
-    start_pos_2 = torch.full(
-        (batch_size,), start_pos_val, device=device, dtype=torch.int32
-    )
+    kv_lens_2 = torch.full((batch_size,), total_seqlen, device=device, dtype=torch.int32)
+    start_pos_2 = torch.full((batch_size,), start_pos_val, device=device, dtype=torch.int32)
     cu_seq_lens_2, cu_outputs_2 = prepare_prefill_metadata(
-        kv_lens_2, start_pos_2, ratio, head_dim, device,
+        kv_lens_2,
+        start_pos_2,
+        ratio,
+        head_dim,
+        device,
     )
     kv_comp_2 = prepare_compress_output(
-        cu_outputs_2, batch_size, head_dim, device, torch.bfloat16,
+        cu_outputs_2,
+        batch_size,
+        head_dim,
+        device,
+        torch.bfloat16,
     )
     max_outputs_2 = max(actual_num_out_2, 1)
     prefill_kernel(
-        kv_score_2, ape, kv_lens_2, start_pos_2,
-        cu_seq_lens_2, cu_outputs_2, kv_comp_2,
-        paged_kv, paged_score, block_table, max_outputs_2,
-        block_table, ratio, head_dim, page_size,
+        kv_score_2,
+        ape,
+        kv_lens_2,
+        start_pos_2,
+        cu_seq_lens_2,
+        cu_outputs_2,
+        kv_comp_2,
+        paged_kv,
+        paged_score,
+        block_table,
+        max_outputs_2,
+        block_table,
+        ratio,
+        head_dim,
+        page_size,
     )
 
     # ---- Compare per batch: concat(call1_out, call2_out) vs reference ----
@@ -2164,8 +2254,7 @@ def benchmark_compress_kernel():
     print("-" * 70)
     for r in results:
         print(
-            f"{r['name']:<30} {r['cuda_us']:>12.2f} "
-            f"{r['pytorch_us']:>12.2f} {r['speedup']:>9.2f}x"
+            f"{r['name']:<30} {r['cuda_us']:>12.2f} {r['pytorch_us']:>12.2f} {r['speedup']:>9.2f}x"
         )
     print("=" * 70)
 
