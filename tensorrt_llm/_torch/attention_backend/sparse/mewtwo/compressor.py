@@ -9,8 +9,6 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
-from .kernel import kv_compress_cutile, kv_compress_prefill_cutile
-
 if TYPE_CHECKING:
     from .mewtwo import MewtwoTrtllmAttentionMetadata
 
@@ -165,43 +163,47 @@ class Compressor(nn.Module):
 
         # Run compression kernels
         if num_contexts > 0:
-            kv_compress_prefill_cutile(
-                kv_score=kv_score[:num_ctx_tokens],
-                ape=self.ape,
-                kv_lens=kv_lens[:num_contexts],
-                start_pos=metadata.cached_token_lens_cuda[:num_contexts],
-                cu_seq_lens=metadata.cu_seq_lens_cuda,
-                cu_new_comp_kv=cu_new_comp_kv[: num_contexts + 1],
-                kv_comp=kv_comp,
-                paged_kv=paged_kv_state,
-                paged_score=paged_score_state,
-                block_table_kv=block_table_kv_state[:num_contexts],
-                block_table_score=block_table_score_state[:num_contexts],
-                compress_ratio=self.compress_ratio,
-                head_dim=self.head_dim,
-                overlap=self.overlap,
-                page_size=state_tokens_per_block,
-                max_outputs=max_ctx_comp_kv_lens,
+            torch.ops.trtllm.compressor_prefill_reduction(
+                kv_score[:num_ctx_tokens],
+                self.ape,
+                paged_kv_state,
+                paged_score_state,
+                block_table_kv_state[:num_contexts],
+                block_table_score_state[:num_contexts],
+                kv_comp,
+                kv_lens[:num_contexts],
+                metadata.cached_token_lens_cuda[:num_contexts],
+                metadata.cu_seq_lens_cuda,
+                cu_new_comp_kv[: num_contexts + 1],
+                num_contexts,
+                state_tokens_per_block,
+                self.head_dim,
+                self.compress_ratio,
+                max_ctx_comp_kv_lens,
             )
 
         if num_generations > 0:
-            kv_compress_cutile(
-                kv_score=kv_score[num_ctx_tokens:],
-                ape=self.ape,
-                kv_lens=kv_lens[num_contexts:],
-                start_pos=None,
-                cu_seq_lens=metadata.cu_seq_lens_cuda,
-                cu_new_comp_kv=cu_new_comp_kv[num_contexts:],
-                kv_comp=kv_comp,
-                paged_kv=paged_kv_state,
-                paged_score=paged_score_state,
-                block_table_kv=block_table_kv_state[num_contexts:],
-                block_table_score=block_table_score_state[num_contexts:],
-                compress_ratio=self.compress_ratio,
-                head_dim=self.head_dim,
-                overlap=self.overlap,
-                page_size=state_tokens_per_block,
-                next_n=metadata.num_gen_tokens_per_seq,
+            gen_kv_lens = kv_lens[num_contexts:]
+            next_n = metadata.num_gen_tokens_per_seq
+            # Pass full kv_score (not sliced) with the generation portion of
+            # cu_seq_lens so the kernel reads at the correct absolute offsets.
+            torch.ops.trtllm.compressor_paged_kv_compress(
+                kv_score,
+                self.ape,
+                paged_kv_state,
+                paged_score_state,
+                block_table_kv_state[num_contexts:],
+                block_table_score_state[num_contexts:],
+                kv_comp,
+                gen_kv_lens,
+                gen_kv_lens - next_n,
+                metadata.cu_seq_lens_cuda[num_contexts:],
+                cu_new_comp_kv[num_contexts:],
+                num_generations,
+                state_tokens_per_block,
+                self.head_dim,
+                self.compress_ratio,
+                next_n,
             )
 
         # Scatter to cache with appropriate quantization (all modes fused)

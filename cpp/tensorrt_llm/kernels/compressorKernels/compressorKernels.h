@@ -28,11 +28,11 @@ namespace kernels::compressor
 {
 
 // Decode kernel: write NEXT_N tokens to paged cache + conditional compression
-// via online softmax. Supports both overlap (state_dim = 2*head_dim) and
-// non-overlap (state_dim = head_dim) modes.
+// via online softmax. Overlap is derived from compress_ratio (ratio=4).
 //
 // Grid: (batch_size, cdiv(state_dim, block_size))
 // One thread per state_dim element across all phases.
+// state_dim is a constexpr derived from COMPRESS_RATIO and HEAD_DIM inside the kernel.
 void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or fp32)
     float const* ape,                            // [compress_ratio, state_dim]
     void* paged_kv,                              // [num_blocks, page_size, state_dim]
@@ -44,7 +44,7 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int32_t const* start_pos,                    // [bsz]
     int32_t const* cu_seq_lens,                  // [bsz+1]
     int32_t const* cu_kv_comp,                   // [bsz+1]
-    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, bool is_overlap, int next_n,
+    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, int next_n,
     int io_elem_bytes,                           // bytes per element for kv_score/paged (2=bf16, 4=fp32)
     int out_elem_bytes,                          // bytes per element for output
     cudaStream_t stream);
@@ -65,8 +65,8 @@ void prefillReductionLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or 
     int32_t const* start_pos,                     // [bsz]
     int32_t const* cu_seq_lens,                   // [bsz+1]
     int32_t const* cu_kv_comp,                    // [bsz+1]
-    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, bool is_overlap, int max_outputs,
-    int io_elem_bytes, int out_elem_bytes, cudaStream_t stream);
+    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, int max_outputs, int io_elem_bytes,
+    int out_elem_bytes, cudaStream_t stream);
 
 // RMSNorm + RoPE + Hadamard + paged scatter in a single kernel launch.
 // Optionally writes postprocessed result to kv_out (nullptr to skip).

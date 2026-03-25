@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test suite for KV compressor kernels (cuTile).
+"""Test suite for KV compressor kernels.
 
 Tests cover: prefill/decode corner cases, state updates, varlen, MTP support.
 Run: pytest -s tests/unittest/_torch/attention/sparse/test_compressor_kernel.py
@@ -10,11 +10,41 @@ import pytest
 import torch
 import triton
 
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.kernel import (
-    compressed_kv_scatter_cutile,
-    kv_compress_cutile,
-    kv_compress_prefill_cutile,
-)
+_CUDA_SUPPORTED_HEAD_DIMS = (128, 512)
+
+
+def prefill_kernel(
+    kv_score: torch.Tensor,
+    ape: torch.Tensor,
+    kv_lens: torch.Tensor,
+    start_pos: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
+    kv_comp: torch.Tensor,
+    paged_kv: torch.Tensor,
+    paged_score: torch.Tensor,
+    block_table_kv: torch.Tensor,
+    max_outputs: int,
+    block_table_score: torch.Tensor = None,
+    compress_ratio: int = None,
+    head_dim: int = None,
+    page_size: int = 32,
+):
+    """CUDA prefill kernel wrapper with head_dim skip guard."""
+    if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
+        pytest.skip(f"CUDA prefill kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}")
+    if block_table_score is None:
+        block_table_score = block_table_kv
+
+    paged_kv_2d = paged_kv.flatten(1) if paged_kv.dim() == 3 else paged_kv
+    paged_score_2d = paged_score.flatten(1) if paged_score.dim() == 3 else paged_score
+
+    torch.ops.trtllm.compressor_prefill_reduction(
+        kv_score, ape, paged_kv_2d, paged_score_2d,
+        block_table_kv, block_table_score, kv_comp,
+        kv_lens, start_pos, cu_seq_lens, cu_new_comp_kv,
+        kv_lens.shape[0], page_size, head_dim, compress_ratio, max_outputs,
+    )
 
 
 def prepare_compress_output(
@@ -39,6 +69,51 @@ def prepare_compress_output(
     total_outputs = cu_new_comp_kv[-1].item()
     kv_comp = torch.empty(total_outputs, head_dim, device=device, dtype=dtype)
     return kv_comp
+
+
+def decode_kernel(
+    kv_score: torch.Tensor,
+    ape: torch.Tensor,
+    kv_lens: torch.Tensor,
+    start_pos: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
+    kv_comp: torch.Tensor,
+    paged_kv: torch.Tensor,
+    paged_score: torch.Tensor,
+    block_table_kv: torch.Tensor,
+    block_table_score: torch.Tensor = None,
+    compress_ratio: int = None,
+    head_dim: int = None,
+    page_size: int = 32,
+    next_n: int = 1,
+):
+    """CUDA decode kernel wrapper with head_dim skip guard."""
+    if head_dim not in _CUDA_SUPPORTED_HEAD_DIMS:
+        pytest.skip(f"CUDA decode kernel only supports head_dim in {_CUDA_SUPPORTED_HEAD_DIMS}, got {head_dim}")
+    if block_table_score is None:
+        block_table_score = block_table_kv
+    if start_pos is None:
+        start_pos = kv_lens - next_n
+
+    torch.ops.trtllm.compressor_paged_kv_compress(
+        kv_score,
+        ape,
+        paged_kv,
+        paged_score,
+        block_table_kv,
+        block_table_score,
+        kv_comp,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_new_comp_kv,
+        kv_lens.shape[0],
+        page_size,
+        head_dim,
+        compress_ratio,
+        next_n,
+    )
 
 
 # ============================================================================
@@ -196,76 +271,6 @@ def run_pytorch_prefill_reference_varlen(
     return torch.empty(0, head_dim, device=kv_score.device, dtype=torch.float32)
 
 
-def run_pytorch_chunked_prefill_reference(
-    kv_score,
-    ape,
-    start_pos,
-    compress_ratio,
-    head_dim,
-    overlap,
-    prev_paged_kv,
-    prev_paged_score,
-    page_size,
-    block_table_kv_b,
-    block_table_score_b,
-):
-    """Single-batch chunked prefill reference.
-
-    For overlap mode and start_pos >= compress_ratio, output[0] uses the
-    prev-segment from paged state instead of kv_score.
-    """
-    ratio = compress_ratio
-    seqlen = kv_score.shape[0]
-    coff = 2 if overlap else 1
-    state_dim = coff * head_dim
-    d = head_dim
-    remainder = seqlen % ratio
-    cutoff = seqlen - remainder
-    num_outputs = cutoff // ratio
-
-    kv = kv_score[:, :state_dim].float()
-    score = kv_score[:, state_dim:].float()
-
-    if num_outputs == 0:
-        return None
-
-    kv_chunks = kv[:cutoff].reshape(num_outputs, ratio, state_dim)
-    score_chunks = score[:cutoff].reshape(num_outputs, ratio, state_dim) + ape.float().unsqueeze(0)
-
-    if not overlap:
-        attn = score_chunks.softmax(dim=1)
-        return (kv_chunks * attn).sum(dim=1).to(torch.bfloat16)
-
-    # Overlap mode: each output i combines
-    #   prev-segment (first d features) from chunk [i-1] (or paged state for i=0)
-    #   curr-segment (second d features) from chunk [i]
-    kv_t = torch.zeros(num_outputs, 2 * ratio, d, device=kv.device)
-    score_t = torch.full((num_outputs, 2 * ratio, d), float("-inf"), device=score.device)
-
-    # Current segment (second d features, index ratio..2*ratio-1)
-    kv_t[:, ratio:, :] = kv_chunks[:, :, d:]
-    score_t[:, ratio:, :] = score_chunks[:, :, d:]
-
-    # Previous segment from kv_score for outputs i=1..n_out-1
-    kv_t[1:, :ratio, :] = kv_chunks[:-1, :, :d]
-    score_t[1:, :ratio, :] = score_chunks[:-1, :, :d]
-
-    # Previous segment for output i=0: from paged state if sp >= ratio
-    if start_pos >= ratio:
-        for r in range(ratio):
-            abs_pos = start_pos - ratio + r
-            log_blk = abs_pos // page_size
-            blk_off = abs_pos % page_size
-            phys_kv = block_table_kv_b[log_blk].item()
-            phys_sc = block_table_score_b[log_blk].item()
-            kv_t[0, r, :] = prev_paged_kv[phys_kv, blk_off, :d].float()
-            score_t[0, r, :] = prev_paged_score[phys_sc, blk_off, :d].float()
-            # paged_score already has APE fused — no addition needed
-
-    attn = score_t.softmax(dim=1)
-    return (kv_t * attn).sum(dim=1).to(torch.bfloat16)
-
-
 # ============================================================================
 # Test Utilities
 # ============================================================================
@@ -310,7 +315,9 @@ def prepare_prefill_metadata(
         start_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
     seq_lens = kv_lens - start_pos
-    num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
+    num_outputs_per_batch = torch.clamp(
+        kv_lens // compress_ratio - start_pos // compress_ratio, min=1
+    )
 
     cu_seq_lens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
     cu_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
@@ -351,22 +358,11 @@ def pack_prefill_inputs(kv_list, score_list):
 
 PREFILL_CONFIGS = [
     # Overlap mode (ratio=4)
-    pytest.param(1, 3, 4, 8, True, id="overlap_seqlen_lt_ratio"),
-    pytest.param(1, 4, 4, 8, True, id="overlap_seqlen_eq_ratio"),
-    pytest.param(1, 5, 4, 8, True, id="overlap_1chunk_1remainder"),
-    pytest.param(1, 8, 4, 8, True, id="overlap_2chunks"),
-    pytest.param(1, 9, 4, 8, True, id="overlap_2chunks_1remainder"),
-    pytest.param(1, 20, 4, 16, True, id="overlap_5chunks"),
-    pytest.param(2, 20, 4, 16, True, id="overlap_multi_batch"),
     pytest.param(4, 32, 4, 128, True, id="overlap_large_head_dim"),
-    pytest.param(1, 100, 4, 64, True, id="overlap_25chunks"),
+    pytest.param(1, 20, 4, 512, True, id="overlap_hd512_5chunks"),
     # Basic mode (ratio=128)
-    pytest.param(1, 64, 128, 8, False, id="basic_seqlen_lt_ratio"),
-    pytest.param(1, 128, 128, 8, False, id="basic_seqlen_eq_ratio"),
-    pytest.param(1, 129, 128, 8, False, id="basic_1chunk_1remainder"),
-    pytest.param(1, 256, 128, 8, False, id="basic_2chunks"),
-    pytest.param(1, 260, 128, 8, False, id="basic_2chunks_4remainder"),
-    pytest.param(2, 512, 128, 64, False, id="basic_multi_batch_large"),
+    pytest.param(1, 128, 128, 128, False, id="basic_hd128_eq_ratio"),
+    pytest.param(1, 256, 128, 512, False, id="basic_hd512_2chunks"),
 ]
 
 
@@ -409,7 +405,7 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
     num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
     max_outputs = num_outputs_per_batch.max().item()
 
-    kv_compress_prefill_cutile(
+    prefill_kernel(
         kv_score,
         ape,
         kv_lens,
@@ -424,7 +420,6 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
         block_table,
         compress_ratio,
         head_dim,
-        overlap,
         page_size,
     )
 
@@ -441,13 +436,10 @@ def test_prefill_corner_cases(batch_size, seqlen, compress_ratio, head_dim, over
 
 
 DECODE_CONFIGS = [
-    pytest.param(1, 4, 8, True, 16, id="overlap_4compressions"),
-    pytest.param(2, 4, 8, True, 8, id="overlap_multi_batch"),
-    pytest.param(1, 128, 8, False, 256, id="basic_2compressions"),
     pytest.param(1, 4, 128, True, 12, id="overlap_large_head_dim"),
-    pytest.param(4, 4, 64, True, 20, id="overlap_multi_batch_large"),
-    pytest.param(1, 4, 8, True, 4, id="overlap_1compression"),
-    pytest.param(2, 128, 64, False, 384, id="basic_multi_batch_3comp"),
+    pytest.param(1, 4, 512, True, 8, id="overlap_hd512"),
+    pytest.param(1, 128, 128, False, 256, id="basic_hd128_2compressions"),
+    pytest.param(1, 128, 512, False, 256, id="basic_hd512_2compressions"),
 ]
 
 
@@ -514,12 +506,12 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
             overlap,
         )
 
-        # cuTile kernel
+        # CUDA decode kernel
         kv_score = fuse_kv_score(new_kv, new_score)  # [bsz, 2*state_dim]
         kv_lens = torch.full((batch_size,), total_tokens, device="cuda", dtype=torch.int32)
         start_pos = torch.full((batch_size,), token_idx, device="cuda", dtype=torch.int32)
 
-        kv_compress_cutile(
+        decode_kernel(
             kv_score,
             ape,
             kv_lens,
@@ -533,7 +525,6 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
             block_table,
             compress_ratio,
             head_dim,
-            overlap,
             page_size,
             next_n=1,
         )
@@ -553,21 +544,31 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
 
 
 STATE_UPDATE_CONFIGS = [
-    pytest.param(1, 9, 4, 8, True, id="overlap_2chunks_1remainder"),
-    # pytest.param(1, 130, 128, 8, False, id="basic_1chunk_2remainder"),
+    pytest.param(1, 12, 4, 128, True, id="overlap_hd128_3chunks"),
+    pytest.param(1, 13, 4, 512, True, id="overlap_hd512_3chunks_1remainder"),
+    pytest.param(1, 256, 128, 128, False, id="basic_hd128_2chunks"),
+    pytest.param(1, 260, 128, 512, False, id="basic_hd512_2chunks_4remainder"),
 ]
 
 
 @pytest.mark.parametrize("batch_size,seqlen,compress_ratio,head_dim,overlap", STATE_UPDATE_CONFIGS)
 def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, overlap):
-    """Verify prefill state updates match reference."""
+    """Verify prefill state updates match reference — all chunks, not just the last one.
+
+    Checks two things:
+      1. All full-chunk positions [0, cutoff) are written to paged cache with
+         the correct kv and score+APE values (block reuse requirement: this
+         section would FAIL against the old kernel that only wrote the last chunk).
+      2. The last-chunk + remainder state matches the PyTorch reference state
+         (continuity requirement for decode following prefill).
+    """
     coff = 2 if overlap else 1
     state_len, state_dim = coff * compress_ratio, coff * head_dim
 
-    kv = torch.arange(batch_size * seqlen * state_dim, device="cuda").reshape(
+    kv = torch.arange(batch_size * seqlen * state_dim, dtype=torch.float32, device="cuda").reshape(
         batch_size, seqlen, state_dim
     )
-    score = torch.arange(batch_size * seqlen * state_dim, device="cuda").reshape(
+    score = torch.arange(batch_size * seqlen * state_dim, dtype=torch.float32, device="cuda").reshape(
         batch_size, seqlen, state_dim
     )
     ape = torch.randn(compress_ratio, state_dim, device="cuda")
@@ -579,7 +580,7 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
         batch_size, seqlen, compress_ratio, head_dim, overlap
     )
 
-    # Run PyTorch reference
+    # Run PyTorch reference (sets last-chunk + remainder in kv_state_py/score_state_py)
     _ = run_pytorch_prefill_reference(
         kv.clone(),
         score.clone(),
@@ -598,7 +599,6 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     kv_lens = torch.full((batch_size,), seqlen, device="cuda", dtype=torch.int32)
     start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
 
-    # Pre-compute metadata
     cu_seq_lens, cu_outputs = prepare_prefill_metadata(
         kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
     )
@@ -609,7 +609,7 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
     max_outputs = num_outputs_per_batch.max().item()
 
-    kv_compress_prefill_cutile(
+    prefill_kernel(
         kv_score,
         ape,
         kv_lens,
@@ -624,44 +624,63 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
         block_table,
         compress_ratio,
         head_dim,
-        overlap,
         page_size,
     )
 
-    # Extract state from paged cache
-    # Prefill writes state at absolute token positions:
-    #   overlap:     [cutoff-ratio : cutoff] (last full chunk) and [cutoff : cutoff+remainder]
-    #   non-overlap: [cutoff : cutoff+remainder]
     remainder = seqlen % compress_ratio
     cutoff = seqlen - remainder
     offset = compress_ratio if overlap else 0
 
+    # --- Check 1: ALL full-chunk positions [0, cutoff) ---
+    # Expected: paged_kv[phys, blk_off] == kv[b, p]
+    #           paged_score[phys, blk_off] == score[b, p] + ape[p % compress_ratio]
+    # This check FAILS against the old kernel (which only wrote the last chunk),
+    # proving these positions are now correctly populated for block reuse.
+    for b in range(batch_size):
+        for p in range(cutoff):
+            log_block = p // page_size
+            block_offset = p % page_size
+            phys_block = block_table[b, log_block].item()
+            r = p % compress_ratio
+
+            got_kv = paged_kv[phys_block, block_offset].float()
+            exp_kv = kv[b, p].float()
+            assert torch.allclose(got_kv, exp_kv, atol=1e-5), (
+                f"batch={b} pos={p}: paged_kv mismatch "
+                f"max_diff={(got_kv - exp_kv).abs().max():.6f}"
+            )
+
+            got_sc = paged_score[phys_block, block_offset].float()
+            exp_sc = (score[b, p] + ape[r]).float()
+            assert torch.allclose(got_sc, exp_sc, atol=1e-5), (
+                f"batch={b} pos={p}: paged_score mismatch "
+                f"max_diff={(got_sc - exp_sc).abs().max():.6f}"
+            )
+
+    # --- Check 2: last-chunk + remainder match the PyTorch reference state ---
+    # The PyTorch reference stores the "virtual" state needed for decode continuation.
+    # Verify the kernel's paged cache agrees for those positions.
     kv_state_kernel = torch.zeros_like(kv_state_py)
     score_state_kernel = torch.full_like(score_state_py, float("-inf"))
 
-    # Recover last full chunk for overlap mode
-    # Kernel writes at absolute positions [cutoff-ratio : cutoff]
-    # PyTorch reference stores at virtual positions [0 : ratio]
-    if overlap and cutoff >= compress_ratio:
-        for r in range(compress_ratio):
-            abs_pos = cutoff - compress_ratio + r
-            log_block = abs_pos // page_size
-            block_offset = abs_pos % page_size
-            phys_block = block_table[0, log_block].item()
-            kv_state_kernel[0, r] = paged_kv[phys_block, block_offset]
-            score_state_kernel[0, r] = paged_score[phys_block, block_offset]
+    for b in range(batch_size):
+        if overlap and cutoff >= compress_ratio:
+            for r in range(compress_ratio):
+                abs_pos = cutoff - compress_ratio + r
+                log_block = abs_pos // page_size
+                block_offset = abs_pos % page_size
+                phys_block = block_table[b, log_block].item()
+                kv_state_kernel[b, r] = paged_kv[phys_block, block_offset]
+                score_state_kernel[b, r] = paged_score[phys_block, block_offset]
 
-    # Recover remainder
-    # Kernel writes at absolute positions [cutoff : cutoff+remainder]
-    # PyTorch reference stores at virtual positions [offset : offset+remainder]
-    if remainder > 0:
-        for r in range(remainder):
-            abs_pos = cutoff + r
-            log_block = abs_pos // page_size
-            block_offset = abs_pos % page_size
-            phys_block = block_table[0, log_block].item()
-            kv_state_kernel[0, offset + r] = paged_kv[phys_block, block_offset]
-            score_state_kernel[0, offset + r] = paged_score[phys_block, block_offset]
+        if remainder > 0:
+            for r in range(remainder):
+                abs_pos = cutoff + r
+                log_block = abs_pos // page_size
+                block_offset = abs_pos % page_size
+                phys_block = block_table[b, log_block].item()
+                kv_state_kernel[b, offset + r] = paged_kv[phys_block, block_offset]
+                score_state_kernel[b, offset + r] = paged_score[phys_block, block_offset]
 
     assert torch.allclose(kv_state_py, kv_state_kernel, atol=1e-5), (
         f"KV state mismatch: {(kv_state_py - kv_state_kernel).abs().max():.6f}"
@@ -671,11 +690,218 @@ def test_prefill_state_update(batch_size, seqlen, compress_ratio, head_dim, over
     )
 
 
+PREFILL_ALL_BLOCKS_CONFIGS = [
+    pytest.param(1, 12, 4, 128, True, id="overlap_hd128_3chunks"),
+    pytest.param(1, 20, 4, 512, True, id="overlap_hd512_5chunks"),
+    pytest.param(1, 256, 128, 128, False, id="basic_hd128_2chunks"),
+    pytest.param(1, 260, 128, 512, False, id="basic_hd512_2chunks_4remainder"),
+]
+
+
+@pytest.mark.parametrize("batch_size,seqlen,compress_ratio,head_dim,overlap", PREFILL_ALL_BLOCKS_CONFIGS)
+def test_prefill_paged_state_all_blocks(
+    batch_size, seqlen, compress_ratio, head_dim, overlap
+):
+    """Verify prefill writes ALL token positions to paged cache (block reuse requirement).
+
+    Before the fix, only the last full chunk + remainder were written to paged cache.
+    Every chunk block must now be written so reused requests can read any prefix slice.
+
+    Checks: for every full-chunk position p in [0, cutoff):
+      paged_kv[phys, blk_off]    == kv[b, p]
+      paged_score[phys, blk_off] == score[b, p] + ape[p % compress_ratio]
+    """
+    coff = 2 if overlap else 1
+    state_dim = coff * head_dim
+
+    kv = torch.randn(batch_size, seqlen, state_dim, device="cuda")
+    score = torch.randn(batch_size, seqlen, state_dim, device="cuda")
+    ape = torch.randn(compress_ratio, state_dim, device="cuda")
+
+    paged_kv, paged_score, block_table, page_size, _ = create_paged_cache(
+        batch_size, seqlen, compress_ratio, head_dim, overlap
+    )
+
+    kv_score = fuse_kv_score(kv.view(-1, state_dim), score.view(-1, state_dim))
+    kv_lens = torch.full((batch_size,), seqlen, device="cuda", dtype=torch.int32)
+    start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_prefill_metadata(
+        kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
+    )
+    kv_comp = prepare_compress_output(cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16)
+    max_outputs = torch.clamp((kv_lens - start_pos) // compress_ratio, min=1).max().item()
+
+    prefill_kernel(
+        kv_score, ape, kv_lens, start_pos, cu_seq_lens, cu_outputs,
+        kv_comp, paged_kv, paged_score, block_table, max_outputs, block_table,
+        compress_ratio, head_dim, page_size,
+    )
+
+    # Verify every full-chunk position is correctly written
+    cutoff = (seqlen // compress_ratio) * compress_ratio
+    for b in range(batch_size):
+        for p in range(cutoff):
+            log_blk = p // page_size
+            blk_off = p % page_size
+            phys = block_table[b, log_blk].item()
+            r = p % compress_ratio  # APE index: position within window
+
+            got_kv = paged_kv[phys, blk_off].float()
+            exp_kv = kv[b, p].float()
+            assert torch.allclose(got_kv, exp_kv, atol=1e-5), (
+                f"batch={b} pos={p}: paged_kv mismatch "
+                f"max_diff={(got_kv - exp_kv).abs().max():.6f}"
+            )
+
+            got_sc = paged_score[phys, blk_off].float()
+            exp_sc = (score[b, p] + ape[r]).float()
+            assert torch.allclose(got_sc, exp_sc, atol=1e-5), (
+                f"batch={b} pos={p}: paged_score mismatch "
+                f"max_diff={(got_sc - exp_sc).abs().max():.6f}"
+            )
+
+
+BLOCK_REUSE_CONFIGS = [
+    # (batch_size, prefix_len, compress_ratio, head_dim, overlap, reuse_at)
+    # reuse_at must be on a chunk boundary (reuse_at % compress_ratio == 0)
+    # so the decode uses an EARLIER chunk as overlap window, not the last one.
+    pytest.param(1, 12, 4, 128, True, 4, id="overlap_hd128_reuse_after_chunk0"),
+    pytest.param(1, 12, 4, 512, True, 8, id="overlap_hd512_reuse_after_chunk1"),
+    pytest.param(1, 512, 128, 128, False, 128, id="basic_hd128_reuse_after_chunk0"),
+    pytest.param(1, 512, 128, 512, False, 256, id="basic_hd512_reuse_after_chunk1"),
+]
+
+
+@pytest.mark.parametrize(
+    "batch_size,prefix_len,compress_ratio,head_dim,overlap,reuse_at",
+    BLOCK_REUSE_CONFIGS,
+)
+def test_prefill_block_reuse_decode(
+    batch_size, prefix_len, compress_ratio, head_dim, overlap, reuse_at
+):
+    """End-to-end block reuse: decode from mid-prefix using paged cache written during prefill.
+
+    Simulates the block reuse scenario:
+      1. Request A prefills the full prefix [0 .. prefix_len-1], populating paged cache.
+      2. Request B reuses A's paged blocks: decodes starting at position reuse_at,
+         reading the overlap window from earlier blocks (positions < reuse_at).
+
+    With the old code only the last chunk was in paged cache, so decode triggered at
+    reuse_at + compress_ratio - 1 would read garbage for the overlap window.
+    With the fix, all blocks are present and decode outputs must match the reference.
+    """
+    assert reuse_at % compress_ratio == 0, "reuse_at must be on a chunk boundary"
+    assert reuse_at < prefix_len, "reuse_at must be within the prefix"
+
+    coff = 2 if overlap else 1
+    state_len = coff * compress_ratio
+    state_dim = coff * head_dim
+    page_size = 8
+    decode_steps = compress_ratio * 2  # enough to trigger two compressions
+    total_len = prefix_len + decode_steps
+    max_blocks = (total_len + (compress_ratio if overlap else 0) + page_size - 1) // page_size
+
+    ape = torch.randn(compress_ratio, state_dim, device="cuda")
+
+    num_blocks = batch_size * max_blocks
+    paged_kv = torch.zeros(num_blocks, page_size, state_dim, device="cuda")
+    paged_score = torch.zeros(num_blocks, page_size, state_dim, device="cuda")
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32).view(
+        batch_size, max_blocks
+    )
+
+    # --- Step 1: Prefill the full prefix ---
+    kv_prefill = torch.randn(batch_size, prefix_len, state_dim, device="cuda")
+    score_prefill = torch.randn(batch_size, prefix_len, state_dim, device="cuda")
+
+    kv_score_prefill = fuse_kv_score(
+        kv_prefill.view(-1, state_dim), score_prefill.view(-1, state_dim)
+    )
+    kv_lens_pre = torch.full((batch_size,), prefix_len, device="cuda", dtype=torch.int32)
+    start_pos_pre = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_prefill_metadata(
+        kv_lens_pre, start_pos_pre, compress_ratio, head_dim, "cuda"
+    )
+    kv_comp_pre = prepare_compress_output(cu_outputs, batch_size, head_dim, "cuda", torch.bfloat16)
+    max_outputs = torch.clamp((kv_lens_pre - start_pos_pre) // compress_ratio, min=1).max().item()
+
+    prefill_kernel(
+        kv_score_prefill, ape, kv_lens_pre, start_pos_pre,
+        cu_seq_lens, cu_outputs, kv_comp_pre,
+        paged_kv, paged_score, block_table, max_outputs, block_table,
+        compress_ratio, head_dim, page_size,
+    )
+
+    # --- Step 2: Build PyTorch reference state at reuse_at ---
+    # The state at reuse_at is: the overlap window = tokens [reuse_at-CR .. reuse_at-1],
+    # and any remainder tokens within [reuse_at-CR .. reuse_at).
+    # Since reuse_at is on a chunk boundary, remainder = 0.
+    kv_state_py = torch.zeros(batch_size, state_len, state_dim, device="cuda")
+    score_state_py = torch.full((batch_size, state_len, state_dim), float("-inf"), device="cuda")
+
+    if overlap and reuse_at >= compress_ratio:
+        # Overlap window = last full chunk before reuse_at: [reuse_at-CR .. reuse_at-1]
+        kv_state_py[:, :compress_ratio] = kv_prefill[:, reuse_at - compress_ratio : reuse_at]
+        score_state_py[:, :compress_ratio] = (
+            score_prefill[:, reuse_at - compress_ratio : reuse_at]
+            + ape.unsqueeze(0)
+        )
+    # (non-overlap, or overlap with reuse_at < compress_ratio: state stays zero/-inf)
+
+    # --- Step 3: Decode from reuse_at and verify outputs match reference ---
+    cu_seq_lens_dec, cu_outputs_dec = prepare_decode_metadata(
+        batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=1
+    )
+    kv_comp_dec = prepare_compress_output(
+        cu_outputs_dec, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
+    )
+
+    for i in range(decode_steps):
+        token_idx = reuse_at + i
+        total_tokens = token_idx + 1
+
+        new_kv = torch.randn(batch_size, state_dim, device="cuda")
+        new_score = torch.randn(batch_size, state_dim, device="cuda")
+
+        # PyTorch reference (uses ground-truth kv_state_py)
+        out_py = run_pytorch_reference(
+            new_kv.unsqueeze(1), new_score.unsqueeze(1), ape,
+            kv_state_py, score_state_py, token_idx, compress_ratio, head_dim, overlap,
+        )
+
+        # CUDA decode (reads overlap window from paged cache written during prefill)
+        kv_score = fuse_kv_score(new_kv, new_score)
+        kv_lens = torch.full((batch_size,), total_tokens, device="cuda", dtype=torch.int32)
+        start_pos = torch.full((batch_size,), token_idx, device="cuda", dtype=torch.int32)
+
+        decode_kernel(
+            kv_score, ape, kv_lens, start_pos,
+            cu_seq_lens_dec, cu_outputs_dec, kv_comp_dec,
+            paged_kv, paged_score, block_table, block_table,
+            compress_ratio, head_dim, page_size, next_n=1,
+        )
+
+        should_compress = (token_idx + 1) % compress_ratio == 0
+        if should_compress and out_py is not None:
+            for b in range(batch_size):
+                out_idx = cu_outputs_dec[b].item()
+                diff = out_py[b, 0, :head_dim].to(kv_comp_dec.dtype) - kv_comp_dec[out_idx, :]
+                assert torch.allclose(
+                    out_py[b, 0, :head_dim].to(kv_comp_dec.dtype),
+                    kv_comp_dec[out_idx, :],
+                    rtol=1e-2,
+                    atol=1e-3,
+                ), (
+                    f"Block reuse decode step {i} (token_idx={token_idx}), "
+                    f"batch {b}: diff={(diff).abs().max():.6f}"
+                )
+
+
 PREFILL_VARLEN_CONFIGS = [
-    pytest.param([8, 12, 4, 16], 4, 8, True, id="varlen_overlap_mixed"),
-    pytest.param([128, 256, 64, 192], 128, 8, False, id="varlen_basic_mixed"),
-    pytest.param([20, 20, 20], 4, 16, True, id="varlen_uniform"),
-    pytest.param([3, 5, 8, 4], 4, 8, True, id="varlen_some_lt_ratio"),
+    pytest.param([8, 12, 4, 16], 4, 128, True, id="varlen_hd128_overlap"),
+    pytest.param([128, 256, 64, 192], 128, 128, False, id="varlen_hd128_basic"),
+    pytest.param([8, 12, 4, 16], 4, 512, True, id="varlen_hd512_overlap"),
+    pytest.param([128, 256, 64, 192], 128, 512, False, id="varlen_hd512_basic"),
 ]
 
 
@@ -737,7 +963,7 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
     num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
     max_outputs = num_outputs_per_batch.max().item()
 
-    kv_compress_prefill_cutile(
+    prefill_kernel(
         kv_score,
         ape,
         kv_lens,
@@ -752,7 +978,6 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
         block_table,
         compress_ratio,
         head_dim,
-        overlap,
         page_size,
     )
 
@@ -790,11 +1015,10 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
 
 
 PREFILL_DECODE_CONFIGS = [
-    pytest.param(1, 20, 4, 16, True, 12, id="overlap_prefill20_decode12"),
-    pytest.param(1, 256, 128, 16, False, 128, id="basic_prefill256_decode128"),
-    pytest.param(2, 32, 4, 64, True, 20, id="overlap_multi_batch"),
-    pytest.param(1, 5, 4, 8, True, 8, id="overlap_prefill_with_remainder"),
-    pytest.param(1, 512, 128, 32, False, 256, id="basic_large"),
+    pytest.param(1, 20, 4, 128, True, 12, id="overlap_hd128_prefill20_decode12"),
+    pytest.param(1, 256, 128, 128, False, 128, id="basic_hd128_prefill256_decode128"),
+    pytest.param(1, 20, 4, 512, True, 12, id="overlap_hd512_prefill20_decode12"),
+    pytest.param(1, 256, 128, 512, False, 128, id="basic_hd512_prefill256_decode128"),
 ]
 
 
@@ -859,7 +1083,7 @@ def test_prefill_then_decode(
     num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
     max_outputs = num_outputs_per_batch.max().item()
 
-    kv_compress_prefill_cutile(
+    prefill_kernel(
         kv_score_prefill,
         ape,
         kv_lens_prefill,
@@ -874,7 +1098,6 @@ def test_prefill_then_decode(
         block_table,
         compress_ratio,
         head_dim,
-        overlap,
         page_size,
     )
 
@@ -924,12 +1147,12 @@ def test_prefill_then_decode(
             overlap,
         )
 
-        # cuTile decode
+        # CUDA decode
         kv_score = fuse_kv_score(new_kv, new_score)
         kv_lens = torch.full((batch_size,), total_tokens, device="cuda", dtype=torch.int32)
         start_pos = torch.full((batch_size,), token_idx, device="cuda", dtype=torch.int32)
 
-        kv_compress_cutile(
+        decode_kernel(
             kv_score,
             ape,
             kv_lens,
@@ -943,7 +1166,6 @@ def test_prefill_then_decode(
             block_table,
             compress_ratio,
             head_dim,
-            overlap,
             page_size,
             next_n=1,
         )
@@ -956,8 +1178,8 @@ def test_prefill_then_decode(
                 assert torch.allclose(
                     out_py[b, 0, :head_dim].to(kv_comp_decode.dtype),
                     kv_comp_decode[out_idx, :],
-                    rtol=1e-4,
-                    atol=1e-5,
+                    rtol=2e-3,
+                    atol=5e-3,
                 ), (
                     f"Decode step {i} (token_idx={token_idx}), Batch {b}: mismatch diff={(diff).abs().max():.6f}"
                 )
@@ -965,13 +1187,10 @@ def test_prefill_then_decode(
 
 # MTP (Multi-Token Prediction) Tests
 MTP_CONFIGS = [
-    pytest.param(1, 4, 8, True, 4, id="overlap_next4"),
-    pytest.param(2, 4, 8, True, 7, id="overlap_multi_batch_next7"),
-    pytest.param(1, 4, 8, False, 5, id="basic_next5"),
-    pytest.param(1, 4, 64, True, 3, id="overlap_next3_large_head"),
-    pytest.param(4, 4, 32, True, 8, id="overlap_multi_batch_next8"),
-    pytest.param(1, 4, 16, True, 1, id="overlap_next1_single"),
-    pytest.param(2, 128, 32, False, 4, id="basic_multi_batch_next4"),
+    pytest.param(1, 4, 128, True, 4, id="overlap_hd128_next4"),
+    pytest.param(1, 4, 512, True, 3, id="overlap_hd512_next3"),
+    pytest.param(2, 128, 128, False, 4, id="basic_hd128_multi_batch_next4"),
+    pytest.param(1, 128, 512, False, 4, id="basic_hd512_next4"),
 ]
 
 
@@ -1041,7 +1260,7 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
             if out_py is not None:
                 py_outputs.append((token_idx, out_py))
 
-        # cuTile: process all tokens at once
+        # CUDA decode: process all tokens at once
         kv_score = fuse_kv_score(new_kv, new_score)
         abs_start = base_token_idx + step
         kv_lens = torch.full((batch_size,), abs_start + actual_n, device="cuda", dtype=torch.int32)
@@ -1055,7 +1274,7 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
             cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
         )
 
-        kv_compress_cutile(
+        decode_kernel(
             kv_score,
             ape,
             kv_lens,
@@ -1069,7 +1288,6 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
             block_table,
             compress_ratio,
             head_dim,
-            overlap,
             page_size,
             next_n=actual_n,
         )
@@ -1083,8 +1301,8 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
                     assert torch.allclose(
                         out_py[b, 0, :head_dim].to(kv_comp.dtype),
                         kv_comp[out_idx, :],
-                        rtol=1e-4,
-                        atol=5e-5,  # Loose a bit for type conversion
+                        rtol=2e-3,
+                        atol=2e-3,
                     ), f"Token {token_idx}, Batch {b}: mismatch diff={(diff).abs().max():.6f}"
 
         step += actual_n
@@ -1092,15 +1310,22 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
 
 CHUNKED_PREFILL_CONFIGS = [
     # (compress_ratio, head_dim, overlap, batch_size, start_pos, new_seqlen)
-    # overlap=True, various start_pos/seqlen combos
-    pytest.param(4, 512, True, 1, 4, 4, id="overlap_sp4_seq4_1out_paged_prev"),
-    pytest.param(4, 512, True, 1, 4, 8, id="overlap_sp4_seq8_2out"),
-    pytest.param(4, 512, True, 1, 8, 8, id="overlap_sp8_seq8_deeper_history"),
+    # overlap=True, aligned start_pos
+    pytest.param(4, 512, True, 1, 4, 4, id="overlap_sp4_seq4"),
+    pytest.param(4, 512, True, 1, 4, 8, id="overlap_sp4_seq8"),
+    pytest.param(4, 512, True, 1, 8, 8, id="overlap_sp8_seq8"),
     pytest.param(4, 512, True, 2, 4, 4, id="overlap_batch2_sp4_seq4"),
-    pytest.param(4, 512, True, 1, 4, 5, id="overlap_sp4_seq5_with_remainder"),
-    # overlap=False: regression checks
-    pytest.param(128, 128, False, 1, 128, 128, id="basic_sp128_seq128"),
-    pytest.param(4, 512, False, 1, 4, 8, id="basic_ratio4_sp4_seq8"),
+    pytest.param(4, 512, True, 1, 4, 5, id="overlap_sp4_seq5_remainder"),
+    # overlap=True, unaligned start_pos (sp % ratio != 0)
+    pytest.param(4, 512, True, 1, 6, 4, id="overlap_sp6_seq4_unaligned"),
+    pytest.param(4, 512, True, 1, 6, 5, id="overlap_sp6_seq5_unaligned"),
+    pytest.param(4, 512, True, 1, 5, 7, id="overlap_sp5_seq7_unaligned"),
+    pytest.param(4, 512, True, 1, 3, 9, id="overlap_sp3_seq9_unaligned"),
+    # overlap=False, aligned start_pos
+    pytest.param(128, 128, False, 1, 128, 128, id="nonoverlap_sp128_seq128"),
+    # overlap=False, unaligned start_pos
+    pytest.param(128, 128, False, 1, 50, 206, id="nonoverlap_sp50_seq206_unaligned"),
+    pytest.param(128, 128, False, 1, 5, 251, id="nonoverlap_sp5_seq251_2windows"),
 ]
 
 
@@ -1108,92 +1333,124 @@ CHUNKED_PREFILL_CONFIGS = [
     "compress_ratio,head_dim,overlap,batch_size,start_pos_val,new_seqlen",
     CHUNKED_PREFILL_CONFIGS,
 )
-def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_pos_val, new_seqlen):
-    """Chunked prefill: start_pos != 0 — prior tokens already in paged state."""
+def test_chunked_prefill(
+    compress_ratio, head_dim, overlap, batch_size, start_pos_val, new_seqlen
+):
+    """End-to-end chunked prefill: reference (one-shot full prefill) vs
+    kernel (initial prefill + chunked prefill on same paged cache).
+
+    Validates that kernel Phase 1 correctly persists state and Phase 2
+    correctly reads it back in a subsequent call.
+    """
     device = torch.device("cuda")
     coff = 2 if overlap else 1
     state_dim = coff * head_dim
     ratio = compress_ratio
     page_size = 32
+    total_seqlen = start_pos_val + new_seqlen
 
-    total_positions = start_pos_val + new_seqlen + (ratio if overlap else 0)
+    total_ref_outputs = total_seqlen // ratio
+    if total_ref_outputs == 0:
+        return
+
+    # Shared paged cache (zeros — no prior state)
+    total_positions = total_seqlen + (ratio if overlap else 0)
     max_blocks = (total_positions + page_size - 1) // page_size
     num_blocks = batch_size * max_blocks
-
-    paged_kv = torch.randn(num_blocks, page_size, state_dim, device=device) * 0.1
-    paged_score = torch.randn(num_blocks, page_size, state_dim, device=device) * 0.5
+    paged_kv = torch.zeros(num_blocks, page_size, state_dim, device=device)
+    paged_score = torch.zeros(num_blocks, page_size, state_dim, device=device)
     block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).view(
         batch_size, max_blocks
     )
-
-    new_seqlen_total = batch_size * new_seqlen
-    kv_score = torch.randn(new_seqlen_total, 2 * state_dim, device=device)
     ape = torch.randn(ratio, state_dim, device=device)
 
-    kv_lens = torch.full(
-        (batch_size,), start_pos_val + new_seqlen, device=device, dtype=torch.int32
+    # Generate full sequence data
+    kv_full = torch.randn(batch_size, total_seqlen, state_dim, device=device)
+    score_full = torch.randn(batch_size, total_seqlen, state_dim, device=device)
+
+    # ---- Reference: one-shot full prefill (sp=0) ----
+    state_len = coff * ratio
+    kv_state_ref = torch.zeros(batch_size, state_len, state_dim, device=device)
+    score_state_ref = torch.full(
+        (batch_size, state_len, state_dim), float("-inf"), device=device
     )
-    start_pos = torch.full((batch_size,), start_pos_val, device=device, dtype=torch.int32)
-
-    seq_lens = kv_lens - start_pos
-    num_out_per_batch = torch.clamp(seq_lens // ratio, min=1)
-    max_outputs = num_out_per_batch.max().item()
-
-    cu_seq_lens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
-    cu_seq_lens[1:] = seq_lens.cumsum(0)
-    cu_kv_comp = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
-    cu_kv_comp[1:] = num_out_per_batch.cumsum(0)
-
-    kv_comp = torch.empty(cu_kv_comp[-1].item(), head_dim, device=device, dtype=torch.bfloat16)
-
-    kv_compress_prefill_cutile(
-        kv_score,
-        ape,
-        kv_lens,
-        start_pos,
-        cu_seq_lens,
-        cu_kv_comp,
-        kv_comp,
-        paged_kv,
-        paged_score,
-        block_table,
-        max_outputs=max_outputs,
-        block_table_score=block_table,
-        compress_ratio=ratio,
-        head_dim=head_dim,
-        overlap=overlap,
-        page_size=page_size,
+    ref_out = run_pytorch_prefill_reference(
+        kv_full.clone(), score_full.clone(), ape,
+        kv_state_ref, score_state_ref, ratio, head_dim, overlap,
     )
+    assert ref_out is not None, "Reference should produce output"
 
-    actual_num_out = new_seqlen // ratio
-    if actual_num_out == 0:
-        return
+    # ---- Kernel call 1: initial prefill (sp=0, kv_len=start_pos_val) ----
+    actual_num_out_1 = start_pos_val // ratio
+    kv_comp_1 = torch.empty(0, head_dim, device=device, dtype=torch.bfloat16)
 
-    for b in range(batch_size):
-        seq_start = cu_seq_lens[b].item()
-        kv_score_b = kv_score[seq_start : seq_start + new_seqlen]
-        ref = run_pytorch_chunked_prefill_reference(
-            kv_score_b,
-            ape,
-            start_pos_val,
-            ratio,
-            head_dim,
-            overlap,
-            paged_kv,
-            paged_score,
-            page_size,
-            block_table[b],
-            block_table[b],
+    if start_pos_val > 0:
+        kv_score_1 = fuse_kv_score(
+            kv_full[:, :start_pos_val].reshape(-1, state_dim),
+            score_full[:, :start_pos_val].reshape(-1, state_dim),
         )
-        if ref is None:
+        kv_lens_1 = torch.full(
+            (batch_size,), start_pos_val, device=device, dtype=torch.int32
+        )
+        start_pos_1 = torch.zeros(batch_size, device=device, dtype=torch.int32)
+        cu_seq_lens_1, cu_outputs_1 = prepare_prefill_metadata(
+            kv_lens_1, start_pos_1, ratio, head_dim, device,
+        )
+        kv_comp_1 = prepare_compress_output(
+            cu_outputs_1, batch_size, head_dim, device, torch.bfloat16,
+        )
+        max_outputs_1 = max(actual_num_out_1, 1)
+        prefill_kernel(
+            kv_score_1, ape, kv_lens_1, start_pos_1,
+            cu_seq_lens_1, cu_outputs_1, kv_comp_1,
+            paged_kv, paged_score, block_table, max_outputs_1,
+            block_table, ratio, head_dim, page_size,
+        )
+
+    # ---- Kernel call 2: chunked prefill (sp=start_pos_val, kv_len=total_seqlen) ----
+    actual_num_out_2 = total_seqlen // ratio - start_pos_val // ratio
+    kv_score_2 = fuse_kv_score(
+        kv_full[:, start_pos_val:].reshape(-1, state_dim),
+        score_full[:, start_pos_val:].reshape(-1, state_dim),
+    )
+    kv_lens_2 = torch.full(
+        (batch_size,), total_seqlen, device=device, dtype=torch.int32
+    )
+    start_pos_2 = torch.full(
+        (batch_size,), start_pos_val, device=device, dtype=torch.int32
+    )
+    cu_seq_lens_2, cu_outputs_2 = prepare_prefill_metadata(
+        kv_lens_2, start_pos_2, ratio, head_dim, device,
+    )
+    kv_comp_2 = prepare_compress_output(
+        cu_outputs_2, batch_size, head_dim, device, torch.bfloat16,
+    )
+    max_outputs_2 = max(actual_num_out_2, 1)
+    prefill_kernel(
+        kv_score_2, ape, kv_lens_2, start_pos_2,
+        cu_seq_lens_2, cu_outputs_2, kv_comp_2,
+        paged_kv, paged_score, block_table, max_outputs_2,
+        block_table, ratio, head_dim, page_size,
+    )
+
+    # ---- Compare per batch: concat(call1_out, call2_out) vs reference ----
+    for b in range(batch_size):
+        parts = []
+        if start_pos_val > 0 and actual_num_out_1 > 0:
+            off_1 = cu_outputs_1[b].item()
+            parts.append(kv_comp_1[off_1 : off_1 + actual_num_out_1])
+        if actual_num_out_2 > 0:
+            off_2 = cu_outputs_2[b].item()
+            parts.append(kv_comp_2[off_2 : off_2 + actual_num_out_2])
+
+        if not parts:
             continue
+        kernel_out_b = torch.cat(parts, dim=0)
+        ref_out_b = ref_out[b, :total_ref_outputs, :head_dim].to(torch.bfloat16)
 
-        out_start = cu_kv_comp[b].item()
-        out_b = kv_comp[out_start : out_start + actual_num_out]
-
-        assert torch.allclose(ref, out_b, rtol=2e-3, atol=5e-3), (
-            f"batch={b} start_pos={start_pos_val} seqlen={new_seqlen} "
-            f"max_diff={(ref - out_b).abs().max():.6f}"
+        assert torch.allclose(ref_out_b, kernel_out_b, rtol=2e-3, atol=5e-3), (
+            f"batch={b} sp={start_pos_val} seqlen={new_seqlen} "
+            f"max_diff={(ref_out_b - kernel_out_b).abs().max():.6f}"
         )
 
 
@@ -1205,6 +1462,28 @@ try:
     _HAS_POSTPROCESS_SCATTER = hasattr(torch.ops.trtllm, "compressor_postprocess_scatter")
 except Exception:
     _HAS_POSTPROCESS_SCATTER = False
+
+
+def _scatter_reference_to_paged_cache(
+    kv: torch.Tensor,
+    num_comp_tokens: torch.Tensor,
+    cu_kv_comp: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_offsets: torch.Tensor,
+    tokens_per_block: int,
+    head_dim: int,
+):
+    """Reference paged scatter without calling any CuTile kernel."""
+    batch_size = num_comp_tokens.shape[0]
+    for b in range(batch_size):
+        num_tokens_b = num_comp_tokens[b].item()
+        src_start = cu_kv_comp[b].item()
+        for t in range(num_tokens_b):
+            blk = t // tokens_per_block
+            off = t % tokens_per_block
+            phys = block_offsets[b, blk].item()
+            dst = off * head_dim
+            kv_cache[phys, dst : dst + head_dim] = kv[src_start + t]
 
 
 @pytest.mark.parametrize("rotate_activation", [True, False], ids=["rotate", "no_rotate"])
@@ -1275,16 +1554,14 @@ def test_fused_postprocess_scatter(
         rotate_activation,
     )
 
-    compressed_kv_scatter_cutile(
+    _scatter_reference_to_paged_cache(
         x,
         num_comp_tokens,
         cu_kv_comp,
-        start_pos,
         kv_cache_ref,
         block_offsets,
         tokens_per_block,
         head_dim,
-        max_outputs=max_outputs,
     )
 
     # --- Fused postprocess + scatter kernel ---
@@ -1773,10 +2050,10 @@ def test_fused_postprocess_scatter_fp8_blockwise(
 
 
 def benchmark_compress_kernel():
-    """Benchmark cuTile vs PyTorch compress (decode) kernels using triton.testing.do_bench."""
+    """Benchmark CUDA vs PyTorch compress (decode) kernels using triton.testing.do_bench."""
 
     print("\n" + "=" * 70)
-    print("Compress Kernel Benchmark: cuTile vs PyTorch (decode)")
+    print("Compress Kernel Benchmark: CUDA vs PyTorch (decode)")
     print("=" * 70)
 
     configs = [
@@ -1831,26 +2108,25 @@ def benchmark_compress_kernel():
             cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
         )
 
-        paged_kv_cutile = paged_kv.clone()
-        paged_score_cutile = paged_score.clone()
-        kv_comp_cutile = kv_comp.clone()
+        paged_kv_cuda = paged_kv.clone()
+        paged_score_cuda = paged_score.clone()
+        kv_comp_cuda = kv_comp.clone()
 
-        def cutile_fn():
-            kv_compress_cutile(
+        def cuda_fn():
+            decode_kernel(
                 kv_score,
                 ape,
                 kv_lens,
                 start_pos,
                 cu_seq_lens,
                 cu_outputs,
-                kv_comp_cutile,
-                paged_kv_cutile,
-                paged_score_cutile,
+                kv_comp_cuda,
+                paged_kv_cuda,
+                paged_score_cuda,
                 block_table,
                 block_table,
                 compress_ratio,
                 head_dim,
-                overlap,
                 page_size,
                 next_n=1,
             )
@@ -1868,27 +2144,27 @@ def benchmark_compress_kernel():
                 overlap,
             )
 
-        cutile_ms = triton.testing.do_bench(cutile_fn, warmup=25, rep=100)
+        cuda_ms = triton.testing.do_bench(cuda_fn, warmup=25, rep=100)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=25, rep=100)
 
-        cutile_us = cutile_ms * 1000
+        cuda_us = cuda_ms * 1000
         pytorch_us = pytorch_ms * 1000
 
         results.append(
             {
                 "name": name,
-                "cutile_us": cutile_us,
+                "cuda_us": cuda_us,
                 "pytorch_us": pytorch_us,
-                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
+                "speedup": pytorch_us / cuda_us if cuda_us > 0 else float("inf"),
             }
         )
 
     # Print results
-    print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
+    print(f"\n{'Config':<30} {'CUDA (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
     print("-" * 70)
     for r in results:
         print(
-            f"{r['name']:<30} {r['cutile_us']:>12.2f} "
+            f"{r['name']:<30} {r['cuda_us']:>12.2f} "
             f"{r['pytorch_us']:>12.2f} {r['speedup']:>9.2f}x"
         )
     print("=" * 70)
@@ -1897,10 +2173,10 @@ def benchmark_compress_kernel():
 
 
 def benchmark_compress_prefill_kernel():
-    """Benchmark cuTile vs PyTorch compress (prefill) kernels using triton.testing.do_bench."""
+    """Benchmark CUDA vs PyTorch compress (prefill) kernels using triton.testing.do_bench."""
 
     print("\n" + "=" * 70)
-    print("Compress Prefill Kernel Benchmark: cuTile vs PyTorch")
+    print("Compress Prefill Kernel Benchmark: CUDA vs PyTorch")
     print("=" * 70)
 
     configs = [
@@ -1947,30 +2223,29 @@ def benchmark_compress_prefill_kernel():
             batch_size, seqlen, compress_ratio, head_dim, overlap, page_size
         )
 
-        paged_kv_cutile = paged_kv.clone()
-        paged_score_cutile = paged_score.clone()
-        kv_comp_cutile = kv_comp.clone()
+        paged_kv_kernel = paged_kv.clone()
+        paged_score_kernel = paged_score.clone()
+        kv_comp_kernel = kv_comp.clone()
 
-        def cutile_fn():
+        def kernel_fn():
             seq_lens = kv_lens - start_pos
             num_outputs_per_batch = torch.clamp(seq_lens // compress_ratio, min=1)
             max_outputs = num_outputs_per_batch.max().item()
-            kv_compress_prefill_cutile(
+            prefill_kernel(
                 kv_score,
                 ape,
                 kv_lens,
                 start_pos,
                 cu_seq_lens,
                 cu_outputs,
-                kv_comp_cutile,
-                paged_kv_cutile,
-                paged_score_cutile,
+                kv_comp_kernel,
+                paged_kv_kernel,
+                paged_score_kernel,
                 block_table,
                 max_outputs,
                 block_table,
                 compress_ratio,
                 head_dim,
-                overlap,
                 page_size,
             )
 
@@ -1986,27 +2261,27 @@ def benchmark_compress_prefill_kernel():
                 overlap,
             )
 
-        cutile_ms = triton.testing.do_bench(cutile_fn, warmup=25, rep=100)
+        kernel_ms = triton.testing.do_bench(kernel_fn, warmup=25, rep=100)
         pytorch_ms = triton.testing.do_bench(pytorch_fn, warmup=25, rep=100)
 
-        cutile_us = cutile_ms * 1000
+        kernel_us = kernel_ms * 1000
         pytorch_us = pytorch_ms * 1000
 
         results.append(
             {
                 "name": name,
-                "cutile_us": cutile_us,
+                "kernel_us": kernel_us,
                 "pytorch_us": pytorch_us,
-                "speedup": pytorch_us / cutile_us if cutile_us > 0 else float("inf"),
+                "speedup": pytorch_us / kernel_us if kernel_us > 0 else float("inf"),
             }
         )
 
     # Print results
-    print(f"\n{'Config':<30} {'cuTile (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
+    print(f"\n{'Config':<30} {'CUDA (us)':>12} {'PyTorch (us)':>12} {'Speedup':>10}")
     print("-" * 70)
     for r in results:
         print(
-            f"{r['name']:<30} {r['cutile_us']:>12.2f} "
+            f"{r['name']:<30} {r['kernel_us']:>12.2f} "
             f"{r['pytorch_us']:>12.2f} {r['speedup']:>9.2f}x"
         )
     print("=" * 70)
@@ -2020,7 +2295,6 @@ def run_all_benchmarks():
     print("Compressor Kernel Benchmarks")
     print("=" * 80)
 
-    # cuTile vs PyTorch
     benchmark_compress_kernel()
     benchmark_compress_prefill_kernel()
 

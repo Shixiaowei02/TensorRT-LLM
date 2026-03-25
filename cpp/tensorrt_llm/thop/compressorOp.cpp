@@ -37,7 +37,7 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     torch::Tensor start_pos,                             // [bsz] int32
     torch::Tensor cu_seq_lens,                           // [bsz+1] int32
     torch::Tensor cu_kv_comp,                            // [bsz+1] int32
-    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, bool is_overlap, int64_t next_n)
+    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t next_n)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     int io_eb = static_cast<int>(kv_score.element_size());
@@ -48,16 +48,14 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
         cu_kv_comp.data_ptr<int32_t>(),
         static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
-        static_cast<int>(head_dim), static_cast<int>(compress_ratio), is_overlap, static_cast<int>(next_n), io_eb,
-        out_eb, stream);
+        static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(next_n), io_eb, out_eb, stream);
 }
 
 // Prefill kernel: bulk compression with state update
 void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, torch::Tensor paged_kv,
     torch::Tensor paged_score, torch::Tensor block_table_kv, torch::Tensor block_table_score, torch::Tensor output,
     torch::Tensor kv_lens, torch::Tensor start_pos, torch::Tensor cu_seq_lens, torch::Tensor cu_kv_comp,
-    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio,
-    bool is_overlap, int64_t max_outputs)
+    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t max_outputs)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     int io_eb = static_cast<int>(kv_score.element_size());
@@ -68,8 +66,8 @@ void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, tor
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
         cu_kv_comp.data_ptr<int32_t>(),
         static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
-        static_cast<int>(head_dim), static_cast<int>(compress_ratio), is_overlap, static_cast<int>(max_outputs), io_eb,
-        out_eb, stream);
+        static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(max_outputs), io_eb, out_eb,
+        stream);
 }
 
 // Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged scatter in one kernel
@@ -130,7 +128,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "
-        "bool is_overlap, int next_n) -> ()");
+        "int next_n) -> ()");
 
     m.def(
         "compressor_prefill_reduction("
@@ -142,7 +140,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "
-        "bool is_overlap, int max_outputs) -> ()");
+        "int max_outputs) -> ()");
 
     m.def(
         "compressor_postprocess_scatter("
