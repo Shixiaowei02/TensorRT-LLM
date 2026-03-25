@@ -62,6 +62,7 @@ from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import MewtwoMoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
@@ -581,6 +582,12 @@ class MewtwoWeightLoader:
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "next_layer_layernorm":
+                    continue
+                elif names[-1] in ("engram",):
+                    # Engram is a container module with no direct parameters;
+                    # its leaf sub-modules (multi_head_embedding, kv_proj,
+                    # short_conv) and direct parameters (key_norm_weight,
+                    # query_norm_weight) are loaded via the generic path.
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
@@ -1230,6 +1237,18 @@ class MewtwoDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
+        # Engram module (optional, for n-gram context augmentation)
+        self.engram: Optional[Engram] = None
+        _engram_config = getattr(config, "engram_config", None)
+        _engram_vocab_sizes_by_layer = getattr(config, "engram_vocab_sizes_by_layer", {})
+        if _engram_config is not None and layer_idx in _engram_vocab_sizes_by_layer:
+            self.engram = Engram(
+                layer_id=layer_idx,
+                config=_engram_config,
+                vocab_sizes_flat=_engram_vocab_sizes_by_layer[layer_idx],
+                stream=aux_stream_dict[AuxStreamType.EngramPrecompute],
+            )
+
     def _get_decoder_layer_quant_config(
         self, model_config: ModelConfig[PretrainedConfig], layer_idx: int
     ):
@@ -1292,8 +1311,18 @@ class MewtwoDecoderLayer(DecoderLayer):
         attn_metadata: MewtwoTrtllmAttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
+        engram_embeddings=None,
         **kwargs,
     ) -> torch.Tensor:
+        # Apply Engram module BEFORE attention if enabled for this layer.
+        # Engram operates on all HC streams with per-stream gating,
+        # returning [T, hc_mult, D].  Its output is added as a
+        # direct residual — no mHC wrapping needed because Engram already
+        # produces per-HC differentiated outputs internally.
+        if self.engram is not None and engram_embeddings is not None:
+            engram_output = self.engram(hidden_states, engram_embeddings)
+            hidden_states = hidden_states + engram_output
+
         residual = hidden_states
         post_mix, res_mix, hidden_states = self.hc_attn.pre_mapping(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
@@ -1565,13 +1594,14 @@ class MewtwoModel(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.hc_mult = config.hc_mult
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(5)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
             AuxStreamType.MoeBalancer: aux_stream_list[2],
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+            AuxStreamType.EngramPrecompute: aux_stream_list[4],
         }
 
         self.embed_tokens = Embedding(
@@ -1582,10 +1612,49 @@ class MewtwoModel(DecoderModel):
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size)
 
+        # Engram hash provider (optional, for n-gram context augmentation)
+        # Must be created before layers so vocab sizes can be stored on config.
+        self.engram_hash_provider: Optional[EngramHashProvider] = None
+        self.use_engram = getattr(config, "has_engram", False)
+        if self.use_engram:
+            engram_config = EngramConfig(
+                tokenizer_name_or_path=getattr(
+                    config, "tokenizer_name_or_path", "deepseek-ai/DeepSeek-V3"
+                ),
+                engram_vocab_size=config.engram_vocab_size,
+                max_ngram_size=config.engram_max_ngram_size,
+                n_embed_per_ngram=config.engram_n_embed_per_ngram,
+                n_head_per_ngram=config.engram_n_head_per_ngram,
+                layer_ids=config.engram_layer_ids,
+                pad_id=config.engram_pad_id,
+                seed=config.engram_seed,
+                kernel_size=config.engram_kernel_size,
+                hidden_size=config.hidden_size,
+                hc_mult=config.hc_mult,
+                norm_eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.engram_hash_provider = EngramHashProvider(engram_config)
+            self.engram_layer_ids = engram_config.layer_ids
+            # Store engram config and per-layer vocab sizes on the pretrained config so
+            # MewtwoDecoderLayer can read them directly from model_config without extra params.
+            config.engram_config = engram_config
+            config.engram_vocab_sizes_by_layer = {
+                layer_id: [
+                    x
+                    for y in self.engram_hash_provider.vocab_size_across_layers[layer_id]
+                    for x in y
+                ]
+                for layer_id in engram_config.layer_ids
+            }
+
         self.layers = nn.ModuleList(
             [
                 MewtwoDecoderLayer(
-                    model_config, layer_idx, self.aux_stream_dict, mapping_with_cp=mapping_with_cp
+                    model_config,
+                    layer_idx,
+                    self.aux_stream_dict,
+                    mapping_with_cp=mapping_with_cp,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -1615,6 +1684,36 @@ class MewtwoModel(DecoderModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        # -----------------------------------------------------------------
+        # Engram pre-computation (overlapped with main-stream layer forward)
+        #
+        # Hash provider internally applies CompressedTokenizer to input_ids,
+        # so no separate engram tokenizer input is needed.
+        #
+        # All precompute() calls are dispatched onto a dedicated engram CUDA
+        # stream so they run concurrently with the main stream processing the
+        # earlier transformer layers.  A per-layer Event is recorded after
+        # each precompute; the main stream waits on the event just before it
+        # needs the result for that specific layer.
+        # -----------------------------------------------------------------
+        engram_embeddings_cache: Optional[Dict] = None
+        engram_events: Dict[int, torch.cuda.Event] = {}
+        if self.use_engram and self.engram_hash_provider is not None and input_ids is not None:
+            hash_cache = self.engram_hash_provider.compute_hashes(
+                input_ids.view(-1),
+                seq_lens=attn_metadata.seq_lens_cuda,
+            )
+            engram_embeddings_cache = {}
+            for layer_id in self.engram_layer_ids:
+                engram_mod = self.layers[layer_id].engram
+                if engram_mod is not None:
+                    # precompute() dispatches onto the engram stream internally and
+                    # records sync_event; the main stream will wait on it before use.
+                    engram_embeddings_cache[layer_id] = engram_mod.precompute(
+                        hash_cache[layer_id], dtype=inputs_embeds.dtype
+                    )
+                    engram_events[layer_id] = engram_mod.sync_event
+
         mapping = self.model_config.mapping
         if mapping.has_pp() and not mapping.is_first_pp_rank():
             hidden_states = torch.empty(
@@ -1629,12 +1728,20 @@ class MewtwoModel(DecoderModel):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+            engram_embeddings = None
+            if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
+                # Sync: ensure the engram stream has finished precompute for this layer
+                # before the main stream reads the result.
+                engram_events[idx].wait(torch.cuda.current_stream())
+                engram_embeddings = engram_embeddings_cache[idx]
+
             hidden_states = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
+                engram_embeddings=engram_embeddings,
             )
 
         hidden_states = self.hc_head(hidden_states)
@@ -1682,6 +1789,13 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
             model=MewtwoModel(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
+
+        # Exclude Engram weights from quantization.  Engram embedding tables
+        # and small linear projections are not suited for NVFP4/FP8 quant.
+        if getattr(self.config, "has_engram", False):
+            if model_config.quant_config.exclude_modules is None:
+                model_config.quant_config.exclude_modules = []
+            model_config.quant_config.exclude_modules.append("*engram*")
 
         self.model_nextn = 0
         if (

@@ -6,6 +6,11 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
+# Default Engram embedding vocabulary size per n-gram level.
+# Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
+_DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
+
+
 # This is a temporary workaround for Mewtwo model as HF does not support it yet
 # TODO: Remove this once HF supports Mewtwo
 class MewtwoConfig(PretrainedConfig):
@@ -64,6 +69,15 @@ class MewtwoConfig(PretrainedConfig):
         window_size=128,
         compress_rope_theta=40000,
         compress_ratios=None,
+        has_engram=False,
+        engram_vocab_size=None,
+        engram_max_ngram_size=3,
+        engram_n_embed_per_ngram=512,
+        engram_n_head_per_ngram=8,
+        engram_kernel_size=4,
+        engram_pad_id=2,
+        engram_layer_ids=None,
+        engram_seed=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -124,6 +138,21 @@ class MewtwoConfig(PretrainedConfig):
         # kv compression
         self.compress_rope_theta = compress_rope_theta
         self.compress_ratios = compress_ratios
+
+        # Engram configuration
+        self.has_engram = has_engram
+        self.engram_vocab_size = (
+            engram_vocab_size
+            if engram_vocab_size is not None
+            else [_DEFAULT_ENGRAM_VOCAB_SIZE, _DEFAULT_ENGRAM_VOCAB_SIZE]
+        )
+        self.engram_max_ngram_size = engram_max_ngram_size
+        self.engram_n_embed_per_ngram = engram_n_embed_per_ngram
+        self.engram_n_head_per_ngram = engram_n_head_per_ngram
+        self.engram_kernel_size = engram_kernel_size
+        self.engram_pad_id = engram_pad_id
+        self.engram_layer_ids = engram_layer_ids if engram_layer_ids is not None else [1, 15]
+        self.engram_seed = engram_seed
 
         super().__init__(
             pad_token_id=pad_token_id,
