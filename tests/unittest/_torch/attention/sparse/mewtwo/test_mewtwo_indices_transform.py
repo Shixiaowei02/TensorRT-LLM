@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.kernel import mewtwo_local_to_global_indices
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo import (
@@ -387,6 +388,8 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     cache_manager.shutdown()
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize(
     "scenario, context_lengths, is_large_gap_case",
     index_transform_cases,

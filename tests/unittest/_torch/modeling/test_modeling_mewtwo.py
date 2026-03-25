@@ -189,7 +189,7 @@ def test_mewtwo_sanity():
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
     with torch.inference_mode(), model_extra_attrs(extra_attrs):
         scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests = reqs
+        scheduled_batch.context_requests_last_chunk = reqs
         kv_cache_manager.prepare_resources(scheduled_batch)
         attn_metadata.prepare()
 
@@ -224,6 +224,3 @@ def test_mewtwo_sanity():
     for req in reqs:
         kv_cache_manager.free_resources(req)
     kv_cache_manager.shutdown()
-
-
-test_mewtwo_sanity()

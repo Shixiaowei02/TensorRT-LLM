@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
@@ -508,6 +509,8 @@ def _allocate_kv_cache_for_generation(cache_manager, request_ids, num_tokens: in
         kv_cache.resize(kv_cache.capacity + num_tokens)
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
 @pytest.mark.parametrize("num_generation_steps", [2])
 def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int):
@@ -1016,6 +1019,8 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
     print("\nAll tests passed!")
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[14, 508, 3947]])
 def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
     scenario = Scenario()

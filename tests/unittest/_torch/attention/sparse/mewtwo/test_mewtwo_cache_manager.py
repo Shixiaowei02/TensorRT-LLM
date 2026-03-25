@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo import MewtwoCacheManager
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoAttentionType
@@ -27,6 +28,8 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     return buffer
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 class TestMewtwoCacheManager:
     # mewtwo specific param
     head_dim = 512
