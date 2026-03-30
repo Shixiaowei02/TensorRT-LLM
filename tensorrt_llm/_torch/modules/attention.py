@@ -2705,6 +2705,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
+            output=output if self.is_mewtwo else None,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
@@ -2719,39 +2720,46 @@ class MLA(nn.Module):
         )
         fused_q = None
 
-        # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
-        v_head_dim = self.v_head_dim if self.is_mewtwo else self.kv_lora_rank
-        assert (attn_out_latent.shape[0] == q.shape[0] and
-                attn_out_latent.shape[1] == self.num_heads_tp_cp * v_head_dim)
-
-        # [seq, num_heads, kv_lora_rank] or [seq, num_heads, v_head_dim]
-        attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads_tp_cp, v_head_dim])
-
         if self.is_mewtwo:
-            output.copy_(attn_out_latent.view([num_tokens, -1]))
-        else:
-            attn_output = output.view(
-                [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+            if self.mapping.has_cp_helix():
+                raise RuntimeError(
+                    "Mewtwo + CP Helix is not supported: "
+                    "_helix_post_process returns a different tensor, "
+                    "bypassing the pre-allocated output buffer.")
+            assert attn_out_latent.data_ptr() == output.data_ptr(), \
+                "Attention backend did not write into the provided output buffer."
+            return output
 
-            if self.v_b_proj.dtype == torch.bfloat16:
-                # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-                # -> [num_heads, seq, v_head_dim]
-                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                         self.v_b_proj.transpose(1, 2),
-                                         attn_output.transpose(0, 1))
-            elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-                fp8_block_scaling_bmm_out(
-                    attn_out_latent,
-                    self.v_b_proj,
-                    self.v_b_proj_scale,
-                    attn_output.transpose(0, 1),
-                    self.v_b_proj_dequant,
-                    self.use_cute_dsl_blockscaling_bmm,
-                )
-            else:
-                raise NotImplementedError(
-                    f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+        # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
+        assert (attn_out_latent.shape[0] == q.shape[0]
+                and attn_out_latent.shape[1]
+                == self.num_heads_tp_cp * self.kv_lora_rank)
+
+        # [seq, num_heads, kv_lora_rank]
+        attn_out_latent = attn_out_latent.view(
+            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
+
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+
+        if self.v_b_proj.dtype == torch.bfloat16:
+            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+            # -> [num_heads, seq, v_head_dim]
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
+        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+            fp8_block_scaling_bmm_out(
+                attn_out_latent,
+                self.v_b_proj,
+                self.v_b_proj_scale,
+                attn_output.transpose(0, 1),
+                self.v_b_proj_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
+            )
+        else:
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         return output
 
@@ -2831,6 +2839,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
+            output=output if self.is_mewtwo else None,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
@@ -2838,39 +2847,46 @@ class MLA(nn.Module):
         )
         fused_q = None
 
+        if self.is_mewtwo:
+            if self.mapping.has_cp_helix():
+                raise RuntimeError(
+                    "Mewtwo + CP Helix is not supported: "
+                    "_helix_post_process returns a different tensor, "
+                    "bypassing the pre-allocated output buffer.")
+            assert attn_out_latent.data_ptr() == output.data_ptr(), \
+                "Attention backend did not write into the provided output buffer."
+            return output
+
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
-        v_head_dim = self.v_head_dim if self.is_mewtwo else self.kv_lora_rank
-        assert (attn_out_latent.shape[0] == q.shape[0] and
-                attn_out_latent.shape[1] == self.num_heads_tp_cp * v_head_dim)
+        assert (attn_out_latent.shape[0] == q.shape[0]
+                and attn_out_latent.shape[1]
+                == self.num_heads_tp_cp * self.kv_lora_rank)
 
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
-            [-1, self.num_heads_tp_cp, v_head_dim])
+            [-1, self.num_heads_tp_cp, self.kv_lora_rank])
 
-        if self.is_mewtwo:
-            output.copy_(attn_out_latent.view([num_tokens, -1]))
+        attn_output = output.view(
+            [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
+
+        if self.v_b_proj.dtype == torch.bfloat16:
+            # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
+            # -> [num_heads, seq, v_head_dim]
+            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
+                                     self.v_b_proj.transpose(1, 2),
+                                     attn_output.transpose(0, 1))
+        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+            fp8_block_scaling_bmm_out(
+                attn_out_latent,
+                self.v_b_proj,
+                self.v_b_proj_scale,
+                attn_output.transpose(0, 1),
+                self.v_b_proj_dequant,
+                self.use_cute_dsl_blockscaling_bmm,
+            )
         else:
-            attn_output = output.view(
-                [num_tokens, self.num_heads_tp_cp, self.v_head_dim])
-
-            if self.v_b_proj.dtype == torch.bfloat16:
-                # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
-                # -> [num_heads, seq, v_head_dim]
-                torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                         self.v_b_proj.transpose(1, 2),
-                                         attn_output.transpose(0, 1))
-            elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-                fp8_block_scaling_bmm_out(
-                    attn_out_latent,
-                    self.v_b_proj,
-                    self.v_b_proj_scale,
-                    attn_output.transpose(0, 1),
-                    self.v_b_proj_dequant,
-                    self.use_cute_dsl_blockscaling_bmm,
-                )
-            else:
-                raise NotImplementedError(
-                    f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
+            raise NotImplementedError(
+                f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         return output
 
