@@ -107,8 +107,10 @@ def test_mewtwo_sanity():
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:3] + past_seen_tokens[3:]
     tokens_per_block = 128  # Mewtwo requirement
+    max_new_tokens = 1024
     required_blocks = sum(
-        (token_num + tokens_per_block - 1) // tokens_per_block for token_num in token_nums
+        (token_num + max_new_tokens + tokens_per_block - 1) // tokens_per_block
+        for token_num in token_nums
     )
     num_blocks = max(10, required_blocks)
     head_dim = config.v_head_dim
@@ -147,17 +149,22 @@ def test_mewtwo_sanity():
         sparse_attn_config=sparse_attn_config,
         model_config=model_config,
     )
-    # reqs = add_dummy_requests(kv_cache_manager, request_ids, token_nums)
-    reqs = [
-        LlmRequest(
+    # Register request IDs in KV cache via prepare_context / resize_context
+    reqs = []
+    for i, req_id in enumerate(request_ids):
+        req = LlmRequest(
             request_id=req_id,
-            max_new_tokens=1024,
+            max_new_tokens=max_new_tokens,
             input_tokens=list(range(token_nums[i])),
             sampling_config=SamplingConfig(),
             is_streaming=False,
         )
-        for i, req_id in enumerate(request_ids)
-    ]
+        success = kv_cache_manager.prepare_context(req)
+        assert success, f"Failed to prepare context for request {req_id}"
+        # Allocate enough capacity for context tokens plus generation headroom
+        success = kv_cache_manager.resize_context(req, token_nums[i] + max_new_tokens)
+        assert success, f"Failed to resize context for request {req_id}"
+        reqs.append(req)
 
     attn_metadata = MewtwoTrtllmAttentionMetadata(
         seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
@@ -183,7 +190,7 @@ def test_mewtwo_sanity():
         position_ids.append(position_id)
         seq_lens.append(seq_len)
 
-    position_ids = torch.cat(position_ids).unsqueeze(0)
+    position_ids = torch.cat(position_ids).unsqueeze(0).to(torch.int32)
 
     extra_attrs = model_config.extra_attrs
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)

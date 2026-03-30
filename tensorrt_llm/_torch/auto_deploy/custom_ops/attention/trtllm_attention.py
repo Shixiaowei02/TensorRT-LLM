@@ -478,6 +478,7 @@ def trtllm_mha_with_cache(
         None,  # qk_nope_head_dim (MLA)
         None,  # qk_rope_head_dim (MLA)
         None,  # v_head_dim (MLA)
+        None,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
         mla_tensor_params,  # mla_tensor_params
@@ -491,6 +492,7 @@ def trtllm_mha_with_cache(
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
         0,  # sparse_mla_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
@@ -500,6 +502,9 @@ def trtllm_mha_with_cache(
         None,  # mla_bmm1_scale
         None,  # mla_bmm2_scale
         None,  # quant_q_buffer
+        None,  # flash_mla_tile_scheduler_metadata
+        None,  # flash_mla_num_splits
+        None,  # sparse_mla_secondary_kv_pool_ptr
     )
 
     if out is not None:

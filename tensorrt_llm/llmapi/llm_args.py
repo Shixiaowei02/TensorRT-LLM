@@ -360,7 +360,7 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
 
     compress_ratios: List[int] = Field(
-        default=[1, 1, 4, 128, 4, 128, 4],
+        default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
         description="The compress ratios of each layer.")
 
     window_size: int = Field(
