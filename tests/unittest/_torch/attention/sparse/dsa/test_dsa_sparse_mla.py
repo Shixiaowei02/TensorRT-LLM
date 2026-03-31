@@ -9,6 +9,7 @@ from typing import List, Optional
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -21,7 +22,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
@@ -428,7 +429,8 @@ SPARSE_TOPK = 2048
 
 
 # Convert parameterized tests to pytest parametrize
-@pytest.mark.skipif(get_sm_version() < 90, reason="Sparse MLA requires SM90 (Hopper) or later")
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize(
     "context_sequence_lengths",
