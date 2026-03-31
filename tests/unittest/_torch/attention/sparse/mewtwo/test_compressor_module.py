@@ -810,7 +810,7 @@ class CompressorWrapper:
         is_prefill: torch.Tensor,
         batch_indices: torch.Tensor = None,
     ) -> Tuple[List[LlmRequest], ScheduledRequests]:
-        """Prepare requests for a batch using prepare_resources pattern from test_mewtwo_cache_manager.
+        """Prepare requests for a batch using the KVCacheV2 scheduler allocation flow.
 
         Args:
             batch_indices: Optional tensor mapping batch positions to external batch indices.
@@ -830,7 +830,7 @@ class CompressorWrapper:
         else:
             ext_indices = list(range(bsz))
 
-        # Separate prefill and generation indices
+        # Separate prefill and generation indices.
         prefill_indices = []
         gen_indices = []
         for b in range(bsz):
@@ -839,19 +839,33 @@ class CompressorWrapper:
             else:
                 gen_indices.append(b)
 
-        # Handle prefill requests - create LlmRequest directly (following test_mewtwo_cache_manager pattern)
+        # Handle prefill requests, including chunked prefill with start_pos > 0.
         for b in prefill_indices:
-            seq_len = int(seq_lens[b].item())
-            req = self._create_request(self.next_request_id, seq_len)
             ext_idx = ext_indices[b]
-            self.active_requests[ext_idx] = req
+            req = self.active_requests.get(ext_idx)
+            total_prompt_len = int((start_pos[b] + seq_lens[b]).item())
+            chunk_size = int(seq_lens[b].item())
+            if req is None:
+                assert int(start_pos[b].item()) == 0, (
+                    "Chunked prefill requests must reuse an existing request created by "
+                    "the initial context chunk"
+                )
+                req = self._create_request(self.next_request_id, total_prompt_len)
+                self.active_requests[ext_idx] = req
+                self.next_request_id += 1
+            req.state = LlmRequestState.CONTEXT_INIT
+            req.context_current_position = int(start_pos[b].item())
+            req.prompt_len = total_prompt_len
+            req.py_prompt_len = total_prompt_len
+            req.context_chunk_size = chunk_size
+            req.py_draft_tokens = []
             context_requests.append(req)
-            self.next_request_id += 1
 
         # Handle generation requests - reuse existing requests or create new ones
         for b in gen_indices:
             ext_idx = ext_indices[b]
             req = self.active_requests.get(ext_idx)
+            req_seq_len = int(seq_lens[b].item())
             if req is None:
                 # Need to create a new request for generation (prefill was done in previous call)
                 pos = int(start_pos[b].item())
@@ -864,6 +878,9 @@ class CompressorWrapper:
             else:
                 # Existing request from previous prefill - mark as generation
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            # Scheduler v2 allocates 1 sampled token plus any draft tokens.
+            # Mirror that contract so multi-token generation reserves enough KV slots.
+            req.py_draft_tokens = [0] * max(req_seq_len - 1, 0)
             generation_requests.append(req)
 
         # Build final request list in batch order
@@ -871,16 +888,22 @@ class CompressorWrapper:
             ext_idx = ext_indices[b]
             requests.append(self.active_requests[ext_idx])
 
-        # Build scheduled batch and call prepare_resources (following test_mewtwo_cache_manager pattern)
+        # Build scheduled batch and allocate buffers like KVCacheV2Scheduler.
         scheduled_batch = ScheduledRequests()
         for req in context_requests:
             scheduled_batch.append_context_request(req)
         scheduled_batch.generation_requests = generation_requests
         for req in context_requests:
-            self.cache_manager.prepare_context(req)
-            self.cache_manager.resize_context(req, req.context_chunk_size)
+            assert self.cache_manager.prepare_context(req), (
+                f"Failed to prepare context for request {req.py_request_id}"
+            )
+            assert self.cache_manager.resize_context(req, req.context_chunk_size), (
+                f"Failed to resize context for request {req.py_request_id}"
+            )
         for req in generation_requests:
-            self.cache_manager.try_allocate_generation(req)
+            assert self.cache_manager.try_allocate_generation(req), (
+                f"Failed to allocate generation KV cache for request {req.py_request_id}"
+            )
 
         return requests, scheduled_batch
 
@@ -904,12 +927,29 @@ class CompressorWrapper:
         freqs_cis: torch.Tensor,
         batch_indices: torch.Tensor = None,
         seq_lens: torch.Tensor = None,
+        *,
+        is_prefill: torch.Tensor | None = None,
     ):
         """Wrapper forward that matches the reference Compressor interface.
 
         Supports mixed prefill+decode when seq_lens and start_pos tensor are provided.
         """
         ratio = self.compress_ratio
+
+        def normalize_is_prefill(
+            prefill: torch.Tensor | None, default: torch.Tensor
+        ) -> torch.Tensor:
+            if prefill is None:
+                prefill_tensor = default
+            else:
+                assert isinstance(prefill, torch.Tensor), "is_prefill must be a torch.Tensor"
+                prefill_tensor = prefill.to(device=DEVICE, dtype=torch.bool)
+                if prefill_tensor.ndim == 0:
+                    prefill_tensor = prefill_tensor.expand(bsz)
+            assert prefill_tensor.shape == (bsz,), (
+                f"is_prefill must have shape ({bsz},), got {tuple(prefill_tensor.shape)}"
+            )
+            return prefill_tensor
 
         # Handle variable-length sequences
         if seq_lens is not None:
@@ -929,8 +969,12 @@ class CompressorWrapper:
             total_tokens = int(seq_lens.sum().item())
             x_flat = x_flat[:total_tokens]
 
-            # Determine which sequences are context (prefill) vs generation (decode)
-            is_context = start_pos_tensor == 0
+            is_prefill_tensor = normalize_is_prefill(
+                is_prefill, (start_pos_tensor == 0) | (seq_lens > 1)
+            )
+
+            # Determine which sequences are context (prefill) vs generation (decode).
+            is_context = is_prefill_tensor
             num_contexts = int(is_context.sum().item())
             num_generations = bsz - num_contexts
 
@@ -962,29 +1006,48 @@ class CompressorWrapper:
             )
             seq_lens = seq_lens_reordered
             past_kv_lens = start_pos_reordered
+            is_prefill = is_context[reorder_indices]
 
             # Use reorder_indices for request mapping (maps reordered position to original batch index)
             batch_indices_for_requests = reorder_indices
             start_pos_for_kv = past_kv_lens
 
             # Get number of compressed tokens
-            num_ctx_compressed_tokens = (seq_lens[:num_contexts] // ratio).sum().item()
-            num_gen_compressed_tokens = num_generations
+            num_comp_per_seq = (past_kv_lens + seq_lens) // ratio - past_kv_lens // ratio
+            num_ctx_compressed_tokens = int(num_comp_per_seq[:num_contexts].sum().item())
+            num_gen_compressed_tokens = int(num_comp_per_seq[num_contexts:].sum().item())
         else:
             # Original single-mode logic
             bsz, seqlen, _ = x.size()
             x_flat = x.reshape(-1, DIM)
+            if isinstance(start_pos, torch.Tensor):
+                past_kv_lens = start_pos.to(torch.int32).to(DEVICE)
+                if past_kv_lens.ndim == 0:
+                    past_kv_lens = past_kv_lens.expand(bsz)
+            else:
+                past_kv_lens = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
 
-            if seqlen == 1:
+            is_prefill = normalize_is_prefill(
+                is_prefill, torch.full((bsz,), seqlen > 1, dtype=torch.bool, device=DEVICE)
+            )
+            if not torch.all(is_prefill == is_prefill[0]):
+                raise ValueError(
+                    "single-shape forward requires uniform is_prefill across the batch"
+                )
+            is_prefill_value = bool(is_prefill[0].item())
+
+            if not is_prefill_value:
                 # Decode mode
                 num_contexts = 0
                 num_generations = bsz
                 num_ctx_tokens = 0
-                num_gen_tokens = bsz
-                seq_lens = torch.ones(bsz, dtype=torch.int32, device=DEVICE)
-                past_kv_lens = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
+                num_gen_tokens = bsz * seqlen
+                seq_lens = torch.full((bsz,), seqlen, dtype=torch.int32, device=DEVICE)
                 num_ctx_compressed_tokens = 0
-                num_gen_compressed_tokens = bsz
+                kv_lens_local = past_kv_lens + seq_lens
+                num_gen_compressed_tokens = int(
+                    (kv_lens_local // ratio - past_kv_lens // ratio).sum().item()
+                )
             else:
                 # Prefill mode (may be chunked when start_pos > 0)
                 num_contexts = bsz
@@ -992,24 +1055,16 @@ class CompressorWrapper:
                 num_ctx_tokens = bsz * seqlen
                 num_gen_tokens = 0
                 seq_lens = torch.full((bsz,), seqlen, dtype=torch.int32, device=DEVICE)
-                if isinstance(start_pos, torch.Tensor):
-                    past_kv_lens = start_pos.to(torch.int32).to(DEVICE)
-                    if past_kv_lens.ndim == 0:
-                        past_kv_lens = past_kv_lens.expand(bsz)
-                else:
-                    past_kv_lens = torch.full((bsz,), start_pos, dtype=torch.int32, device=DEVICE)
                 kv_lens_local = past_kv_lens + seq_lens
-                num_ctx_compressed_tokens = (
+                num_ctx_compressed_tokens = int(
                     (kv_lens_local // ratio - past_kv_lens // ratio).sum().item()
                 )
                 num_gen_compressed_tokens = 0
-
             # Use batch_indices for request mapping if provided
             batch_indices_for_requests = batch_indices
             start_pos_for_kv = past_kv_lens
 
         # Prepare requests for the cache manager
-        is_prefill = start_pos_for_kv == 0
         requests, scheduled_batch = self._prepare_requests_for_batch(
             bsz, seq_lens, start_pos_for_kv, is_prefill, batch_indices_for_requests
         )
@@ -1025,7 +1080,7 @@ class CompressorWrapper:
         # kv_len // ratio - past // ratio works for all cases:
         #   fresh prefill (past=0): kv_len // ratio
         #   chunked prefill (past>0, seqlen>1): correct window boundary counting
-        #   decode (past>0, seqlen=1): fires when chunk boundary is crossed
+        #   generation (past>0): fires when chunk boundary is crossed
         num_comp = (past_kv_lens + seq_lens) // ratio - past_kv_lens // ratio
 
         cu_new_comp_kv = torch.zeros(bsz + 1, dtype=torch.int32, device=DEVICE)
@@ -1150,11 +1205,10 @@ class CompressorWrapper:
 
         # Update request state and call update_resources after processing
         for b, req in enumerate(requests):
-            if is_prefill[b]:
-                req.context_current_position = int(seq_lens[b].item())
-            # Call add_new_token for BOTH prefill and generation requests
-            # Token count should be total sequence length after processing (start_pos + seq_len)
             token_count = int((start_pos_for_kv[b] + seq_lens[b]).item())
+            if is_prefill[b]:
+                req.context_current_position = token_count
+            # Call add_new_token for BOTH prefill and generation requests.
             req.add_new_token(token_count, 0)
         self.cache_manager.update_resources(scheduled_batch)
 
@@ -1948,7 +2002,12 @@ def test_short_prefill_then_decode(prefill_len, decode_steps, batch, ratio, rota
         with torch.no_grad():
             # Prefill: should produce no compressed tokens (prefill_len < ratio)
             out_ref = ref(x_prefill, 0, freqs[:prefill_len])
-            out_comp = comp.forward(x_prefill, 0, freqs[:prefill_len])
+            out_comp = comp.forward(
+                x_prefill,
+                0,
+                freqs[:prefill_len],
+                is_prefill=torch.ones(batch, dtype=torch.bool, device=DEVICE),
+            )
 
             if prefill_len < ratio:
                 # No compression expected from prefill
@@ -1990,14 +2049,20 @@ def test_short_prefill_then_decode(prefill_len, decode_steps, batch, ratio, rota
         comp.cleanup()
 
 
-@pytest.mark.parametrize(
-    "prefill_len, decode_steps, batch, ratio, next_n",
-    [
-        (128, 8, 1, 4, 2),
-        (128, 8, 1, 4, 3),
-        (128, 8, 2, 4, 2),
-    ],
-)
+MTP_DECODE_CASES = [
+    # No prior compressed output: decode spans the first compression boundary.
+    (1, 8, 1, 4, 2),
+    (3, 8, 1, 4, 3),
+    # Prefill ends exactly on or just after a compression boundary.
+    (4, 8, 1, 4, 2),
+    (5, 8, 1, 4, 3),
+    # Large absolute positions: exercise the same boundary cases after many windows.
+    (127, 8, 1, 4, 2),
+    (128, 8, 2, 4, 3),
+]
+
+
+@pytest.mark.parametrize("prefill_len, decode_steps, batch, ratio, next_n", MTP_DECODE_CASES)
 def test_mtp_decode_overlap(prefill_len, decode_steps, batch, ratio, next_n):
     """MTP decode: ref(combined seqlen=n) == ref(chunked seqlen=1 each).
 
@@ -2055,7 +2120,6 @@ def test_mtp_decode_overlap(prefill_len, decode_steps, batch, ratio, next_n):
                     )
                     assert_similar(out_combined, last_chunked_out, f"MTP decode step {step}")
                     for b in range(batch):
-                        num_comp_tokens = ref_combined.kv_cache[b].shape[0]
                         assert_similar(
                             ref_combined.kv_cache[b : b + 1],
                             ref_chunked.kv_cache[b : b + 1],
@@ -2065,6 +2129,54 @@ def test_mtp_decode_overlap(prefill_len, decode_steps, batch, ratio, next_n):
                     assert last_chunked_out is None, (
                         f"MTP step {step}: chunked produced unexpected output"
                     )
+
+                step += n
+    finally:
+        comp.cleanup()
+
+
+@pytest.mark.parametrize("prefill_len, decode_steps, batch, ratio, next_n", MTP_DECODE_CASES)
+def test_mtp_decode_overlap_module(prefill_len, decode_steps, batch, ratio, next_n):
+    """MTP decode through CompressorWrapper requires explicit generation mode."""
+    ref, comp = setup_compressors(ratio, rotate=True)
+    try:
+        freqs = precompute_freqs_cis(
+            ROPE_DIM, MAX_SEQ, ORI_SEQ_LEN, ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW
+        ).to(DEVICE)
+        x_prefill = torch.randn(batch, prefill_len, DIM, device=DEVICE, dtype=DTYPE)
+
+        with torch.no_grad():
+            ref(x_prefill, 0, freqs[:prefill_len])
+            comp.forward(
+                x_prefill,
+                0,
+                freqs[:prefill_len],
+                is_prefill=torch.ones(batch, dtype=torch.bool, device=DEVICE),
+            )
+
+            step = 0
+            while step < decode_steps:
+                n = min(next_n, decode_steps - step)
+                pos = prefill_len + step
+                x_decode = torch.randn(batch, n, DIM, device=DEVICE, dtype=DTYPE)
+
+                out_ref = ref(x_decode, pos, freqs)
+                out_comp = comp.forward(
+                    x_decode,
+                    pos,
+                    freqs,
+                    is_prefill=torch.zeros(batch, dtype=torch.bool, device=DEVICE),
+                )
+
+                if out_ref is None:
+                    assert out_comp is None, (
+                        f"MTP module step {step}: expected no compressed output"
+                    )
+                else:
+                    assert out_comp is not None, (
+                        f"MTP module step {step}: wrapper produced no output for generation"
+                    )
+                    assert_similar(out_ref, out_comp, f"MTP module decode step {step}")
 
                 step += n
     finally:
@@ -2295,7 +2407,12 @@ def test_chunked_prefill_module(total_seqlen, split_pos, batch, ratio):
 
         with torch.no_grad():
             out_1 = comp.forward(x[:, :split_pos], 0, freqs[:split_pos])
-            out_2 = comp.forward(x[:, split_pos:], split_pos, freqs[:total_seqlen])
+            out_2 = comp.forward(
+                x[:, split_pos:],
+                split_pos,
+                freqs[:total_seqlen],
+                is_prefill=torch.ones(batch, dtype=torch.bool, device=DEVICE),
+            )
 
         parts = [p for p in [out_1, out_2] if p is not None]
         if out_ref is None:

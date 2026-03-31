@@ -503,10 +503,11 @@ def calculate_mewtwo_ref_gen_sparse(
     return ref_result, new_latent_cache_out
 
 
-def _allocate_kv_cache_for_generation(cache_manager, request_ids, num_tokens: int):
-    for request_id in request_ids:
-        kv_cache = cache_manager.kv_cache_map[request_id]
-        kv_cache.resize(kv_cache.capacity + num_tokens)
+def _allocate_kv_cache_for_generation(cache_manager, requests: List[LlmRequest]):
+    for req in requests:
+        assert cache_manager.try_allocate_generation(req), (
+            f"Failed to allocate generation KV cache for request {req.py_request_id}"
+        )
 
 
 @skip_pre_blackwell
@@ -869,7 +870,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
     # 8. Generation steps
     for step in range(num_generation_steps):
         print(f"\n=== Generation step {step + 1} ===")
-        _allocate_kv_cache_for_generation(cache_manager, request_ids, generation_seq_len_q)
+        _allocate_kv_cache_for_generation(cache_manager, requests)
 
         cached_lens = [ctx_len + step * generation_seq_len_q for ctx_len in context_lengths]
         kv_lens = [cl + generation_seq_len_q for cl in cached_lens]
@@ -1212,7 +1213,8 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
             )
 
     # 3. Allocate 1 gen step for gen requests.
-    _allocate_kv_cache_for_generation(cache_manager, gen_request_ids, generation_seq_len_q)
+    gen_requests = requests[1:]
+    _allocate_kv_cache_for_generation(cache_manager, gen_requests)
     gen_cached_lens = [cl + generation_seq_len_q for cl in gen_ctx_lengths]
 
     # Grow compress buffers for gen step.
