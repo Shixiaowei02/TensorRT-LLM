@@ -152,11 +152,10 @@ class CompressedTokenizer:
         if not isinstance(input_ids, torch.Tensor):
             input_ids = torch.tensor(input_ids, dtype=torch.long)
         ids = input_ids.long()
-        # Clamp token IDs to the tokenizer's vocabulary range
-        # Tokens outside vocab are mapped to the last valid token
+        # Preserve negative padding IDs while compressing valid token IDs.
         vocab_size = len(self.lookup_table)
-        clamped = ids.clamp(0, vocab_size - 1)
-        return self.lookup_table[clamped]
+        compressed = self.lookup_table[ids.clamp(0, vocab_size - 1)]
+        return torch.where(ids < 0, ids, compressed)
 
     def __call__(self, input_ids):
         return self._compress(input_ids)
