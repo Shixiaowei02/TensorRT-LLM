@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Test suite for KV compressor kernels.
 
@@ -9,6 +9,7 @@ Run: pytest -s tests/unittest/_torch/attention/sparse/test_compressor_kernel.py
 import pytest
 import torch
 import triton
+from utils.util import skip_pre_blackwell
 
 _CUDA_SUPPORTED_HEAD_DIMS = (128, 512)
 
@@ -961,6 +962,8 @@ PREFILL_VARLEN_CONFIGS = [
 ]
 
 
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("seq_lens_list,compress_ratio,head_dim,overlap", PREFILL_VARLEN_CONFIGS)
 def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
     """Test prefill with variable-length sequences."""
@@ -1629,7 +1632,6 @@ def test_fused_postprocess_scatter(
     cu_kv_comp = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
     cu_kv_comp[1:] = num_comp_tokens.cumsum(0)
     start_pos = torch.zeros(batch_size, device=device, dtype=torch.int32)
-    max_outputs = num_comp_tokens.max().item()
 
     # --- Reference: unfused pipeline ---
     x = _build_postprocess_reference(
