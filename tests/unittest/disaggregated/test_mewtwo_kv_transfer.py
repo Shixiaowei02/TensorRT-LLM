@@ -638,18 +638,20 @@ def run_mewtwo_transfer_test(
             if should_handle:
                 gen_handle_map[rank].append((req_idx, gen_request))
 
-    # ===== 5. prepare_resources for all ranks =====
-    # Both sides treat requests as context_requests for prepare_resources
-    # (mirrors _prepare_disagg_gen_init for gen, normal context flow for ctx).
-    # All ranks must call prepare_resources BEFORE mutating the shared request
-    # objects (add_new_token changes is_first_context_chunk).
+    # ===== 5. Allocate KV cache for all ranks =====
+    # Uses prepare_context + resize_context (the V2 manager path).
+    # prepare_resources is a no-op for non-draft KVCacheManagerV2.
+    # All ranks must allocate BEFORE mutating shared request objects
+    # (add_new_token changes is_first_context_chunk).
     gen_batches: Dict[int, ScheduledRequests] = {}
     for rank in range(gen_world):
         reqs = [req for _, req in gen_handle_map[rank]]
         if reqs:
             batch = ScheduledRequests()
-            batch.context_requests = reqs
-            gen_managers[rank].prepare_resources(batch)
+            batch.context_requests_last_chunk = reqs
+            for req in reqs:
+                gen_managers[rank].prepare_context(req)
+                gen_managers[rank].resize_context(req, req.context_chunk_size)
             gen_batches[rank] = batch
 
     ctx_batches: Dict[int, ScheduledRequests] = {}
@@ -657,8 +659,10 @@ def run_mewtwo_transfer_test(
         reqs = [req for _, req in ctx_handle_map[rank]]
         if reqs:
             batch = ScheduledRequests()
-            batch.context_requests = reqs
-            ctx_managers[rank].prepare_resources(batch)
+            batch.context_requests_last_chunk = reqs
+            for req in reqs:
+                ctx_managers[rank].prepare_context(req)
+                ctx_managers[rank].resize_context(req, req.context_chunk_size)
             ctx_batches[rank] = batch
 
     # ===== 5.5. context_current_position + add_new_token =====
