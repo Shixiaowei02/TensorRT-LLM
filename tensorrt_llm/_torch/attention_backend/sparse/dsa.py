@@ -19,7 +19,8 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
+from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -1371,8 +1372,10 @@ class Indexer(nn.Module):
             f"Indexer.prepare_one_prefill_chunk - cu_seqlen_ke length mismatch: {cu_seqlen_ke.shape[0]} != {num_q_tokens}"
 
         return IndexerPrefillChunkMetadata(
-            cu_seqlen_ks=cu_seqlen_ks.to(device, non_blocking=True),
-            cu_seqlen_ke=cu_seqlen_ke.to(device, non_blocking=True),
+            cu_seqlen_ks=maybe_pin_memory(cu_seqlen_ks).to(device,
+                                                           non_blocking=True),
+            cu_seqlen_ke=maybe_pin_memory(cu_seqlen_ke).to(device,
+                                                           non_blocking=True),
             token_start=token_start,
             token_end=token_end,
             k_token_start=k_token_start,
@@ -1645,10 +1648,10 @@ class Indexer(nn.Module):
                 host_seq_lens, num_contexts, num_ctx_tokens,
                 host_num_past_tokens, host_kv_lens, compress_ratio)
 
-            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(host_cu_seqlen_ks,
-                                                         non_blocking=True)
-            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(host_cu_seqlen_ke,
-                                                         non_blocking=True)
+            metadata.cu_seqlen_ks[:num_ctx_tokens].copy_(
+                maybe_pin_memory(host_cu_seqlen_ks), non_blocking=True)
+            metadata.cu_seqlen_ke[:num_ctx_tokens].copy_(
+                maybe_pin_memory(host_cu_seqlen_ke), non_blocking=True)
             Indexer.prepare_for_chunked_prefill(metadata, indexer_params)
 
         # Prepare for decode phase if there are generation requests
