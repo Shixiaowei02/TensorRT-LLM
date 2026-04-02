@@ -5,6 +5,7 @@ in a single process. Validates KV cache transfer correctness across different
 TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -32,6 +33,9 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
+# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
+# contention when creating multiple agents on a single GPU in the same process.
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------

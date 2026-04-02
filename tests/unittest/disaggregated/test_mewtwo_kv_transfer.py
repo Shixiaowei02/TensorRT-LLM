@@ -5,6 +5,7 @@ in a single process. Validates all MewtwoAttentionType cache transfers across
 different TP/PP/DP configurations.
 """
 
+import os
 import threading
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -34,18 +35,24 @@ from tensorrt_llm.llmapi.llm_args import (
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
+# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
+# contention when creating multiple agents on a single GPU in the same process.
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
+
+
 # ---------------------------------------------------------------------------
 # Constants matching MewtwoCacheManager defaults
 # ---------------------------------------------------------------------------
-HEAD_DIM = 512
+HEAD_DIM = 256  # Reduced from 512: test validates transfer, not attention correctness
 INDEX_HEAD_DIM = 128
 WINDOW_SIZE = 128
 TOKENS_PER_BLOCK = 128
-MAX_SEQ_LEN = 1024
-MAX_BATCH_SIZE = 64
+MAX_SEQ_LEN = 512
+MAX_BATCH_SIZE = 16
 VOCAB_SIZE = 129280
 NUM_KV_HEADS = 1
 INDEXER_QUANT_BLOCK_SIZE = 128
+
 
 # Mewtwo-specific ratios (from cache_manager.py constants)
 SPARSE_RATIO = 4
