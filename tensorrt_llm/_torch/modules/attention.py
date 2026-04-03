@@ -3058,6 +3058,8 @@ class MLA(nn.Module):
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
                     position_ids, self.layer_idx_str, attn_output)
             else:
+                # Mewtwo and vanilla MLA both use the single custom op.
+                # Mewtwo dispatches to forward_impl_with_mewtwo inside.
                 torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
                                                        position_ids,
                                                        self.layer_idx_str,
@@ -3073,11 +3075,6 @@ class MLA(nn.Module):
                                           hidden_states,
                                           attn_metadata,
                                           output=attn_output)
-        elif self.register_to_config:
-            torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,
-                                                   self.layer_idx_str,
-                                                   attn_output,
-                                                   latent_cache_gen)
         else:
             self.forward_impl(position_ids,
                               hidden_states,
