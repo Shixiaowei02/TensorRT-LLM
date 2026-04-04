@@ -33,8 +33,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
-from .kernel import triton_convert_req_index_to_global_index
-
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
 if TYPE_CHECKING:
@@ -593,6 +591,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device='cpu', pin_memory=prefer_pinned())
         # Block table for topk_indices conversion (shared for context and generation)
+        self.block_table = self.get_empty(
+            self.cuda_graph_buffers,
+            [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
+            cache_name="block_table",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         self.scheduler_metadata_buffer = self.get_empty(
             self.cuda_graph_buffers,
             (self.num_sms + 1, 2),
@@ -1837,8 +1842,8 @@ class Indexer(nn.Module):
                         chunk_q_start = 0
                         chunk_q_end = chunk_num_token
 
-                    global_q_start = chunk.token_start + chunk_q_start
-                    global_q_end = chunk.token_start + chunk_q_end
+                    chunk.token_start + chunk_q_start
+                    chunk.token_start + chunk_q_end
 
                     logits = fp8_mqa_logits(
                         q_fp8[chunk.token_start:chunk.token_end, ...],
