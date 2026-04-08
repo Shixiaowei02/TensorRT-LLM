@@ -1973,7 +1973,7 @@ class MLA(nn.Module):
                 k_pe_gen,
                 attn_metadata,
                 output[num_ctx_tokens:num_tokens, :],
-                latent_cache_gen,
+                latent_cache=latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             )
 

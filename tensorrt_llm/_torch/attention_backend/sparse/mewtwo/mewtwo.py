@@ -569,13 +569,8 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
         )
 
-        # Build req_idx_per_token for topk_indices conversion
-        host_req_idx_per_token = torch.repeat_interleave(
-            torch.arange(self.num_seqs, dtype=torch.int32),
-            self.seq_lens,
-            dim=0,
-        )
-        self.req_idx_per_token[: self.num_tokens].copy_(host_req_idx_per_token, non_blocking=True)
+        # For indices conversion
+        self.prepare_for_indices_conversion()
 
         has_sparse_layers = MEWTWO_SPARSE_RATIO in self.compress_ratio_set
 
