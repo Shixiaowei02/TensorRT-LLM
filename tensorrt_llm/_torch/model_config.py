@@ -579,6 +579,24 @@ class ModelConfig(Generic[TConfig]):
                     else:
                         compress_ratios = pretrained_config.compress_ratios
                         window_size = pretrained_config.window_size
+
+                    # Adjust compress_ratios length based on MTP config.
+                    num_base_layers = pretrained_config.num_hidden_layers
+                    spec_config = kwargs.get('spec_config', None)
+                    mtp_enabled = (
+                        spec_config is not None
+                        and spec_config.spec_dec_mode.is_mtp_one_model())
+                    if mtp_enabled:
+                        mtp_num_layers = spec_config.num_nextn_predict_layers
+                        total_layers = num_base_layers + mtp_num_layers
+                        if len(compress_ratios) < total_layers:
+                            compress_ratios = list(compress_ratios) + [1] * (
+                                total_layers - len(compress_ratios))
+                    else:
+                        if len(compress_ratios) > num_base_layers:
+                            compress_ratios = compress_ratios[
+                                :num_base_layers]
+
                     kwargs[
                         'sparse_attention_config'] = MewtwoSparseAttentionConfig(
                             compress_ratios=compress_ratios,

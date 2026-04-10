@@ -578,6 +578,9 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if has_sparse_layers:
             self.prepare_for_indexer_k_cache()
 
+        # For spec decode
+        self.prepare_for_spec_decode(kv_lens)
+
         # For block offsets
         self.prepare_for_block_tables()
 
