@@ -1,3 +1,4 @@
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -8,9 +9,20 @@ from tensorrt_llm._torch.attention_backend.interface import MLAParams, Positiona
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.utils import maybe_compile
 
 if TYPE_CHECKING:
     from .mewtwo import MewtwoTrtllmAttentionMetadata
+
+# When set to "1", forces wkv_gate to use full FP32 computation (via nn.Linear)
+# instead of the default TF32 path (via cublas_mm on tensor cores).
+_USE_FP32_COMPRESSOR = os.environ.get("MEWTWO_COMPRESSOR_FP32", "0") == "1"
+
+
+@maybe_compile(dynamic=True)
+def _to_float(x: torch.Tensor) -> torch.Tensor:
+    """Cast to float32 for TF32 GEMM (following DSA pattern)."""
+    return x.float()
 
 
 class KVCacheDtype(IntEnum):
@@ -155,8 +167,15 @@ class Compressor(nn.Module):
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
-        # Project input to KV and score
-        kv_score = self.wkv_gate(x.float())
+        # Project input to KV and score.
+        # Default: TF32 via cublas_mm (faster, uses tensor cores on Ampere+).
+        # Fallback: FP32 via nn.Linear when MEWTWO_COMPRESSOR_FP32=1.
+        if _USE_FP32_COMPRESSOR:
+            kv_score = self.wkv_gate(_to_float(x))
+        else:
+            kv_score = torch.ops.trtllm.cublas_mm(
+                _to_float(x), self.wkv_gate.weight.t(), None, out_dtype=None
+            )
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
