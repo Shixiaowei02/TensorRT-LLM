@@ -696,8 +696,13 @@ def add_and_verify_request(
             for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
 
+        token_range = TokenRange(start=0, end=request_len)
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                token_range=token_range,
+            )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
         send_slice_futures = [
@@ -713,7 +718,11 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=gen_block_ids_per_group,
+                token_range=token_range,
+            )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
         recv_slice_futures = [
@@ -722,12 +731,17 @@ def add_and_verify_request(
         ]
 
     else:
+        token_range = TokenRange(start=0, end=request_len)
         receiver_sessions = [
             gen_transfer_worker.create_rx_session(gen_request)
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=gen_block_ids_per_group,
+                token_range=token_range,
+            )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
         recv_slice_futures = [
@@ -748,7 +762,11 @@ def add_and_verify_request(
             assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                token_range=token_range,
+            )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
         send_slice_futures = [

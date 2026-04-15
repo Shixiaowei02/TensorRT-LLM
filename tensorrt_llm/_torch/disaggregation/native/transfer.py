@@ -487,11 +487,40 @@ class Sender(SenderBase):
             )
 
     @staticmethod
-    def _filter_kv_blocks(
-        src_block_ids: np.ndarray, dst_block_ids: np.ndarray
+    def _align_kv_blocks(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        src_token_start: int,
+        dst_token_start: int,
+        tokens_per_block: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        # TODO: filter the kv block_ids according to the peer_overlap
-        return src_block_ids, dst_block_ids
+        """Align src/dst block arrays using explicit token-start positions.
+
+        Both src_token_start and dst_token_start must be block-aligned
+        (multiples of tokens_per_block), which is always true for prefix-cache
+        boundaries in current KV cache managers.
+
+        Returns the (src, dst) sub-arrays that cover the shared token overlap.
+        Returns a pair of empty arrays when there is no overlap (i.e. this
+        context slice is entirely within generation's already-cached prefix).
+
+        This handles four cases without special-casing:
+          1. No prefix cache on either side  → identity (start_token == 0 both)
+          2. Context prefix cache (src starts later than 0)  → trim dst head
+          3. Generation prefix cache (dst starts later than 0)  → trim src head
+          4. Chunked context (each slice has its own token_range)  → correct
+             overlap even when the slice is entirely before dst_token_start
+        """
+        overlap_start = max(src_token_start, dst_token_start)
+        src_skip = (overlap_start - src_token_start) // tokens_per_block
+        dst_skip = (overlap_start - dst_token_start) // tokens_per_block
+        n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
+        if n_transfer <= 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        return (
+            src_block_ids[src_skip : src_skip + n_transfer],
+            dst_block_ids[dst_skip : dst_skip + n_transfer],
+        )
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -527,15 +556,28 @@ class Sender(SenderBase):
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                if src_block_ids.size + 1 == dst_block_ids.size:
-                    # FIXME: this is a temporary solution, need to be fixed for the draft tokens
-                    logger.warning(
-                        "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
-                        " remove the last block from dst_block_ids "
+                # Speculative decoding: generation may have one extra draft-token block.
+                block_diff = dst_block_ids.size - src_block_ids.size
+                if block_diff == 1:
+                    logger.debug(
+                        f"Trimming 1 extra dst block for draft tokens: "
+                        f"src={src_block_ids.size}, dst={dst_block_ids.size}"
                     )
                     dst_block_ids = dst_block_ids[:-1]
-                src_block_ids, dst_block_ids = Sender._filter_kv_blocks(
-                    src_block_ids, dst_block_ids
+                elif block_diff > 1:
+                    raise ValueError(
+                        f"src/dst block count mismatch: {src_block_ids.size} vs "
+                        f"{dst_block_ids.size} (expected diff <= 1)"
+                    )
+                tpb = extractor.page_table.tokens_per_block
+                src_start = task._slice.token_range.start if task._slice.token_range else 0
+                dst_start = req_info.start_token_idx or 0
+                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
+                    src_block_ids,
+                    dst_block_ids,
+                    src_token_start=src_start,
+                    dst_token_start=dst_start,
+                    tokens_per_block=tpb,
                 )
 
                 src_region = extractor.extract(
@@ -1028,12 +1070,20 @@ class Receiver(ReceiverBase):
             f"ctx_request_id is None for task unique_rid={task._unique_rid}"
         )
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
+        # Propagate the generation-side token offset so the context server can
+        # skip blocks that are already present in generation's prefix cache.
+        # Currently this is 0 for all requests (generation does not yet filter
+        # its block list); the hook is in place for future narrowing.
+        start_token_idx = (
+            task._kv_slice.token_range.start if task._kv_slice.token_range is not None else None
+        )
         return RecvReqInfo(
             sender_req_id=task._params.ctx_request_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
             block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
             unique_rid=task._unique_rid,
+            start_token_idx=start_token_idx,
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
         )
@@ -1134,7 +1184,7 @@ class Receiver(ReceiverBase):
         )
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
-        slice_id = int(slice_id_str)
+        sender_slice_id = int(slice_id_str)
         if msg_type.encode("ascii") != MessageType.KV_AGENT_RESULT:
             logger.error(
                 f"_process_kv_agent_result: unexpected msg_type={msg_type!r}, expected KV_AGENT_RESULT"
@@ -1147,7 +1197,7 @@ class Receiver(ReceiverBase):
             )
             return
         session.process_kv_agent_result(
-            peer_rank, slice_id, is_last_slice_str == "True", AgentResult(status)
+            peer_rank, sender_slice_id, is_last_slice_str == "True", AgentResult(status)
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1237,9 +1287,14 @@ class RxSession(RxSessionBase):
         return task.future
 
     def process_kv_agent_result(
-        self, peer_rank: int, slice_id: int, is_last_slice: bool, status: AgentResult
+        self, peer_rank: int, sender_slice_id: int, is_last_slice: bool, status: AgentResult
     ):
-        task = self._kv_tasks[slice_id]
+        assert sender_slice_id < len(self._kv_tasks), (
+            f"Receiver got slice_id={sender_slice_id} from sender but only has "
+            f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
+            f"Sender/receiver slice count mismatch."
+        )
+        task = self._kv_tasks[sender_slice_id]
         if status == AgentResult.SUCCESS:
             if is_last_slice:
                 task.last_slice_count += 1
@@ -1249,20 +1304,21 @@ class RxSession(RxSessionBase):
                     task.status = TaskStatus.TRANSFERRED
 
                     logger.debug(
-                        f"KV transfer complete for request {self.request_id} slice {slice_id}"
+                        f"KV transfer complete for request {self.request_id} "
+                        f"slice={sender_slice_id}"
                     )
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_end(peer_rank)
                     ri = self._receiver._registrar.self_rank_info
                     task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
         elif status == AgentResult.FAILED:
-            if not task.future.done():
-                task.future.set_exception(
-                    RuntimeError(
-                        f"KV transfer failed for request {self.request_id} slice {slice_id}"
-                    )
+            task.fail(
+                RuntimeError(
+                    f"KV transfer failed for request {self.request_id} slice={sender_slice_id}"
                 )
-            task.status = TaskStatus.ERROR
+            )
+            if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
+                self._terminal_status = SessionStatus.ERROR
         else:
             raise ValueError(
                 f"Session {self.request_id} received unknown task status: {status.value}"

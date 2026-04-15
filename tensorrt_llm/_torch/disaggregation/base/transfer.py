@@ -44,6 +44,9 @@ class LayerRange:
 class KVSlice:
     """
     Specifies which portion of KV cache to transfer.
+
+    token_range is the half-open token interval [start, end) of the tokens
+    covered by the blocks in block_ids_per_layer_groups.
     """
 
     token_range: Optional[TokenRange] = None
