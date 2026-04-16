@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -501,6 +502,9 @@ class KVCacheManager:
         self._last_adjustment_time = time.monotonic()
 
     def _try_update_target_ratios(self) -> None:
+        # Workaround for "assert all(x > 0 for x in ratio_list)" error.
+        if os.environ.get("TRTLLM_DISABLE_KV_CACHE_RATIO_UPDATE", "0") == "1":
+            return
         if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
             return
         self._last_update_num_closed_requests = self._num_closed_kv_caches
