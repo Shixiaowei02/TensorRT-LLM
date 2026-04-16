@@ -1253,10 +1253,13 @@ class RxSession(RxSessionBase):
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
+        self._terminal_status: Optional[SessionStatus] = None
         self._receiver.setup_session(self)
 
     @property
     def status(self) -> SessionStatus:
+        if self._terminal_status is not None:
+            return self._terminal_status
         if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
             return SessionStatus.ERROR
         if self._kv_tasks:
