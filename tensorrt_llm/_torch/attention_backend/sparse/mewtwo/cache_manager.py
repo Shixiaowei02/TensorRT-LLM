@@ -439,12 +439,17 @@ class MewtwoCacheManager(KVCacheManagerV2):
         max_num_tokens = self._max_num_tokens
         max_draft_len = self._max_draft_len
 
-        # max_batch_size generation requests as typical cases.
+        # For aggregated serving in large batch size:
+        # Use 1 context request + (max_batch_size - 1) generation requests as
+        # the typical step. An all-generation typical_step over-provisions the
+        # compressed-cache pool at the expense of the SWA pool, starving the
+        # SWA pool and artificially capping the achievable batch size.
         typical_step = BatchDesc(
             kv_caches=[
-                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)
+                KVCacheDesc(capacity=max_seq_len, history_length=0),
             ]
-            * max_batch_size,
+            + [KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)]
+            * (max_batch_size - 1),
         )
 
         constraints = []
