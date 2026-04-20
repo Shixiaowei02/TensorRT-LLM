@@ -383,6 +383,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if hasattr(self.sparse_attention_config, 'compress_ratios'):
             self.compress_ratios = self.sparse_attention_config.compress_ratios
 
+        # Effective tokens-per-block for the indexer k-cache slot mapping.
+        # Mewtwo's indexer cache uses layer-dependent compressed block sizes
+        # (tokens_per_block // compress_ratio), so slot mappings must be built
+        # against that stride — not kv_cache_manager.tokens_per_block directly.
+        tpb = self.kv_cache_manager.tokens_per_block
+        if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
+            compress_ratio = 4 if 4 in self.compress_ratios else 1
+            tpb = tpb // compress_ratio
+        self._tokens_per_block = tpb
+
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
 
@@ -489,7 +499,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.indexer_k_cache_block_offsets,
                 req_indices,
                 self.kv_cache_manager.index_head_dim,
-                self.kv_cache_manager.tokens_per_block,
+                self._tokens_per_block,
                 self.kv_cache_manager.quant_block_size,
             )
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
@@ -1564,12 +1574,6 @@ class Indexer(nn.Module):
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         # Only support compression ratio of 4 and 1 for now
         compress_ratio = 4 if 4 in metadata.compress_ratios else 1
-        tokens_per_block = kv_cache_manager.tokens_per_block
-        # For MewtwoCacheManager, the indexer tokens per block is the compressed block size
-        if hasattr(kv_cache_manager, 'compressed_block_sizes'):
-            indexer_tokens_per_block = tokens_per_block // compress_ratio
-        else:
-            indexer_tokens_per_block = tokens_per_block
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
@@ -1577,7 +1581,7 @@ class Indexer(nn.Module):
             num_ctx_tokens=num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=quant_block_size,
-            tokens_per_block=indexer_tokens_per_block,
+            tokens_per_block=metadata._tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=request_ids,
             num_past_tokens=num_past_tokens,
