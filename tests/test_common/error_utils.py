@@ -44,14 +44,16 @@ def report_error(
 
     for log_file in log_files:
         if not os.path.exists(log_file):
-            messages.append(f"Failed to read {log_file}: Path doesn't exist")
+            messages.append(f"--- {log_file} ---")
+            messages.append("File does not exist (worker may not have started)")
+            continue
 
         all_lines = None
         error_lines = []
         try:
             with open(log_file, "r", errors="replace") as f:
                 all_lines = f.readlines()
-                for line_idx, line in enumerate(f, start=1):
+                for line_idx, line in enumerate(all_lines, start=1):
                     for keyword in ERROR_KEYWORDS:
                         if keyword in line:
                             error_lines.append((line_idx, line.strip()))
