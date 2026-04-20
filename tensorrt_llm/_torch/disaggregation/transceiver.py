@@ -175,16 +175,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
 
-            # Filter to only window-relevant blocks for sliding window layer groups.
-            # Computes the expected number of non-stale blocks (using the same
-            # eviction formula as update_resources) and keeps only the tail.
-            # This works correctly regardless of whether update_resources has
-            # been called:
-            #   - Pre-eviction: all blocks present → trim to last N.
-            #   - Post-eviction (V2 valid_only=True): stale blocks already
-            #     removed → len == expected_valid, so the condition is false.
             window_size = lg.sliding_window_size
             if window_size is not None:
+                # Filter to only window-relevant blocks.
+                # Computes the expected number of non-stale blocks (using the same
+                # eviction formula as update_resources) and keeps only the tail.
+                # This works correctly regardless of whether update_resources has
+                # been called:
+                #   - Pre-eviction: all blocks present → trim to last N.
+                #   - Post-eviction (V2 valid_only=True): stale blocks already
+                #     removed → len == expected_valid, so the condition is false.
                 total_blocks = (req.prompt_len + tpb - 1) // tpb
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = total_blocks - stale_end
@@ -193,8 +193,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 elif block_ids.size > expected_valid:
                     block_ids = block_ids[-expected_valid:]
 
-            if num_cached_blocks > 0 and block_ids.size > num_cached_blocks:
-                block_ids = block_ids[num_cached_blocks:]
+                # For window layers, only skip blocks that fall within BOTH the
+                # cached prefix [0, num_cached_blocks) AND the valid window
+                # [stale_end, total_blocks).  Plain block_ids[num_cached_blocks:]
+                # is wrong here because the window-trimmed list starts at
+                # stale_end, not 0.
+                cached_in_window = max(0, num_cached_blocks - stale_end)
+                if cached_in_window >= block_ids.size:
+                    block_ids = np.array([], dtype=np.int64)
+                elif cached_in_window > 0:
+                    block_ids = block_ids[cached_in_window:]
+            else:
+                if num_cached_blocks > 0 and block_ids.size > num_cached_blocks:
+                    block_ids = block_ids[num_cached_blocks:]
 
             groups.append(block_ids)
 
