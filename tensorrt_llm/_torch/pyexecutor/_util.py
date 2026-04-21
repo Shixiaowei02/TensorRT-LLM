@@ -560,6 +560,8 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        is_disagg = (self._cache_transceiver_config is not None
+                     and self._cache_transceiver_config.backend is not None)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -577,6 +579,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=is_disagg,
         )
 
         if not self._skip_est:
@@ -874,7 +877,8 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None) -> KVCacheManager:
+        num_layers: Optional[int] = None,
+        is_disagg: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -949,6 +953,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             max_num_tokens=max_num_tokens,
+            is_disagg=is_disagg,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1107,6 +1112,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            is_disagg=is_disagg,
         )
     return kv_cache_manager
 

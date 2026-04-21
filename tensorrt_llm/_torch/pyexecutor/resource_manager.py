@@ -1226,7 +1226,8 @@ class KVCacheManager(BaseResourceManager):
                 list(range(self.num_local_layers))
             }
         for local_layer_idx in range(self.num_local_layers):
-            window_size = self.max_attention_window_vec[local_layer_idx %
+            global_layer_idx = self.pp_layers[local_layer_idx]
+            window_size = self.max_attention_window_vec[global_layer_idx %
                                                         pattern_len]
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
@@ -1612,10 +1613,12 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        is_disagg: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.is_disagg = is_disagg
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -1806,8 +1809,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
         # Plus 1 for cuda graph dummy request.
+        # In disaggregated mode, double the capacity to allow KV transfers
+        # (TRANS_IN_PROGRESS) to overlap with active generation requests.
         max_num_sequences = max_batch_size * mapping.pp_size
-        self.index_mapper = IndexMapper(max_num_sequences + 1, max_beam_width)
+        index_mapper_capacity = max_num_sequences * (2 if is_disagg else 1) + 1
+        logger.info(
+            f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
+            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, max_beam_width={max_beam_width})"
+        )
+        self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
+        self._early_freed_index_requests: set[int] = set()
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
                                         pin_memory=prefer_pinned(),
@@ -1830,7 +1841,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
-            (max_num_sequences + 1) * max_beam_width,
+            index_mapper_capacity * max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
@@ -2122,6 +2133,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.py_request_id, req.lora_task_id,
                     req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
                     if self.enable_block_reuse else None)
+                if kv_cache is None:
+                    return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2373,6 +2386,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
@@ -2387,7 +2411,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                       context_current_position])
             kv_cache.stop_committing()
         kv_cache.close()
-        self.index_mapper.remove_sequence(request.py_request_id)
+        if request.py_request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request.py_request_id)
+        else:
+            self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(self,
                                 request_ids: List[int],
@@ -2681,6 +2708,13 @@ class KVCacheManagerV2(BaseResourceManager):
     def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
+        if self.index_mapper.num_free_slots() == 0:
+            logger.warning(
+                "No free IndexMapper slots for request %s "
+                "(%d/%d slots in use, likely held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). "
+                "Skipping KV cache creation; request will retry next iteration.",
+                request_id, self.index_mapper.size(), self.index_mapper.size())
+            return None
         kv_cache = self.impl.create_kv_cache(lora_task_id, input_tokens)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
