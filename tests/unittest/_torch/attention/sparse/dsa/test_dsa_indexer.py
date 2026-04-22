@@ -435,6 +435,13 @@ def _create_mock_metadata(request_ids,
             self.kv_lens = kv_lens
             self.kv_cache_params = MockKVCacheParams()
             self.kv_cache_manager = cache_manager
+            # Effective tokens-per-block for the indexer k-cache slot mapping,
+            # mirroring DSAtrtllmAttentionMetadata.__post_init__ (dsa.py).
+            tpb = self.kv_cache_manager.tokens_per_block
+            if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
+                _cr = 4 if 4 in self.compress_ratios else 1
+                tpb = tpb // _cr
+            self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
                 [batch_size, cache_manager.max_blocks_per_seq],
