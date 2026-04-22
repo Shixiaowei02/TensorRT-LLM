@@ -149,7 +149,7 @@ class TestMewtwoCacheManager:
             dtype=dtype,
             compressor_dtype=compressor_dtype,
             vocab_size=self.vocab_size,
-            max_num_tokens=max_input_len + max_batch_size,
+            max_num_tokens=max_batch_size * (max_input_len + 1),
             sparse_attn_config=sparse_attn_config,
         )
 
@@ -662,7 +662,7 @@ class TestMewtwoCacheManager:
     ):
         max_batch_size = len(prompt_lens)
         max_seq_len = max(prompt_lens) + num_generation_steps + 1
-        max_input_len = sum(prompt_lens)
+        max_input_len = max(prompt_lens)
         # Create cache manager and sparse attention config
         cache_manager, sparse_attn_config = self._create_mewtwo_cache_manager(
             tokens_per_block=self.tokens_per_block,
