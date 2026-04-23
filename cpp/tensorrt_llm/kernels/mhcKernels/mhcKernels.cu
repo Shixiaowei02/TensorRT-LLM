@@ -218,6 +218,15 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 INST_BIGFUSE(1, 128)
 INST_BIGFUSE(1, 256)
 INST_BIGFUSE(1, 512)
+INST_BIGFUSE(2, 128)
+INST_BIGFUSE(2, 256)
+INST_BIGFUSE(2, 512)
+INST_BIGFUSE(4, 128)
+INST_BIGFUSE(4, 256)
+INST_BIGFUSE(4, 512)
+INST_BIGFUSE(8, 128)
+INST_BIGFUSE(8, 256)
+INST_BIGFUSE(8, 512)
 INST_BIGFUSE(16, 128)
 INST_BIGFUSE(16, 256)
 INST_BIGFUSE(16, 512)
@@ -632,8 +641,11 @@ static int selectFmaTileN(int M, int N)
     return 8;
 }
 
-// BigFuse: select BLOCK_SIZE given M.
-// TODO: fill in thresholds from bench_mhc_gridsearch output
+// BigFuse: select BLOCK_SIZE given M. Thresholds match the production autotuner
+// fallback; we use 128 threads for tiny-M waves (too few tokens to hide global
+// scoreboard latency at 256) and 256 otherwise. 512 is not picked here because
+// it only wins when M is very large, which path B/D do not route through this
+// helper.
 static int selectBigFuseBlockSize(int M)
 {
     if (M <= 16)
@@ -680,35 +692,42 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
 void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 const* residual, float const* hc_scale,
     float const* hc_base, float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int M, int K, int hidden_size,
     float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat,
-    int num_splits, cudaStream_t stream)
+    int num_splits, int block_size, cudaStream_t stream)
 {
     if (M <= 0)
         return;
 
-    TLLM_CHECK_WITH_INFO(
-        num_splits == 1 || num_splits == 16, "mhcBigFuseLaunch: only num_splits=1 or 16 supported, got %d", num_splits);
+    TLLM_CHECK_WITH_INFO(num_splits == 1 || num_splits == 2 || num_splits == 4 || num_splits == 8 || num_splits == 16,
+        "mhcBigFuseLaunch: only num_splits ∈ {1,2,4,8,16} supported, got %d", num_splits);
 
-    int const bs = selectBigFuseBlockSize(M);
+    int const bs = (block_size > 0) ? block_size : selectBigFuseBlockSize(M);
 
-    if (num_splits == 16)
-        mhcBigFuseDispatch<16>(y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,
-            hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, bs, stream);
-    else
-        mhcBigFuseDispatch<1>(y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,
-            hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, bs, stream);
+#define DISPATCH_BF(NS)                                                                                                \
+    mhcBigFuseDispatch<NS>(y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,           \
+        hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, bs, stream)
+
+    switch (num_splits)
+    {
+    case 1: DISPATCH_BF(1); break;
+    case 2: DISPATCH_BF(2); break;
+    case 4: DISPATCH_BF(4); break;
+    case 8: DISPATCH_BF(8); break;
+    case 16: DISPATCH_BF(16); break;
+    }
+#undef DISPATCH_BF
 }
 
 void mhcGemmSqrsumFmaLaunch(__nv_bfloat16 const* x, float const* w_t, float* y, float* r, int M, int N, int K,
-    int num_k_blocks, int k_chunk, bool zero_outputs, cudaStream_t stream)
+    int tile_n, int tile_m, cudaStream_t stream)
 {
     if (M <= 0)
         return;
 
-    (void) num_k_blocks;
-    (void) k_chunk;
-    (void) zero_outputs;
+    (void) tile_m; // reserved for future multi-row kernel variant
 
-    int const tileN = selectFmaTileN(M, N);
+    int const tileN = (tile_n > 0) ? tile_n : selectFmaTileN(M, N);
+
+    TLLM_CHECK_WITH_INFO(N % tileN == 0, "mhcGemmSqrsumFmaLaunch: N=%d not divisible by tile_n=%d", N, tileN);
 
 #define LAUNCH_FMA(TN) mhcGemmSqrsumFmaKernel<TN><<<dim3(M, (N + TN - 1) / TN), 256, 0, stream>>>(x, w_t, y, r, M, N, K)
 

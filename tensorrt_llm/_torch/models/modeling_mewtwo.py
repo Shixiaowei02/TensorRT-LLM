@@ -66,7 +66,7 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import MewtwoMoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
-from ..modules.mhc.hyper_connection import HCHead, mHC
+from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
 
 # isort: off
 from ..modules.fused_moe.routing import (
@@ -1235,7 +1235,27 @@ class MewtwoDecoderLayer(DecoderLayer):
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
         self.layer_idx = layer_idx
+        # is_first_layer is baked in at __init__ time so the Python-side branch in
+        # forward() resolves at CUDA-graph capture time (layer 0 captures the hc_pre
+        # path, all other layers capture the fused_hc path).
+        self.is_first_layer = layer_idx == 0
+        # fused_hc knob: pretrained-config attr `enable_fused_hc` controls whether
+        # the MHC boundary fusion (`mHC.fused_hc`) is used. When False, fall back
+        # to the unfused `post_mapping → pre_mapping` chain (same path engram
+        # layers already take). Env var TRTLLM_MHC_ENABLE_FUSED_HC overrides the
+        # config attr (set to "0" to force-disable). Default: True.
+        _env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
+        if _env is not None:
+            self.enable_fused_hc = _env not in ("0", "false", "False")
+        else:
+            self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", True))
         self.next_layer_layernorm: RMSNorm = None
+        # Finalized in MewtwoForCausalLM.post_load_weights once the full layer
+        # list is visible: a layer may defer its hc_ffn.post_mapping only if
+        # the next layer is able to absorb it via fused_hc (i.e. the next
+        # layer has fused_hc enabled and no engram at its entry). Last layer
+        # never defers — hc_head consumes the residual directly.
+        self.defer_post_mapping: bool = False
 
         # Engram module (optional, for n-gram context augmentation)
         self.engram: Optional[Engram] = None
@@ -1307,50 +1327,141 @@ class MewtwoDecoderLayer(DecoderLayer):
     def forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hc_state,
         attn_metadata: MewtwoTrtllmAttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         engram_embeddings=None,
         **kwargs,
-    ) -> torch.Tensor:
-        # Apply Engram module BEFORE attention if enabled for this layer.
-        # Engram operates on all HC streams with per-stream gating,
-        # returning [T, hc_mult, D].  Its output is added as a
-        # direct residual — no mHC wrapping needed because Engram already
-        # produces per-HC differentiated outputs internally.
-        if self.engram is not None and engram_embeddings is not None:
-            engram_output = self.engram(hidden_states, engram_embeddings)
-            hidden_states = hidden_states + engram_output
+    ):
+        """mHC-aware decoder layer with boundary fusion.
 
-        residual = hidden_states
-        post_mix, res_mix, hidden_states = self.hc_attn.pre_mapping(hidden_states)
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        ``hc_state`` carries the mHC pipeline state across layers:
+
+        - ``is_first_layer=True``: ``hc_state`` is the initial residual tensor
+          ``[B, HC_MULT, hidden]`` (bf16). This layer bootstraps the stream
+          with ``hc_attn.pre_mapping`` (aka the standalone ``hc_pre``).
+        - ``is_first_layer=False``: ``hc_state`` is an ``HCState``. If
+          ``is_deferred`` (fused path), the 4 tensors feed the current
+          ``hc_attn.fused_hc``. Otherwise ``residual`` is already post-mapped
+          by the prior layer and this layer just runs ``pre_mapping``.
+
+        Returns an ``HCState``. Fused mode returns a deferred state carrying
+        this layer's ``hc_ffn`` inputs, so the next layer absorbs
+        ``hc_ffn.post_mapping`` via its own ``fused_hc``. Engram / unfused
+        mode resolves the post_mapping in-layer and returns a resolved state.
+
+        Engram (when enabled on this layer) injects a residual modification
+        between the previous block's post_mapping and this block's pre_mapping.
+        That mutation breaks the algebraic assumptions of ``fused_hc``, so
+        engram-enabled layers fall back to the unfused
+        ``post_mapping → +engram → pre_mapping`` chain at the entry boundary.
+        The mid-layer ``attn → MoE`` boundary is always safe to fuse.
+        """
+        has_engram = self.engram is not None and engram_embeddings is not None
+
+        # -------------------------------------------------------------------
+        # Entry boundary: hc_pre (layer 0) or fused_hc / unfused chain.
+        # -------------------------------------------------------------------
+        residual, post_mix, comb_mix, layer_input = self._entry_boundary(
+            hc_state, engram_embeddings, has_engram
+        )
+
+        # -------------------------------------------------------------------
+        # Attention block
+        # -------------------------------------------------------------------
+        x_attn = self.input_layernorm(layer_input)
+        x_attn = self.self_attn(
             position_ids=position_ids,
-            hidden_states=hidden_states,
+            hidden_states=x_attn,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        hidden_states = self.hc_attn.post_mapping(
-            x=hidden_states, residual=residual, post_layer_mix=post_mix, comb_res_mix=res_mix
-        )
 
-        residual = hidden_states
+        # -------------------------------------------------------------------
+        # Mid-layer boundary: fuse hc_attn.post_mapping + hc_ffn.pre_mapping.
+        # No engram concern here because engram only fires at layer entry.
+        # When enable_fused_hc=False, fall back to the unfused chain.
+        # -------------------------------------------------------------------
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
-        post_mix, res_mix, hidden_states = self.hc_ffn.pre_mapping(hidden_states)
-        hidden_states = self.forward_MoE(
-            hidden_states=hidden_states,
+        if self.enable_fused_hc:
+            residual, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc(
+                x_prev=x_attn,
+                residual_prev=residual,
+                post_mix_prev=post_mix,
+                comb_mix_prev=comb_mix,
+            )
+        else:
+            # Break fused_hc into post_mapping and pre_mapping as separate ops.
+            residual = self.hc_attn.post_mapping(
+                x=x_attn,
+                residual=residual,
+                post_layer_mix=post_mix,
+                comb_res_mix=comb_mix,
+            )
+            post_mix, comb_mix, layer_input = self.hc_ffn.pre_mapping(residual)
+
+        # -------------------------------------------------------------------
+        # MoE block — returns x_ffn (post-MoE, already normed by
+        # next_layer_layernorm when POST_MOE_FUSION is on).
+        # -------------------------------------------------------------------
+        x_ffn = self.forward_MoE(
+            hidden_states=layer_input,
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             input_ids=input_ids,
         )
-        hidden_states = self.hc_ffn.post_mapping(
-            x=hidden_states, residual=residual, post_layer_mix=post_mix, comb_res_mix=res_mix
+
+        # Defer this layer's hc_ffn.post_mapping only when the NEXT layer can
+        # absorb it via fused_hc (see post_load_weights). Otherwise resolve it
+        # here and hand the next layer a fully post-mapped residual.
+        if self.defer_post_mapping:
+            return HCState.deferred(
+                residual=residual, post_mix=post_mix, comb_mix=comb_mix, x_prev=x_ffn
+            )
+        resolved_residual = self.hc_ffn.post_mapping(
+            x=x_ffn,
+            residual=residual,
+            post_layer_mix=post_mix,
+            comb_res_mix=comb_mix,
         )
-        return hidden_states
+        return HCState.resolved(resolved_residual)
+
+    def _entry_boundary(self, hc_state, engram_embeddings, has_engram):
+        """Resolve the per-layer entry into (residual, post_mix, comb_mix, layer_input).
+
+        Two code paths:
+          1. fused: previous layer deferred its post_mapping; fold it into this
+             layer's pre_mapping via hc_attn.fused_hc. The prev layer only
+             defers when post_load_weights has proved we can absorb it here
+             (no engram, fused_hc enabled), so a deferred state at entry is
+             guaranteed fusable.
+          2. unfused: previous layer already resolved its post_mapping (or
+             this is layer 0); run pre_mapping on the residual directly.
+        """
+        # Fused entry: prev layer deferred its post_mapping; fold it into
+        # hc_attn.fused_hc. By construction (post_load_weights), a deferred
+        # state at entry is guaranteed fusable. Layer 0 receives the raw
+        # residual tensor and has no HCState, so short-circuit on it.
+        if not self.is_first_layer and hc_state.is_deferred:
+            return self.hc_attn.fused_hc(
+                x_prev=hc_state.x_prev,
+                residual_prev=hc_state.residual,
+                post_mix_prev=hc_state.post_mix,
+                comb_mix_prev=hc_state.comb_mix,
+            )
+
+        # Unfused entry: layer 0 hands us the initial residual tensor
+        # [B, HC_MULT, hidden] directly; post-layer-0 hands us a resolved
+        # HCState. Both collapse to "apply engram delta (if any) then run
+        # pre_mapping".
+        residual = hc_state if self.is_first_layer else hc_state.residual
+        if has_engram:
+            residual = residual + self.engram(residual, engram_embeddings)
+        post_mix, comb_mix, layer_input = self.hc_attn.pre_mapping(residual)
+        return residual, post_mix, comb_mix, layer_input
 
     def forward_MoE(
         self,
@@ -1727,6 +1838,16 @@ class MewtwoModel(DecoderModel):
             hidden_states = inputs_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
+        # ``hc_state`` carries the mHC pipeline state across layers. Layer 0
+        # receives the initial residual tensor and bootstraps via
+        # hc_attn.pre_mapping ("hc_pre"). Every later layer receives an
+        # ``HCState``. In fused mode the state is "deferred" (prior layer's
+        # hc_ffn.post_mapping is folded into this layer's hc_attn.fused_hc);
+        # in unfused mode the state is "resolved" (residual already
+        # post-mapped). After the last layer, a deferred state is closed with
+        # a standalone hc_post; a resolved state feeds hc_head directly.
+        hc_state = hidden_states
+
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
@@ -1735,16 +1856,19 @@ class MewtwoModel(DecoderModel):
                 engram_events[idx].wait(torch.cuda.current_stream())
                 engram_embeddings = engram_embeddings_cache[idx]
 
-            hidden_states = decoder_layer(
+            hc_state = decoder_layer(
                 position_ids=position_ids,
-                hidden_states=hidden_states,
+                hc_state=hc_state,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
                 input_ids=input_ids,
                 engram_embeddings=engram_embeddings,
             )
 
-        hidden_states = self.hc_head(hidden_states)
+        # Epilogue: the last layer always resolves its post_mapping in-place
+        # (post_load_weights pins defer_post_mapping=False on the final
+        # layer), so hc_state is guaranteed to be resolved here.
+        hidden_states = self.hc_head(hc_state.residual)
 
         return hidden_states
 
@@ -1860,8 +1984,23 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
         weight_loader.load_weights(weights)
 
     def post_load_weights(self):
-        for idx, layer in enumerate(self.model.layers[: self.config.num_hidden_layers]):
-            if idx == self.config.num_hidden_layers - 1:
+        layers = self.model.layers[: self.config.num_hidden_layers]
+        last_idx = self.config.num_hidden_layers - 1
+        for idx, layer in enumerate(layers):
+            if idx == last_idx:
                 layer.next_layer_layernorm = self.model.norm
+                # Last layer feeds hc_head directly; never defer.
+                layer.defer_post_mapping = False
             else:
-                layer.next_layer_layernorm = self.model.layers[idx + 1].input_layernorm
+                next_layer = layers[idx + 1]
+                layer.next_layer_layernorm = next_layer.input_layernorm
+                # Defer this layer's hc_ffn.post_mapping into the next layer's
+                # hc_attn.fused_hc only if that next layer can actually absorb
+                # it: fused_hc enabled on both sides, and no engram at the
+                # next layer's entry (engram needs the materialized residual
+                # before pre_mapping runs).
+                layer.defer_post_mapping = (
+                    layer.enable_fused_hc
+                    and next_layer.enable_fused_hc
+                    and next_layer.engram is None
+                )
