@@ -111,6 +111,26 @@ def profile_fn(fn, warmup=BENCH_WARMUP, iters=BENCH_ITERS):
     return result
 
 
+def profile_fn_total(fn, warmup: int = BENCH_WARMUP, iters: int = BENCH_ITERS) -> float:
+    """Return average per-iter kernel time (us) via torch.profiler.
+
+    Sums `self_device_time_total` (microseconds) across every CUDA event
+    recorded between start() and stop() and divides by `iters`. This
+    captures the true per-iter kernel time and excludes host-side gaps
+    between launches (e.g. between post_mapping and pre_mapping in the
+    unfused path), regardless of how kernel counts differ across paths.
+    """
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    total_us = sum(evt.self_device_time_total for evt in prof.key_averages())
+    return total_us / iters
+
+
 def sum_kernel_times(timings, filters):
     """Sum times for kernel names matching any filter substring."""
     total = 0.0
@@ -291,6 +311,426 @@ def test_mhc_post_mapping(n: int, hidden_size: int, hc_mult: int):
     output_cuda = test_module.post_mapping(**test_data)
     output_ref = vanilla_post_mapping(**test_data)
     torch.testing.assert_close(output_ref, output_cuda, rtol=1e-2, atol=0.1)
+
+
+@pytest.mark.parametrize("n", [1, 32, 128, 512, 4096, 8192])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_fused_hc(n: int, hidden_size: int, hc_mult: int):
+    """Correctness test for mHC.fused_hc.
+
+    fused_hc(x_prev, residual_prev, post_mix_prev, comb_mix_prev) must be
+    numerically equivalent to:
+        residual_cur = post_mapping(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+        post_mix_cur, comb_mix_cur, layer_input_cur = pre_mapping(residual_cur)
+
+    Uses two distinct mHC modules so that the 'prev' and 'cur' blocks have
+    different weights — mirroring the real decoder layer boundary.
+    """
+    # Generate parameters for the 'current' mHC (consumed by pre_mapping part).
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    # Generate the incoming (residual_prev, x_prev, post_mix_prev, comb_mix_prev)
+    # that the 'previous' block would have emitted.
+    torch.random.manual_seed(7)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    # --- fused_hc path ---
+    (
+        residual_cur_f,
+        post_mix_cur_f,
+        comb_mix_cur_f,
+        layer_input_cur_f,
+    ) = cur_module.fused_hc(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+
+    # --- two-step reference (post_mapping then pre_mapping via the same module) ---
+    residual_cur_ref = cur_module.post_mapping(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+    post_mix_cur_ref, comb_mix_cur_ref, layer_input_cur_ref = cur_module.pre_mapping(
+        residual_cur_ref
+    )
+
+    # Timing: fused_hc vs separate (post_mapping + pre_mapping).
+    # Both paths sum every CUDA event's self_device_time_total via
+    # torch.profiler and divide by the iteration count, so host-side gaps
+    # between post_mapping and pre_mapping in the unfused path are excluded.
+    def _unfused():
+        residual_cur = cur_module.post_mapping(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+        cur_module.pre_mapping(residual_cur)
+
+    fused_us = profile_fn_total(
+        lambda: cur_module.fused_hc(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+    )
+    unfused_us = profile_fn_total(_unfused)
+
+    timing_stats[("fused_hc", n, hidden_size)]["cuda"] = fused_us
+    timing_stats[("fused_hc", n, hidden_size)]["cuda_unfused"] = unfused_us
+    speedup = (unfused_us / fused_us) if fused_us > 0 else 0.0
+    print(
+        f"[fused_hc benchmark] n={n} hidden={hidden_size}  "
+        f"fused={fused_us:7.2f}us  unfused={unfused_us:7.2f}us  "
+        f"speedup={speedup:.2f}x"
+    )
+
+    # fused_hc is a Python-level chain of the same kernels that pre_mapping and
+    # post_mapping use (mhc_post_mapping then the bigfuse pre_mapping pipeline).
+    # Tolerance matches the baseline post_mapping test (residuals are bf16).
+    torch.testing.assert_close(residual_cur_ref, residual_cur_f, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(post_mix_cur_ref, post_mix_cur_f, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(comb_mix_cur_ref, comb_mix_cur_f, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(layer_input_cur_ref, layer_input_cur_f, rtol=1e-3, atol=5e-3)
+
+
+# Explicit backend coverage. The autotuner picks one tactic per M-bucket at
+# warmup; to actually exercise every backend across CI we force each tactic.
+# Tactic format mirrors MhcFusedHcRunner: (backend, tile_n, num_k_splits,
+# bigfuse_bs, tile_m).
+#
+# FMA tactics intentionally sweep both ks>1 (cross-CTA atomicAdd into y_acc /
+# r_acc) and tile_m>1 (Path F only; multi-token per CTA, which reshapes how
+# the atomic accumulation buckets tokens). Keeping ks=1,tm=1 only would leave
+# the cross-CTA atomic path uncovered.
+_BACKEND_TACTICS_BY_M = {
+    64: [
+        ("fused_half_mma", 0, 8, 256, 1),
+        ("fused_all_mma", 0, 1, 0, 1),
+        ("fused_half_fma", 2, 2, 256, 1),  # FMA cross-CTA atomic (ks=2)
+        ("fused_half_fma", 2, 4, 256, 1),  # FMA deeper cross-CTA atomic (ks=4)
+        ("fused_all_fma", 2, 1, 0, 1),
+        ("fused_all_fma", 2, 2, 0, 1),  # Path F ks=2 atomic
+        ("fused_all_fma", 2, 1, 0, 2),  # Path F tile_m=2 (multi-token CTA)
+    ],
+    256: [
+        ("fused_half_mma", 0, 4, 256, 1),
+        ("fused_all_mma", 0, 1, 0, 1),
+        ("fused_half_fma", 4, 1, 256, 1),
+        ("fused_half_fma", 2, 2, 256, 1),  # ks=2 atomic
+        ("fused_all_fma", 4, 1, 0, 1),
+        ("fused_all_fma", 2, 2, 0, 1),  # Path F ks=2 atomic (tn=2 required for ks>1)
+        ("fused_all_fma", 4, 1, 0, 2),  # Path F tile_m=2
+    ],
+    # fused_half_fma is intentionally omitted at M=2048: the runner guards the
+    # FMA 2-kernel path to M <= 512 (it stops scaling past that M).
+    2048: [
+        ("fused_half_mma", 0, 2, 128, 1),
+        ("fused_all_mma", 0, 1, 0, 1),
+        ("fused_all_fma", 4, 1, 0, 1),
+        ("fused_all_fma", 2, 2, 0, 1),  # Path F ks=2 atomic (tn=2 required for ks>1)
+        ("fused_all_fma", 4, 1, 0, 4),  # Path F tile_m=4
+    ],
+}
+
+
+@pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
+    """Every wired fused_hc backend sees bit-identical input and is checked
+    against one shared torch reference and one golden backend output.
+
+    Paths D (fused_all_mma) and F (fused_all_fma) are single-kernel
+    all-in-one variants; fused_half_mma (Path B) and fused_half_fma (Path E)
+    are the 2-kernel baselines. Each is forced by calling
+    MhcFusedHcRunner.forward directly with an explicit tactic, bypassing the
+    autotuner.
+
+    Path C (bigfuse tcgen05) is not covered: its kernel emits (D_next,
+    sqr_sum_next, layer_input) as the layer-to-layer state carrier and does
+    not produce post_mix_cur / comb_mix_cur, so it cannot be dropped in
+    behind the current mhc_fused_hc API without a kernel-side modification
+    that adds post_mix_out / comb_mix_out stores.
+    """
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    torch.random.manual_seed(13)
+    device = "cuda"
+    # Canonical input tensors — generated once, then deep-cloned per consumer
+    # so the torch ref and each backend each get an independent byte-identical
+    # copy. Protects the test from any hypothetical in-place mutation inside
+    # a kernel launcher or a contiguous() call.
+    x_prev_ref = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev_ref = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev_ref = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev_ref = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    # Torch ground-truth — computed from clones so the ref path cannot
+    # perturb the canonical input tensors either.
+    residual_cur_ref = cur_module.post_mapping(
+        x_prev_ref.clone(),
+        residual_prev_ref.clone(),
+        post_mix_prev_ref.clone(),
+        comb_mix_prev_ref.clone(),
+    )
+    post_mix_ref, comb_mix_ref, layer_input_ref = cur_module.pre_mapping(residual_cur_ref.clone())
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+
+    def make_runner_inputs():
+        return [
+            x_prev_ref.clone(),
+            residual_prev_ref.reshape(n, hc_mult, hidden_size).clone().contiguous(),
+            post_mix_prev_ref.reshape(n, hc_mult).clone().contiguous(),
+            comb_mix_prev_ref.reshape(n, hc_mult, hc_mult).clone().contiguous(),
+            cur_module.fn.detach().clone().contiguous(),
+            cur_module.scale.detach().clone(),
+            cur_module.base.detach().clone(),
+        ]
+
+    backend_outputs = {}
+    for tactic in _BACKEND_TACTICS_BY_M[n]:
+        backend = tactic[0]
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = runner(
+            inputs=make_runner_inputs(), tactic=tactic
+        )
+        backend_outputs[backend] = (
+            residual_cur,
+            post_mix_cur.view(n, hc_mult, 1),
+            comb_mix_cur.view(n, hc_mult, hc_mult),
+            layer_input_cur,
+        )
+
+    # Tolerances: bf16 has a 7-bit mantissa so 1 ulp ~ 7.8e-3. For outputs
+    # near unit scale with fp32-accumulated reductions, rtol=1e-2 atol=1e-2
+    # is the expected bf16 parity — tighter than test_mhc_post_mapping's
+    # atol=0.1 which compared against a pure-bf16 vanilla reference.
+    bf16_tol = dict(rtol=1e-2, atol=1e-2)
+    fp32_tol = dict(rtol=1e-3, atol=5e-3)
+
+    # (1) Every backend must match the torch reference.
+    for backend, (
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+    ) in backend_outputs.items():
+        torch.testing.assert_close(
+            residual_cur_ref,
+            residual_cur,
+            **bf16_tol,
+            msg=f"[vs torch-ref] backend={backend} n={n} residual mismatch",
+        )
+        torch.testing.assert_close(
+            post_mix_ref,
+            post_mix_cur,
+            **fp32_tol,
+            msg=f"[vs torch-ref] backend={backend} n={n} post_mix mismatch",
+        )
+        torch.testing.assert_close(
+            comb_mix_ref,
+            comb_mix_cur,
+            **fp32_tol,
+            msg=f"[vs torch-ref] backend={backend} n={n} comb_mix mismatch",
+        )
+        torch.testing.assert_close(
+            layer_input_ref,
+            layer_input_cur,
+            **bf16_tol,
+            msg=f"[vs torch-ref] backend={backend} n={n} layer_input mismatch",
+        )
+
+    # (2) All backends must agree with one golden backend at the same tolerance
+    # as vs the torch ref. Different backends vary only in tile shape and
+    # reduction order, so cross-backend divergence would indicate a kernel
+    # correctness bug rather than expected rounding drift.
+    gold = "fused_half_mma" if "fused_half_mma" in backend_outputs else next(iter(backend_outputs))
+    gr, gpm, gcm, gli = backend_outputs[gold]
+    for backend, (
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+    ) in backend_outputs.items():
+        if backend == gold:
+            continue
+        torch.testing.assert_close(
+            gr,
+            residual_cur,
+            **bf16_tol,
+            msg=f"[vs {gold}] backend={backend} n={n} residual mismatch",
+        )
+        torch.testing.assert_close(
+            gpm,
+            post_mix_cur,
+            **fp32_tol,
+            msg=f"[vs {gold}] backend={backend} n={n} post_mix mismatch",
+        )
+        torch.testing.assert_close(
+            gcm,
+            comb_mix_cur,
+            **fp32_tol,
+            msg=f"[vs {gold}] backend={backend} n={n} comb_mix mismatch",
+        )
+        torch.testing.assert_close(
+            gli,
+            layer_input_cur,
+            **bf16_tol,
+            msg=f"[vs {gold}] backend={backend} n={n} layer_input mismatch",
+        )
+
+
+@pytest.mark.parametrize("n", [128, 2048])
+@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
+    """CUDA-graph capture/replay of mHC.fused_hc.
+
+    The decoder uses fused_hc at every non-first layer boundary; the whole
+    decoder is expected to be traced into a single CUDA graph. This test
+    verifies that (a) fused_hc can be captured without host syncs, and
+    (b) replay produces bit-exact results to eager.
+
+    To keep the bit-exact assertion structurally valid, we drive the runner
+    with an explicit ``num_k_splits=1`` tactic (Path B, fused_half_mma).
+    That disables split-K atomic accumulation entirely, so none of the four
+    outputs depend on the non-deterministic FP ordering that pickKSplits(M)
+    would otherwise introduce (it picks ks=16 at M=128 and ks=4 at M=2048
+    for the autotuner fallback — atomics active, not deterministic across
+    replays).
+    """
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    torch.random.manual_seed(11)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+    # Pin tactic to Path B with num_k_splits=1 → no atomic accumulation on
+    # any output. Tactic tuple matches MhcFusedHcRunner.get_tactics().
+    tactic = ("fused_half_mma", 0, 1, 128, 1)
+    assert tactic[2] == 1, "bit-exact assertion requires num_k_splits=1"
+
+    def _inputs():
+        return [
+            x_prev,
+            residual_prev.reshape(n, hc_mult, hidden_size).contiguous(),
+            post_mix_prev.reshape(n, hc_mult).contiguous(),
+            comb_mix_prev.reshape(n, hc_mult, hc_mult).contiguous(),
+            cur_module.fn,
+            cur_module.scale,
+            cur_module.base,
+        ]
+
+    # Eager reference — runner's workspace cache reuses output tensors across
+    # calls with matching shape, so eager_out and graph_out alias the same
+    # storage. Clone eager_out so we can compare after the graph replay
+    # overwrites the workspace.
+    eager_raw = runner(inputs=_inputs(), tactic=tactic)
+    eager_out = tuple(t.clone() for t in eager_raw)
+
+    # Warm up on a side stream — required for CUDA graph capture.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            runner(inputs=_inputs(), tactic=tactic)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    # Capture.
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        graph_out = runner(inputs=_inputs(), tactic=tactic)
+
+    # Replay — outputs should update in place.
+    g.replay()
+    torch.cuda.synchronize()
+
+    # With ks=1 the kernel has no atomic accumulation anywhere, so replay must
+    # be bit-exact against eager on all four outputs.
+    for ge, ee, name in zip(
+        graph_out, eager_out, ["residual", "post_mix", "comb_mix", "layer_input"]
+    ):
+        torch.testing.assert_close(
+            ge, ee, rtol=0, atol=0, msg=f"fused_hc CUDA-graph mismatch in {name}"
+        )
+
+    # Mutate inputs in-place and replay; result should follow — proves the graph
+    # is parameterised by input storage, not cached constants.
+    x_prev.mul_(1.001)
+    residual_prev.mul_(1.001)
+    post_mix_prev.mul_(1.001)
+    comb_mix_prev.mul_(1.001)
+    eager_raw2 = runner(inputs=_inputs(), tactic=tactic)
+    eager_out2 = tuple(t.clone() for t in eager_raw2)
+    g.replay()
+    torch.cuda.synchronize()
+    for ge, ee, name in zip(
+        graph_out, eager_out2, ["residual", "post_mix", "comb_mix", "layer_input"]
+    ):
+        torch.testing.assert_close(
+            ge, ee, rtol=0, atol=0, msg=f"fused_hc CUDA-graph replay mismatch in {name}"
+        )
 
 
 @pytest.mark.parametrize("m", [64, 128, 4096, 8192])
@@ -534,7 +974,7 @@ def print_timing_stats():
     print("=" * 90)
 
     # --- Per-backend correctness/perf tests (pre_mapping, post_mapping, hc_head) ---
-    for test_type in ("pre_mapping", "post_mapping", "hc_head"):
+    for test_type in ("pre_mapping", "post_mapping", "fused_hc", "hc_head"):
         entries = {
             k: v for k, v in timing_stats.items() if isinstance(k, tuple) and k[0] == test_type
         }
