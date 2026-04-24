@@ -19,7 +19,6 @@ benchmark:
   concurrency_list: "16"
   input_length: 1024  # Input sequence length
   output_length: 1024  # Output sequence length
-  dataset_file: "<dataset_file>"
 
 # Hardware Configuration
 hardware:

@@ -6,22 +6,24 @@ set -u
 trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 # Add parameter validation
-if [ "$#" -lt 10 ]; then
+if [ "$#" -lt 12 ]; then
     echo "Error: Missing required arguments, got $# arguments, args: $@"
-    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
+    echo "Usage: $0 model_name input_seq_len output_seq_len range_ratio multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
     exit 1
 fi
 
 model_name=$1
-dataset_file=$2
-multi_round=$3
-num_gen_servers=$4
-concurrency_list=$5
-streaming=$6
-log_path=$7
-hostname=$8
-port=$9
-ucx_warmup_requests=${10}
+input_seq_len=$2
+output_seq_len=$3
+range_ratio=$4
+multi_round=$5
+num_gen_servers=$6
+concurrency_list=$7
+streaming=$8
+log_path=$9
+hostname=${10}
+port=${11}
+ucx_warmup_requests=${12}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -144,8 +146,12 @@ for concurrency in ${concurrency_list}; do
         --backend openai \
         --host ${hostname} \
         --port ${port} \
-        --dataset-name "trtllm_custom" \
-        --dataset-path ${dataset_file} \
+        --dataset-name random \
+        --random-ids \
+        --tokenize-on-client \
+        --random-input-len ${input_seq_len} \
+        --random-output-len ${output_seq_len} \
+        --random-range-ratio ${range_ratio} \
         --num-prompts ${num_prompts} \
         --max-concurrency ${concurrency} \
         --trust-remote-code \

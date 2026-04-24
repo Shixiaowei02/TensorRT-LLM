@@ -350,8 +350,8 @@ def submit_dwdp_job(config, log_dir, dry_run):
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark.sh')}",
                 (
-                    f"'{env_config['model_path']}'"
-                    f" '{benchmark_config['dataset_file']}'"
+                    f"'{env_config['model_path']}' {isl} {osl}"
+                    f" {benchmark_config['benchmark_ratio']}"
                     f" {benchmark_config['multi_round']} {gen_num}"
                     f" '{benchmark_config['concurrency_list']}'"
                     f" {benchmark_config['streaming']} '{log_dir}'"

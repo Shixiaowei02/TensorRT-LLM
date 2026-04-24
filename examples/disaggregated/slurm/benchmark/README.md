@@ -45,7 +45,6 @@ benchmark:
   concurrency_list: "16"  # Comma-separated list of concurrency levels to test
   input_length: 1024  # Input sequence length
   output_length: 1024  # Output sequence length
-  dataset_file: "<dataset_file>"  # Path to dataset file
 ```
 
 ### 3. Hardware Configuration

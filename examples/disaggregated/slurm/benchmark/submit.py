@@ -621,7 +621,7 @@ def submit_job(config, log_dir, dry_run):
         else:
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark.sh')}",
-                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"'{env_config['model_path']}' {isl} {osl} {benchmark_config['benchmark_ratio']} {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
