@@ -85,7 +85,7 @@ class Compressor(nn.Module):
         dtype: Optional[torch.dtype] = torch.bfloat16,
         kv_cache_dtype: Union[str, KVCacheDtype] = KVCacheDtype.DEFAULT,
         is_indexer: bool = False,
-        rotate_activation: bool = True,
+        rotate_activation: bool = False,
     ):
         super().__init__()
         # Dimensions

@@ -43,7 +43,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -84,6 +84,31 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
+
+
+def _make_mewtwo_pos_embd_params(
+    model_config: ModelConfig[PretrainedConfig], layer_idx: Optional[int]
+) -> PositionalEmbeddingParams:
+    """Per-layer RoPE: compressed layers use ``compress_rope_theta`` + yarn;
+    non-compressed (ratio ≤ 1) layers use base ``rope_theta`` with yarn off."""
+    config = model_config.pretrained_config
+    sparse_cfg = model_config.sparse_attention_config
+    ratios = getattr(sparse_cfg, "compress_ratios", None) or ()
+    compress_ratio = (
+        ratios[layer_idx] if (layer_idx is not None and 0 <= layer_idx < len(ratios)) else 1
+    )
+
+    rope = RopeParams.from_config(config)
+    if compress_ratio > 1:
+        rope.theta = getattr(config, "compress_rope_theta", rope.theta)
+    else:
+        rope.theta = config.rope_theta
+        rope.scale_type = RotaryScalingType.none
+        rope.scale = rope.short_m_scale = rope.long_m_scale = 1.0
+        rope.mscale = 1.0
+        rope.mscale_all_dim = 0.0
+        rope.original_max_positions = rope.max_positions
+    return PositionalEmbeddingParams(type=PositionEmbeddingType.yarn, rope=rope, is_neox=False)
 
 
 @triton.jit
@@ -323,9 +348,9 @@ class MewtwoWeightLoader:
 
         is_lite = self.config.q_lora_rank is None
         num_heads = self.config.num_attention_heads
-        qk_nope_head_dim = self.config.qk_nope_head_dim
-        v_head_dim = self.config.v_head_dim
-        kv_lora_rank = self.config.kv_lora_rank
+        qk_nope_head_dim = getattr(self.config, "qk_nope_head_dim", None)
+        v_head_dim = getattr(self.config, "v_head_dim", getattr(self.config, "head_dim", None))
+        kv_lora_rank = getattr(self.config, "kv_lora_rank", None)
 
         tp_rank = self.model_config.mapping.tp_rank
         tp_size = self.model_config.mapping.tp_size
@@ -334,6 +359,27 @@ class MewtwoWeightLoader:
 
         params_map = {"gate_up_proj": ["gate_proj", "up_proj"]}
         all_named_modules = dict(self.model.named_modules())
+
+        def load_flat_hc_weights(module, names: List[str]) -> bool:
+            """Load mHC / HCHead from flat ckpt keys: ``<stem>_{fn,base,scale}``.
+
+            V4 / mewtwo checkpoints store these as flat names (e.g.
+            ``hc_attn_fn``) rather than structured (``hc_attn.fn``).
+            ``shared_head.hc_head`` (MTP) is rewritten to flat ``hc_head_*``
+            under the same parent.
+            """
+            if names[-1] in ("hc_attn", "hc_ffn", "hc_head"):
+                stem = ".".join(names)
+            elif names[-2:] == ["shared_head", "hc_head"]:
+                stem = ".".join(names[:-2] + ["hc_head"])
+            else:
+                return False
+            keys = {a: f"{stem}_{a}" for a in ("fn", "base", "scale")}
+            if not all(k in weights for k in keys.values()):
+                return False
+            for attr, key in keys.items():
+                getattr(module, attr).data.copy_(weights[key][:])
+            return True
 
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -599,6 +645,8 @@ class MewtwoWeightLoader:
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
+                elif isinstance(module, (mHC, HCHead)) and load_flat_hc_weights(module, names):
+                    continue
                 elif names[-1] in ("engram",):
                     # Engram is a container module with no direct parameters;
                     # its leaf sub-modules (multi_head_embedding, kv_proj,
@@ -756,11 +804,7 @@ class MewtwoAttention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=PositionalEmbeddingParams(
-                type=PositionEmbeddingType.yarn,
-                rope=RopeParams.from_config(config),
-                is_neox=False,
-            ),
+            pos_embd_params=_make_mewtwo_pos_embd_params(model_config, layer_idx),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -910,6 +954,19 @@ class MewtwoMoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
         )
+        # V4 reference: routed experts share one swiglu_limit; fused MoE op
+        # requires a per-local-expert fp32 tensor (cpp/.../moeOp.cpp).
+        swiglu_limit = getattr(config, "swiglu_limit", None)
+        self.swiglu_limit = (
+            None
+            if not swiglu_limit or not math.isfinite(swiglu_limit)
+            else torch.full(
+                (num_experts // model_config.mapping.moe_ep_size,),
+                float(swiglu_limit),
+                dtype=torch.float32,
+                device="cuda",
+            )
+        )
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -921,6 +978,7 @@ class MewtwoMoE(nn.Module):
             override_quant_config=override_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
+            swiglu_limit=self.swiglu_limit,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
             weight_loading_mode=(

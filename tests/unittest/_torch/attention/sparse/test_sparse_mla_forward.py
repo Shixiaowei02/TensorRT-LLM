@@ -1528,10 +1528,14 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             max_batch_size=1,
             max_seq_len=max_seqlen,
         )
+        # V4 reference: attention's compressor uses rotate=False (only the
+        # indexer's compressor rotates).  See V4-Pro inference/model.py
+        # Attention.__init__: ``Compressor(args, ratio, head_dim)`` (default
+        # rotate=False), Indexer.__init__: ``Compressor(..., rotate=True)``.
         ref_compressor = RefCompressor(ref_args,
                                        compress_ratios[layer_idx],
                                        pretrained_config.head_size,
-                                       rotate=True).to(device)
+                                       rotate=False).to(device)
 
         # Initialize reference compressor with same weights as MLA's compressor
         weights_wkv_gate = mla.mqa.compressor.wkv_gate.weight.data
