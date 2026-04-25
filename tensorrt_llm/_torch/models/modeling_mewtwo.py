@@ -662,6 +662,19 @@ class MewtwoWeightLoader:
                             p.data.copy_(module_weights[n][:])
 
 
+@torch.compile(options={"max-autotune": True})
+def _get_last_token_states(hidden_states, attn_metadata):
+    last_tokens = (
+        torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        )
+        - 1
+    )
+    return hidden_states[last_tokens]
+
+
 class MewtwoMTPHead(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -671,20 +684,11 @@ class MewtwoMTPHead(nn.Module):
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
+        self.hc_head = HCHead(config.hc_mult, config.hidden_size)
+        self.hc_mult = config.hc_mult
+        self.hidden_dim = config.hidden_size
 
         self.mapping_lm_head_tp = None
-
-    @torch.compile(options={"max-autotune": True})
-    def get_last_token_states(self, hidden_states, attn_metadata):
-        last_tokens = (
-            torch.cumsum(
-                attn_metadata.seq_lens_cuda,
-                dim=0,
-                dtype=torch.long,
-            )
-            - 1
-        )
-        return hidden_states[last_tokens]
 
     def forward(
         self,
@@ -695,9 +699,13 @@ class MewtwoMTPHead(nn.Module):
     ) -> torch.Tensor:
         if not return_context_logits:
             if attn_metadata is not None:
-                hidden_states = self.get_last_token_states(hidden_states, attn_metadata)
+                hidden_states = _get_last_token_states(hidden_states, attn_metadata)
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
+
+        hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
+        hidden_states = self.hc_head(hidden_states)
+        hidden_states = self.norm(hidden_states)
 
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
         enable_lm_head_tp_in_adp = (
@@ -721,6 +729,46 @@ class MewtwoMTPHead(nn.Module):
         if not enable_attention_dp or enable_lm_head_tp_in_adp:
             lm_head.gather_output = True
         return logits
+
+
+class MewtwoLogitsProcessor(nn.Module):
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        hc_head: HCHead,
+        norm: RMSNorm,
+    ):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.hc_mult = config.hc_mult
+        self.hidden_dim = config.hidden_size
+        # Keep HCHead and final norm owned by MewtwoModel. This processor only
+        # borrows them, so checkpoint loading and PP weight removal still happen
+        # through the model's normal module tree.
+        object.__setattr__(self, "_hc_head", hc_head)
+        object.__setattr__(self, "_norm", norm)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: Linear,
+        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        return_context_logits: bool = False,
+    ) -> torch.Tensor:
+        if not self.model_config.mapping.is_last_pp_rank():
+            return lm_head(hidden_states).float()
+
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = _get_last_token_states(hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1]
+
+        hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
+        hidden_states = self._hc_head(hidden_states)
+        hidden_states = self._norm(hidden_states)
+        return lm_head(hidden_states).float()
 
 
 class MewtwoLinear(Linear):
@@ -1207,6 +1255,7 @@ class MewtwoDecoderLayer(DecoderLayer):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         is_separate_draft_engine: bool = False,
         mapping_with_cp: Optional[Mapping] = None,
+        disable_post_moe_fusion: bool = False,
     ):
         super().__init__()
         self.model_config = model_config
@@ -1274,7 +1323,9 @@ class MewtwoDecoderLayer(DecoderLayer):
 
         has_tp = mapping.has_tp()
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION
+        self.fusion_config.POST_MOE_FUSION = (
+            self.fusion_config.PRE_MOE_FUSION and not disable_post_moe_fusion
+        )
 
         self.mlp = MewtwoMoE(
             num_experts=self.num_experts,
@@ -1639,7 +1690,13 @@ class MewtwoMTP(MewtwoDecoderLayer):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         is_separate_draft_engine: bool = False,
     ):
-        super().__init__(model_config, layer_idx, aux_stream_dict, is_separate_draft_engine)
+        super().__init__(
+            model_config,
+            layer_idx,
+            aux_stream_dict,
+            is_separate_draft_engine,
+            disable_post_moe_fusion=True,
+        )
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1657,17 +1714,35 @@ class MewtwoMTP(MewtwoDecoderLayer):
         self.hnorm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
+        self.hc_mult = config.hc_mult
         if model_config.mapping.enable_attention_dp:
-            self.eh_proj = Linear(
-                config.hidden_size * 2,
+            self.e_proj = Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+            self.h_proj = Linear(
+                config.hidden_size,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
         else:
-            self.eh_proj = Linear(
-                config.hidden_size * 2,
+            self.e_proj = Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+            self.h_proj = Linear(
+                config.hidden_size,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
@@ -1690,11 +1765,18 @@ class MewtwoMTP(MewtwoDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run an MTP layer.
+
+        ``embed_tokens`` is injected by the one-model draft path and shared
+        with the target model. ``hidden_states`` is the flattened mHC residual
+        from the target or previous MTP layer: [num_tokens, hc_mult * hidden].
+        """
+
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  # emdedding
 
         def norm_hidden():
-            return self.hnorm(hidden_states)
+            return self.hnorm(hidden_states.reshape(-1, self.hc_mult, self.hidden_dim))
 
         inputs_embeds, hidden_states = maybe_execute_in_parallel(
             norm_embeds,
@@ -1703,69 +1785,33 @@ class MewtwoMTP(MewtwoDecoderLayer):
             self.event_dict[EventType.MoeShared],
             self.aux_stream,
         )
-        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+
         # Split hidden_states columnwise based on TP
         tp_size = self.model_config.mapping.tp_size
         tp_rank = self.model_config.mapping.tp_rank
-
         if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+            inputs_embeds = torch.chunk(inputs_embeds, tp_size, dim=-1)[tp_rank]
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
-        hidden_states = self.eh_proj(hidden_states)
 
-        # Input layer norm
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        inputs_embeds = self.e_proj(inputs_embeds).unsqueeze(1)
+        hidden_states = self.h_proj(hidden_states)
+        hidden_states = inputs_embeds + hidden_states
 
-        # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
-            **kwargs,
-        )
-
-        # MTP Layer Must have sparse MOE
-        if self.fusion_config.PRE_MOE_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ),
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+        try:
+            hc_state = super().forward(
+                position_ids=position_ids,
+                hc_state=HCState.resolved(hidden_states),
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                input_ids=input_ids,
+                **kwargs,
             )
-        else:
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
-        # MoE
-        hidden_states = self.mlp(
-            hidden_states,
-            all_rank_num_tokens=all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (
-                    self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
-                )
-            ),
-        )
-
-        if self.fusion_config.POST_MOE_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.shared_head.norm.weight,
-                    eps=self.shared_head.norm.variance_epsilon,
-                ),
-            )
-        else:
-            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-
-        # It's for 2-model path, capture the hidden states
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+        finally:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        hidden_states = hc_state.residual.flatten(1)
 
         return hidden_states
 
@@ -1939,10 +1985,7 @@ class MewtwoModel(DecoderModel):
                 engram_embeddings=engram_embeddings,
             )
 
-        # Epilogue: the last layer always resolves its post_mapping in-place
-        # (post_load_weights pins defer_post_mapping=False on the final
-        # layer), so hc_state is guaranteed to be resolved here.
-        hidden_states = self.hc_head(hc_state.residual)
+        hidden_states = hc_state.residual.flatten(1)
 
         return hidden_states
 
@@ -1987,6 +2030,9 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
             model=MewtwoModel(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
+        self.logits_processor = MewtwoLogitsProcessor(
+            model_config, self.model.hc_head, self.model.norm
+        )
 
         # Exclude Engram weights from quantization.  Engram embedding tables
         # and small linear projections are not suited for NVFP4/FP8 quant.
@@ -2000,7 +2046,7 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
             model_config.spec_config is not None
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
+            self.model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
@@ -2011,7 +2057,7 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []
                     for model_mtp_idx in range(
-                        self.num_hidden_layers, self.num_hidden_layers + model_nextn
+                        self.num_hidden_layers, self.num_hidden_layers + self.model_nextn
                     ):
                         ckpt_mtp_idx = (
                             model_mtp_idx - self.num_hidden_layers
@@ -2062,8 +2108,10 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
         last_idx = self.config.num_hidden_layers - 1
         for idx, layer in enumerate(layers):
             if idx == last_idx:
-                layer.next_layer_layernorm = self.model.norm
-                # Last layer feeds hc_head directly; never defer.
+                # The V4 logits path is HCHead -> model.norm -> lm_head, so
+                # the final decoder layer must not fold model.norm into MoE.
+                layer.next_layer_layernorm = None
+                layer.fusion_config.POST_MOE_FUSION = False
                 layer.defer_post_mapping = False
             else:
                 next_layer = layers[idx + 1]
