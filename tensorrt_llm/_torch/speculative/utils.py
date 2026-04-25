@@ -144,6 +144,16 @@ def get_spec_metadata(spec_config,
     return None
 
 
+def get_mtp_hidden_size(model_config) -> int:
+    pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    hidden_size = getattr(pretrained_config, "hidden_size", None)
+    if hidden_size is None:
+        hidden_size = getattr(model_config, "hidden_size")
+    if getattr(pretrained_config, "model_type", None) == "mewtwo":
+        return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    return hidden_size
+
+
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -163,7 +173,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return MTPHiddenStatesManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
                 sa_manager=sa_manager,
             )
@@ -178,7 +188,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
-            model_config.hidden_size,
+            get_mtp_hidden_size(model_config),
             max_num_requests,
             sa_manager=sa_manager,
         )
