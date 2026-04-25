@@ -279,6 +279,28 @@ def _build_compressed_topk_indices(
     return indices
 
 
+def _softmax_with_sink(
+    logits: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Numerically stable softmax with an optional per-head sink in the denominator.
+
+    The sink behaves like a virtual register key whose value is zero: it
+    contributes exp(sink - max) to the denominator only, leaving the numerator
+    untouched.
+    """
+    fp32_logits = logits.float()
+    if attn_sink is None:
+        return torch.softmax(fp32_logits, dim=-1).to(out_dtype)
+    max_val = fp32_logits.amax(dim=-1, keepdim=True)
+    num = torch.exp(fp32_logits - max_val)
+    denom = num.sum(dim=-1, keepdim=True)
+    sink = attn_sink.float().view(-1, 1, 1)
+    denom = denom + torch.exp(sink - max_val)
+    return (num / denom).to(out_dtype)
+
+
 def calculate_mewtwo_ref_ctx_sparse(
     fused_q_rot: torch.Tensor,
     latent_cache_ref: torch.Tensor,
@@ -293,6 +315,7 @@ def calculate_mewtwo_ref_ctx_sparse(
     qk_rope_head_dim: int,
     q_scaling: float,
     compress_ratio: int,
+    attn_sink: Optional[torch.Tensor] = None,
 ):
     """Per-token reference attention for Mewtwo context phase.
 
@@ -346,7 +369,7 @@ def calculate_mewtwo_ref_ctx_sparse(
             v_sel = all_kv[:, :v_head_dim].unsqueeze(0).expand(num_heads, -1, -1)
 
             attn_w = torch.matmul(q_tok.unsqueeze(1), k_sel.transpose(1, 2)) * bmm1_scale
-            attn_w = torch.softmax(attn_w, dim=-1, dtype=torch.float32).to(fused_q_rot.dtype)
+            attn_w = _softmax_with_sink(attn_w, attn_sink, fused_q_rot.dtype)
             out = torch.matmul(attn_w, v_sel).squeeze(1)
             per_token_outputs.append(out.reshape(1, num_heads * v_head_dim))
 
@@ -421,6 +444,7 @@ def calculate_mewtwo_ref_gen_sparse(
     qk_rope_head_dim: int,
     q_scaling: float,
     compress_ratio: int,
+    attn_sink: Optional[torch.Tensor] = None,
 ):
     """Reference attention for Mewtwo generation phase."""
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -492,7 +516,7 @@ def calculate_mewtwo_ref_gen_sparse(
             v_sel = all_kv[:, :v_head_dim].unsqueeze(0).expand(num_heads, -1, -1)
 
             attn_w = torch.matmul(q_tok.unsqueeze(1), k_sel.transpose(1, 2)) * bmm1_scale
-            attn_w = torch.softmax(attn_w, dim=-1, dtype=torch.float32).to(fused_q_rot.dtype)
+            attn_w = _softmax_with_sink(attn_w, attn_sink, fused_q_rot.dtype)
             out = torch.matmul(attn_w, v_sel).squeeze(1)
             ref_results.append(out.reshape(1, num_heads * v_head_dim))
 
@@ -642,6 +666,13 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
         )
         layer.wrapper.update_quant_config(None)
         layers[layer_idx] = layer
+
+    # Install a per-layer attention sink
+    attn_sinks: Dict[int, torch.Tensor] = {}
+    for layer_idx in TEST_LAYERS:
+        sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
+        layers[layer_idx].attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+        attn_sinks[layer_idx] = sink
 
     # 5. Create random inputs per layer
     inputs_per_layer = {}
@@ -845,6 +876,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
             qk_rope_head_dim,
             q_scaling,
             ratio,
+            attn_sink=attn_sinks[layer_idx],
         )
 
         latent_cache_ref_all[layer_idx] = latent_cache_ref
@@ -995,6 +1027,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
                 qk_rope_head_dim,
                 q_scaling,
                 ratio,
+                attn_sink=attn_sinks[layer_idx],
             )
             latent_cache_ref_all[layer_idx] = new_latent_cache
 
@@ -1141,6 +1174,12 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
         )
         layer.wrapper.update_quant_config(None)
         layers[li] = layer
+
+    attn_sinks: Dict[int, torch.Tensor] = {}
+    for li in TEST_LAYERS:
+        sink = torch.randn(num_heads, dtype=torch.float32, device=device).mul_(0.5)
+        layers[li].attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+        attn_sinks[li] = sink
 
     # 2. Pre-fill KV cache for gen requests (1..N) — all layers, all ratios.
     gen_ctx_lengths = context_lengths[num_ctx:]
@@ -1381,6 +1420,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
             qk_rope_head_dim,
             q_scaling,
             ratio,
+            attn_sink=attn_sinks[li],
         )
 
         # Generation reference
@@ -1412,6 +1452,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
             qk_rope_head_dim,
             q_scaling,
             ratio,
+            attn_sink=attn_sinks[li],
         )
 
         ctx_diff = (output[:total_ctx_tokens] - ctx_ref).abs()

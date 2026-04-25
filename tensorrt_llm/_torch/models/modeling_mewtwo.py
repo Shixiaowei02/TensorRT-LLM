@@ -581,6 +581,22 @@ class MewtwoWeightLoader:
                     module.load_weights(weights=[module_weights])
                 elif names[-1] == "self_attn":
                     continue
+                elif names[-1] == "mqa":
+                    # MewtwoTrtllmAttention owns the optional attn_sink
+                    # (per-head fp32, already TP-sharded). The checkpoint key
+                    # uses the parent attention module name, not the .mqa
+                    # suffix. When the key is absent we leave module.attn_sink
+                    # as None so MewtwoTrtllmAttention.forward does not pass
+                    # attention_sinks to the kernel.
+                    parent_attn_name = ".".join(names[:-1])
+                    attn_sink_key = f"{parent_attn_name}.attn_sink"
+                    if attn_sink_key in weights:
+                        sink_full = weights[attn_sink_key][:]
+                        if not self.model_config.mapping.enable_attention_dp:
+                            sink_full = split(sink_full, tp_size, tp_rank)
+                        sink_full = sink_full.to(torch.float32).cuda()
+                        module.attn_sink = nn.Parameter(sink_full, requires_grad=False)
+                    continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
                 elif names[-1] in ("engram",):

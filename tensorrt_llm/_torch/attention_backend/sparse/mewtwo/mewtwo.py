@@ -1057,6 +1057,12 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 dtype=dtype,
             )
 
+    def forward(self, *args, **kwargs):
+        attn_sink = getattr(self, "attn_sink", None)
+        if attn_sink is not None and kwargs.get("attention_sinks") is None:
+            kwargs["attention_sinks"] = attn_sink.data
+        return super().forward(*args, **kwargs)
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
