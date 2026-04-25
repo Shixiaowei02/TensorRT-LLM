@@ -15,10 +15,10 @@
  */
 
 // ============================================================================
-// Compressor Kernels — Mewtwo KV Cache Compression
+// Compressor Kernels — DeepSeek-V4 KV Cache Compression
 // ============================================================================
 //
-// This file implements CUDA kernels for KV cache compression in the Mewtwo
+// This file implements CUDA kernels for KV cache compression in the DeepSeek-V4
 // sparse attention system. The compressor reduces sequences of input tokens
 // into fewer compressed tokens via learned weighted averaging (online softmax),
 // then post-processes and scatters results into a paged KV cache.
@@ -234,7 +234,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks, int out_elem_bytes)
 {
     using IoElemT = typename std::conditional<IO_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
-    // Mewtwo model configures compress_ratio to be 4 or 128.
+    // DeepSeek-V4 model configures compress_ratio to be 4 or 128.
     static_assert(COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
     constexpr bool IS_OVERLAP = (COMPRESS_RATIO == 4);
     constexpr int MAX_VEC = 16 / IO_ELEM_BYTES;

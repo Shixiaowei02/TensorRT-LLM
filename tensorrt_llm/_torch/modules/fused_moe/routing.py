@@ -157,8 +157,8 @@ class RoutingMethodType(IntEnum):
     RenormalizeNaive = 4,
     # MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
     MiniMax2 = 5,
-    # Mewtwo
-    Mewtwo = 6,
+    # DeepSeek-V4
+    DeepSeekV4 = 6,
     # Unspecified
     Unspecified = 7,
 
@@ -411,7 +411,7 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.DeepSeekV3
 
 
-class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
+class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
 
     def __init__(
         self,
@@ -430,7 +430,7 @@ class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
         self.routed_scaling_factor = routed_scaling_factor
         self.is_hashed = is_hashed
 
-        # Pass a callable to fetch the tensor from MewtwoGate at runtime, ensuring it is on the correct device
+        # Pass a callable to fetch the tensor from DeepseekV4Gate at runtime, ensuring it is on the correct device
         assert callable(callable_e_score_correction_bias)
         assert callable(callable_tid2eid)
         self.callable_e_score_correction_bias = callable_e_score_correction_bias
@@ -483,12 +483,12 @@ class MewtwoMoeRoutingMethod(BaseMoeRoutingMethod):
 
     @property
     def requires_separated_routing(self) -> bool:
-        # C++ MoE kernels don't support Mewtwo's sqrtsoftplus scoring natively.
+        # C++ MoE kernels don't support DeepSeek-V4's sqrtsoftplus scoring natively.
         return True
 
     @property
     def routing_method_type(self):
-        # Return DeepSeekV3 because C++ MoE kernels don't recognize Mewtwo routing type
+        # Return DeepSeekV3 because C++ MoE kernels don't recognize DeepSeek-V4 routing type
         return RoutingMethodType.DeepSeekV3
 
 
@@ -776,8 +776,8 @@ ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                        BaseMoeRoutingMethod,
                                        RoutingMethodType.MiniMax2:
                                        MiniMaxM2MoeRoutingMethod,
-                                       RoutingMethodType.Mewtwo:
-                                       MewtwoMoeRoutingMethod,
+                                       RoutingMethodType.DeepSeekV4:
+                                       DeepSeekV4MoeRoutingMethod,
                                    }
 
 

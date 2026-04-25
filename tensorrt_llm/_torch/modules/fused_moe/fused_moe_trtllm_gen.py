@@ -44,7 +44,7 @@ from .quantization import (
     W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DefaultMoeRoutingMethod, MewtwoMoeRoutingMethod)
+                      DefaultMoeRoutingMethod, DeepSeekV4MoeRoutingMethod)
 
 
 class TRTLLMGenFusedMoE(MoE):
@@ -572,7 +572,7 @@ class TRTLLMGenFusedMoE(MoE):
             n_group = self.routing_method.routing_impl.n_group
             topk_group = self.routing_method.routing_impl.topk_group
             routed_scaling_factor = self.routing_method.routing_impl.routed_scaling_factor
-        elif isinstance(self.routing_method, MewtwoMoeRoutingMethod):
+        elif isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod):
             top_k = self.routing_method.top_k
             routing_bias = self.routing_method.e_score_correction_bias
             n_group = self.routing_method.n_group

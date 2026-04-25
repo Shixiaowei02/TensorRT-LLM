@@ -13,7 +13,7 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import ModelConfig
@@ -28,9 +28,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
-from .mewtwo import (
-    MEWTWO_SPARSE_RATIO,
-    MewtwoAttentionType,
+from .deepseek_v4 import (
+    DEEPSEEK_V4_SPARSE_RATIO,
+    DeepseekV4AttentionType,
     compress_ratio_has_attention,
     get_attn_dim,
     get_token_bytes,
@@ -45,11 +45,11 @@ def _estimate_bytes_per_token(
     index_head_dim: int,
     compress_ratios: List[int],
     has_fp8_kv_cache,
-    attn_types: set[MewtwoAttentionType] | None = None,
+    attn_types: set[DeepseekV4AttentionType] | None = None,
 ) -> int:
     total_bytes = 0
     for ratio in compress_ratios:
-        for attn in MewtwoAttentionType:
+        for attn in DeepseekV4AttentionType:
             if attn_types is not None and attn not in attn_types:
                 continue
             if compress_ratio_has_attention(ratio, attn):
@@ -67,7 +67,7 @@ def _get_attn_bytes_per_token(
     head_dim: int,
     index_head_dim: int,
     compress_ratio: int,
-    attn_type: MewtwoAttentionType,
+    attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
 ) -> int:
     token_bytes = get_token_bytes(
@@ -77,18 +77,18 @@ def _get_attn_bytes_per_token(
         attn_type,
         has_fp8_kv_cache,
     )
-    if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+    if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
         token_bytes //= compress_ratio
     return token_bytes
 
 
-class MewtwoCacheManager(KVCacheManagerV2):
+class DeepseekV4CacheManager(KVCacheManagerV2):
     fixed_size_attention = {
-        MewtwoAttentionType.SWA,
-        MewtwoAttentionType.COMPRESSOR_STATE,
-        MewtwoAttentionType.COMPRESSOR_SCORE,
-        MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-        MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.SWA,
+        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
     }
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains pool pointers swa pool, shape: [1, 2]
@@ -118,14 +118,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
         mapping: Mapping,
         dtype: DataType = DataType.BF16,
         compressor_dtype: DataType = DataType.FLOAT,
-        sparse_attn_config: MewtwoSparseAttentionConfig,
+        sparse_attn_config: DeepSeekV4SparseAttentionConfig,
         max_input_len: Optional[int] = None,
         max_num_tokens: Optional[int] = None,
         **kwargs,
     ) -> None:
-        # Mewtwo specific attributes initialization
-        assert kv_cache_type == CacheTypeCpp.SELFKONLY, "Mewtwo only supports SELFKONLY"
-        assert num_kv_heads == 1, "Mewtwo only supports num_kv_heads == 1"
+        # DeepSeek-V4 specific attributes initialization
+        assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
+        assert num_kv_heads == 1, "DeepSeek-V4 only supports num_kv_heads == 1"
         assert len(sparse_attn_config.compress_ratios) >= num_layers, (
             "The length of compress ratios must be >= the number of layers"
         )
@@ -137,7 +137,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
 
         assert tokens_per_block in [128, 256], (
-            f"MewtwoCacheManager requires tokens_per_block in [128, 256], got {tokens_per_block}. "
+            f"DeepseekV4CacheManager requires tokens_per_block in [128, 256], got {tokens_per_block}. "
             f"Set kv_cache_config.tokens_per_block to 128 or 256."
         )
 
@@ -192,17 +192,17 @@ class MewtwoCacheManager(KVCacheManagerV2):
             dtype=dtype,
             **kwargs,
         )
-        self.is_vswa = True  # Mewtwo must has VSWA
+        self.is_vswa = True  # DeepSeek-V4 must has VSWA
 
-        # Mewtwo expects cache of all layers with the same attention type and compress ratio
+        # DeepSeek-V4 expects cache of all layers with the same attention type and compress ratio
         # to be in the same pool and have the same scale.
         self._assert_layer_pool_scale()
 
-        # For Mewtwo Attention, the base pointer for SWA pool
+        # For DeepSeek-V4 Attention, the base pointer for SWA pool
         # Use first PP layer instead of hardcoded 0 for pipeline parallelism.
         first_pp_layer = self.pp_layers[0]
         self.swa_pool_ptr = self.impl.get_mem_pool_base_address(
-            self._layer_attn_to_layer_id[first_pp_layer, MewtwoAttentionType.SWA], Role.KEY
+            self._layer_attn_to_layer_id[first_pp_layer, DeepseekV4AttentionType.SWA], Role.KEY
         )
 
         self.compress_pool_ptrs = {}
@@ -211,13 +211,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         if 4 in pp_compress_ratios:  # indexer compressor
             first_layer_with_4 = self.pp_layers[pp_compress_ratios.index(4)]
             self.compress_pool_ptrs[4] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[first_layer_with_4, MewtwoAttentionType.COMPRESS],
+                self._layer_attn_to_layer_id[first_layer_with_4, DeepseekV4AttentionType.COMPRESS],
                 Role.KEY,
             )
         if 128 in pp_compress_ratios:  # compressor
             first_layer_with_128 = self.pp_layers[pp_compress_ratios.index(128)]
             self.compress_pool_ptrs[128] = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[first_layer_with_128, MewtwoAttentionType.COMPRESS],
+                self._layer_attn_to_layer_id[first_layer_with_128, DeepseekV4AttentionType.COMPRESS],
                 Role.KEY,
             )
         # Use pinned staging buffer to avoid pageable H2D memcpy
@@ -231,7 +231,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             device="cpu",
         )
 
-    def get_buffers(self, layer_idx: int, attn_type: MewtwoAttentionType) -> torch.Tensor:
+    def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
         """
         Get the buffers for a specific layer and attention type.
 
@@ -247,14 +247,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
         addr = self.impl.get_mem_pool_base_address(layer_id, Role.KEY)
 
         block_size = self.tokens_per_block
-        if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+        if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
             block_size = self.compressed_block_sizes[layer_idx]
 
         attn_dim = get_attn_dim(
             self.head_dim, self.index_head_dim, self._compress_ratios[layer_idx], attn_type
         )
         scale_size = 0
-        if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             scale_size = self._indexer_scale_size
 
         shape = (
@@ -266,19 +266,19 @@ class MewtwoCacheManager(KVCacheManagerV2):
         dtype = self.dtype
         # (indexer) compressor state and score use compressor_dtype
         if attn_type in [
-            MewtwoAttentionType.COMPRESSOR_STATE,
-            MewtwoAttentionType.COMPRESSOR_SCORE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+            DeepseekV4AttentionType.COMPRESSOR_STATE,
+            DeepseekV4AttentionType.COMPRESSOR_SCORE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             dtype = self._compressor_dtype
-        elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+        elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             dtype = self._indexer_dtype
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
-    def _get_window_size(self, compress_ratio: int, attn_type: MewtwoAttentionType) -> int:
-        if attn_type == MewtwoAttentionType.SWA:
+    def _get_window_size(self, compress_ratio: int, attn_type: DeepseekV4AttentionType) -> int:
+        if attn_type == DeepseekV4AttentionType.SWA:
             base_window_size = self._swa_window_size
         elif attn_type in self.fixed_size_attention:
             state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
@@ -290,15 +290,15 @@ class MewtwoCacheManager(KVCacheManagerV2):
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         first_pp_layer = self.pp_layers[0]
         swa_bytes_per_block = self._get_attn_bytes_per_block(
-            MewtwoAttentionType.SWA, first_pp_layer
+            DeepseekV4AttentionType.SWA, first_pp_layer
         )
         swa_pool_ptr = self.impl.get_mem_pool_base_address(
-            self._layer_attn_to_layer_id[first_pp_layer, MewtwoAttentionType.SWA], Role.KEY
+            self._layer_attn_to_layer_id[first_pp_layer, DeepseekV4AttentionType.SWA], Role.KEY
         )
 
         def _get_layer_offset(pp_layer: int) -> int:
             buffer_ptr = self.impl.get_mem_pool_base_address(
-                self._layer_attn_to_layer_id[pp_layer, MewtwoAttentionType.SWA], Role.KEY
+                self._layer_attn_to_layer_id[pp_layer, DeepseekV4AttentionType.SWA], Role.KEY
             )
             return (buffer_ptr - swa_pool_ptr) // swa_bytes_per_block
 
@@ -324,7 +324,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         self,
         request_id: int,
         layer_idx: int,
-        attn_type: MewtwoAttentionType,
+        attn_type: DeepseekV4AttentionType,
     ) -> List[int]:
         """
         Get the cache block indices for a batch of requests at a specific layer and attention type.
@@ -349,7 +349,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
     def _get_cache_quota(self, max_tokens: int) -> int:
         quota = int(max_tokens * self.get_cache_bytes_per_token())
         # Add extra quota to ensure sufficient space for small max_tokens cases.
-        quota += len(MewtwoAttentionType) * (2 << 20)
+        quota += len(DeepseekV4AttentionType) * (2 << 20)
         return quota
 
     def _build_cache_config(
@@ -361,13 +361,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         cache_tiers: List[GpuCacheTierConfig | HostCacheTierConfig],
     ) -> KVCacheManagerConfigPy:
         """
-        Create the cache manager config for Mewtwo.
+        Create the cache manager config for DeepSeek-V4.
         """
         layers: List[AttentionLayerConfig] = []
-        layer_attn_to_layer_id: Dict[Tuple[int, MewtwoAttentionType], LayerId] = {}
+        layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
 
         def _add_layer(
-            layer_idx: int, attn_type: MewtwoAttentionType, sliding_window_size: int | None
+            layer_idx: int, attn_type: DeepseekV4AttentionType, sliding_window_size: int | None
         ):
             nonlocal layers, layer_attn_to_layer_id
             layer_id = LayerId(len(layers))
@@ -386,7 +386,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             )
             layers.append(layer_config)
 
-        # create the layer config for Mewtwo
+        # create the layer config for DeepSeek-V4
         for layer in self.pp_layers:
             compress_ratio = self._compress_ratios[layer]
             is_compress = is_compress_layer(compress_ratio)
@@ -395,37 +395,37 @@ class MewtwoCacheManager(KVCacheManagerV2):
             # sliding window attention pool
             _add_layer(
                 layer,
-                MewtwoAttentionType.SWA,
-                self._get_window_size(compress_ratio, MewtwoAttentionType.SWA),
+                DeepseekV4AttentionType.SWA,
+                self._get_window_size(compress_ratio, DeepseekV4AttentionType.SWA),
             )
 
             if is_compress:
                 # compressed attention pool
-                _add_layer(layer, MewtwoAttentionType.COMPRESS, None)
+                _add_layer(layer, DeepseekV4AttentionType.COMPRESS, None)
                 # compressor state, managed as a sliding window attention cache,
                 # including compressor kv states and compressor score states.
                 # Add max_draft_len so rewind after rejected draft tokens can
                 # still reach past states.
                 compressor_window = self._get_window_size(
-                    compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE
+                    compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE
                 )
-                _add_layer(layer, MewtwoAttentionType.COMPRESSOR_STATE, compressor_window)
-                _add_layer(layer, MewtwoAttentionType.COMPRESSOR_SCORE, compressor_window)
+                _add_layer(layer, DeepseekV4AttentionType.COMPRESSOR_STATE, compressor_window)
+                _add_layer(layer, DeepseekV4AttentionType.COMPRESSOR_SCORE, compressor_window)
 
             # sparse attention layer has indexer
             if is_sparse:
                 # indexer kv cache pool, dim is indexer_head_dim
-                _add_layer(layer, MewtwoAttentionType.INDEXER_COMPRESS, None)
+                _add_layer(layer, DeepseekV4AttentionType.INDEXER_COMPRESS, None)
                 # indexer has its own compressor, so a separate compressor state
                 # similarly, indexer compressor state is managed as a sliding window attention cache
                 indexer_compressor_window = self._get_window_size(
-                    compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE
+                    compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
                 )
                 _add_layer(
-                    layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE, indexer_compressor_window
+                    layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE, indexer_compressor_window
                 )
                 _add_layer(
-                    layer, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE, indexer_compressor_window
+                    layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE, indexer_compressor_window
                 )
         # the mapping from layer index and attention type to layer id
         self._layer_attn_to_layer_id = layer_attn_to_layer_id
@@ -482,12 +482,12 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
 
     def _assert_layer_pool_scale(self) -> None:
-        attn_ratio_to_pool_id = defaultdict[MewtwoAttentionType, dict[int, int]](lambda: {})
-        attn_ratio_to_scale = defaultdict[MewtwoAttentionType, dict[int, int]](lambda: {})
+        attn_ratio_to_pool_id = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
+        attn_ratio_to_scale = defaultdict[DeepseekV4AttentionType, dict[int, int]](lambda: {})
 
         comb = [
             (attn_type, layer_idx)
-            for attn_type in MewtwoAttentionType
+            for attn_type in DeepseekV4AttentionType
             for layer_idx in self.pp_layers
             if compress_ratio_has_attention(self._compress_ratios[layer_idx], attn_type)
         ]
@@ -505,7 +505,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
                     f"Layer {layer_idx} with compress ratio {compress_ratio}, "
                     f"its attention type {attn_type.name} has pool id {pool_id}, "
                     f"but another layer with the same compress ratio and attention type has pool id {other_pool_id}."
-                    "Mewtwo expects they share the same pool."
+                    "DeepSeek-V4 expects they share the same pool."
                 )
             else:
                 attn_ratio_to_pool_id[attn_type][compress_ratio] = pool_id
@@ -517,14 +517,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
                     f"Layer {layer_idx} with compress ratio {compress_ratio}, "
                     f"its attention type {attn_type.name} has scale {scale}, "
                     f"but another layer with the same compress ratio and attention type has scale {other_scale}."
-                    "Mewtwo expects they share the same scale."
+                    "DeepSeek-V4 expects they share the same scale."
                 )
             else:
                 attn_ratio_to_scale[attn_type][compress_ratio] = scale
 
         # check if all swa attentions are in the same pool and have the same scale
-        swa_pool_ids = set(attn_ratio_to_pool_id[MewtwoAttentionType.SWA].values())
-        swa_scales = set(attn_ratio_to_scale[MewtwoAttentionType.SWA].values())
+        swa_pool_ids = set(attn_ratio_to_pool_id[DeepseekV4AttentionType.SWA].values())
+        swa_scales = set(attn_ratio_to_scale[DeepseekV4AttentionType.SWA].values())
         assert len(swa_pool_ids) == 1, "All swa attentions must be in the same pool"
         assert len(swa_scales) == 1, "All swa attentions must have the same scale"
 
@@ -536,16 +536,16 @@ class MewtwoCacheManager(KVCacheManagerV2):
         swa_pool_id = next(iter(swa_pool_ids))
         swa_scale = next(iter(swa_scales))
         for ratio in set(self._compress_ratios):
-            if ratio not in attn_ratio_to_pool_id[MewtwoAttentionType.SWA]:
-                attn_ratio_to_pool_id[MewtwoAttentionType.SWA][ratio] = swa_pool_id
-                attn_ratio_to_scale[MewtwoAttentionType.SWA][ratio] = swa_scale
+            if ratio not in attn_ratio_to_pool_id[DeepseekV4AttentionType.SWA]:
+                attn_ratio_to_pool_id[DeepseekV4AttentionType.SWA][ratio] = swa_pool_id
+                attn_ratio_to_scale[DeepseekV4AttentionType.SWA][ratio] = swa_scale
 
         self._attn_ratio_to_pool_id = attn_ratio_to_pool_id
         self._attn_ratio_to_scale = attn_ratio_to_scale
 
     def _get_attn_bytes_per_block(
         self,
-        attn_type: MewtwoAttentionType,
+        attn_type: DeepseekV4AttentionType,
         layer_idx: int,
     ) -> int:
         """
@@ -561,13 +561,13 @@ class MewtwoCacheManager(KVCacheManagerV2):
         )
 
         block_size = self.tokens_per_block
-        if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+        if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
             block_size = self.compressed_block_sizes[layer_idx]
 
         return token_bytes * block_size
 
     def get_cache_bytes_per_token(self) -> int:
-        """Get the average cache bytes per token for Mewtwo."""
+        """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
         return _estimate_bytes_per_token(
@@ -611,7 +611,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         total_bytes = 0
         for layer in self.pp_layers:
             compress_ratio = self._compress_ratios[layer]
-            for attn_type in MewtwoAttentionType:
+            for attn_type in DeepseekV4AttentionType:
                 if not compress_ratio_has_attention(compress_ratio, attn_type):
                     continue
                 token_bytes = _get_attn_bytes_per_token(
@@ -636,14 +636,14 @@ class MewtwoCacheManager(KVCacheManagerV2):
         data_role: Role,
     ) -> int:
         raise NotImplementedError(
-            "Mewtwo doesn't support get_layer_bytes_per_token, use _get_attn_bytes_per_block"
+            "DeepSeek-V4 doesn't support get_layer_bytes_per_token, use _get_attn_bytes_per_block"
         )
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
         Get the buffers for the indexer k cache for a specific layer.
         """
-        buffer = self.get_buffers(layer_idx, MewtwoAttentionType.INDEXER_COMPRESS).unsqueeze(2)
+        buffer = self.get_buffers(layer_idx, DeepseekV4AttentionType.INDEXER_COMPRESS).unsqueeze(2)
         return buffer.view(torch.uint8)
 
     def get_batch_indexer_k_cache_indices(self, request_ids: List[int]) -> List[List[int]]:
@@ -656,8 +656,8 @@ class MewtwoCacheManager(KVCacheManagerV2):
             1,
             0,
             len(request_ids),
-            MewtwoAttentionType.INDEXER_COMPRESS,
-            MEWTWO_SPARSE_RATIO,
+            DeepseekV4AttentionType.INDEXER_COMPRESS,
+            DEEPSEEK_V4_SPARSE_RATIO,
         ).tolist()
 
     def copy_batch_block_offsets(
@@ -674,7 +674,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             beam_width,
             num_contexts,
             num_seqs,
-            MewtwoAttentionType.SWA,
+            DeepseekV4AttentionType.SWA,
             # all compress ratios have SWA attention and they are in the same pool
             self._compress_ratios[self.pp_layers[0]],
         )
@@ -689,7 +689,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
-        attn_type: MewtwoAttentionType,
+        attn_type: DeepseekV4AttentionType,
         compress_ratio: int,
     ) -> torch.Tensor:
         """
@@ -707,7 +707,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
             The block offsets, shape (num_seqs, max_blocks_per_seq)
         """
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
-        assert attn_type == MewtwoAttentionType.SWA or compress_ratio is not None, (
+        assert attn_type == DeepseekV4AttentionType.SWA or compress_ratio is not None, (
             "compress_ratio must be provided for non-SWA attention types"
         )
 
@@ -725,7 +725,7 @@ class MewtwoCacheManager(KVCacheManagerV2):
         request_ids: List[int],
         num_contexts: int,
         attention_type_set: set,
-    ) -> Dict[Tuple[int, "MewtwoAttentionType"], torch.Tensor]:
+    ) -> Dict[Tuple[int, "DeepseekV4AttentionType"], torch.Tensor]:
         """Get block offsets for all attention types in a single call.
 
         Calls get_copy_index once and deduplicates offset computation by

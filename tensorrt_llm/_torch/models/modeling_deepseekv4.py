@@ -49,7 +49,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.mewtwo.mewtwo import MewtwoTrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -63,7 +63,7 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
-from ..modules.fused_moe import MewtwoMoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
+from ..modules.fused_moe import DeepSeekV4MoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -86,7 +86,7 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
 
 
-def _make_mewtwo_pos_embd_params(
+def _make_deepseek_v4_pos_embd_params(
     model_config: ModelConfig[PretrainedConfig], layer_idx: Optional[int]
 ) -> PositionalEmbeddingParams:
     """Per-layer RoPE: compressed layers use ``compress_rope_theta`` + yarn;
@@ -170,7 +170,298 @@ def moe_reduce_add_shared_output(routed_output, shared_output):
     return shared_output + routed_output
 
 
-class MewtwoWeightLoader:
+# Per-attention parameter renames inside `attn.<X>` / `mtp.0.attn.<X>`.
+# Maps checkpoint name component → model name component.
+_ATTN_PARAM_RENAME = {
+    "wq_a": "q_a_proj",
+    "wq_b": "q_b_proj",
+    "wkv": "kv_a_proj_with_mqa",
+    "wo_b": "o_b_proj",
+    "q_norm": "q_a_layernorm",
+    "kv_norm": "kv_a_layernorm",
+}
+
+# Shared expert leaf rename: checkpoint w1/w3/w2 → model gate/up/down. The
+# loader's `params_map` then fuses `gate_proj` + `up_proj` into `gate_up_proj`.
+_SHARED_EXPERT_RENAME = {
+    "w1": "gate_proj",
+    "w3": "up_proj",
+    "w2": "down_proj",
+}
+
+
+def _remap_deepseek_v4_checkpoint_keys(
+    weights: Dict,
+    num_hidden_layers: int,
+    kv_lora_rank: int = 448,
+    o_a_proj_shape: Optional[tuple] = None,
+) -> Dict:
+    """Convert DeepSeek-V4 checkpoint keys to model named-parameter keys.
+
+    Why: the upstream DS-V4 release uses keys like ``layers.X.attn.wkv.weight``,
+    ``mtp.0.ffn.experts.0.w1.scale``, ``embed.weight``, ``head.weight``. The
+    TRT-LLM model exposes them as ``model.layers.X.self_attn.kv_a_proj_with_mqa.weight``,
+    ``model.layers.{N}.mlp.experts.0.w1.weight_scale_inv``, ``model.embed_tokens.weight``,
+    ``lm_head.weight``. This pass renames keys, fuses split projections that the
+    model represents as one tensor, and synthesizes default values for params
+    the model has but the checkpoint does not (so the existing loader's strict
+    key lookup does not raise).
+
+    Args:
+        weights: raw checkpoint state dict.
+        num_hidden_layers: routes ``mtp.0.*`` into ``model.layers.{N}.*``.
+        kv_lora_rank: model's ``kv_a_layernorm`` hidden size. The V4 ckpt
+            ``kv_norm.weight`` is sized ``kv_lora_rank + qk_rope_head_dim``
+            (it normalizes both halves of ``wkv``); the model only normalizes
+            the ``kv_lora`` half, so we slice to the first ``kv_lora_rank``
+            entries assuming layout ``[kv_lora; rope_pe]``.
+        o_a_proj_shape: target shape for ``o_a_proj`` (e.g. ``(n_groups,
+            o_lora_rank, in_dim)``). When provided alongside ``wo_a.weight``
+            and ``wo_a.scale``, we dequantize FP8→bf16 then reshape.
+
+    Caveats — limitations carried as TODOs (kept here so future readers can
+    audit them in one place rather than chasing comments):
+      * ``self_attn.q_b_layernorm.weight`` is synthesized as ones (identity scale)
+        because the V4 release omits it; revisit if a real value ships.
+      * ``self_attn.indexer.wk.weight`` and ``self_attn.indexer.k_norm.{weight,bias}``
+        are zero-filled — V4 indexer's k path is served by the compressor, so
+        the base ``Indexer.wk`` / ``k_norm`` are unused at forward time.
+      * FP4 expert path (plan Phase 4) is not added: the published configs use
+        ``quant_method=fp8``; if FP4 weights ship later, extend the scale rename
+        to recognize ``weight_scale`` / ``weight_scale_2`` / ``input_scale``.
+      * ``mtp.0.head.weight`` is dropped — DeepSeekV4MTP reuses the main
+        ``lm_head`` via ``shared_head``. Flash omits this key entirely; Flash-Base
+        carries it but matches the main head, so we let the main head win.
+    """
+    mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
+
+    def _rename_attn_subkey(rest: str) -> Optional[str]:
+        # rest examples: "wq_a.weight", "wq_a.scale", "wo_a.weight",
+        # "attn_sink", "compressor.wkv.weight", "indexer.wq_b.scale",
+        # "kv_norm.weight"
+        # ``attn_sink`` is loaded by the ``mqa`` branch in the per-module
+        # loader, which reads it under the parent ``self_attn.attn_sink``
+        # key. Pass through unchanged.
+        if rest == "attn_sink":
+            return "attn_sink"
+        # `wo_a` collects to ``o_a_proj`` via a fusion bucket below — emit a
+        # sentinel here so the dispatch below can route it.
+        if rest in ("wo_a.weight", "wo_a.scale"):
+            return f"__wo_a__.{rest.split('.')[1]}"
+        # Compressor / indexer paths — pass through with .scale rename, plus
+        # wkv+wgate fusion handled separately below.
+        if rest.startswith("compressor.") or rest.startswith("indexer."):
+            return rest.replace(".scale", ".weight_scale_inv")
+        # ``kv_norm`` shape rewrite: ckpt is (kv_lora_rank + rope_dim,) but the
+        # model only normalizes kv_lora_rank.
+        if rest == "kv_norm.weight":
+            return "kv_a_layernorm.weight__slice_kv_lora__"
+        head, sep, tail = rest.partition(".")
+        new_head = _ATTN_PARAM_RENAME.get(head, head)
+        if tail == "scale":
+            tail = "weight_scale_inv"
+        return f"{new_head}.{tail}" if sep else new_head
+
+    def _rename_ffn_subkey(rest: str) -> str:
+        # Examples:
+        #   gate.weight                                    → gate.weight
+        #   gate.tid2eid                                   → gate.tid2eid (hashed gates)
+        #   gate.bias                                      → gate.e_score_correction_bias (non-hashed)
+        #   experts.<i>.<w1|w2|w3>.<weight|scale>          → experts.<i>.<w1|w2|w3>.<weight|weight_scale_inv>
+        #   shared_experts.<w1|w3|w2>.<weight|scale>       → shared_experts.<gate|up|down>_proj.<weight|weight_scale_inv>
+        rest = rest.replace(".scale", ".weight_scale_inv")
+        # Non-hashed layers carry the routing logit bias as `gate.bias`; the
+        # model wires it through `DeepseekV4Gate.e_score_correction_bias`.
+        if rest == "gate.bias":
+            return "gate.e_score_correction_bias"
+        if rest.startswith("shared_experts."):
+            parts = rest.split(".")
+            if len(parts) >= 2 and parts[1] in _SHARED_EXPERT_RENAME:
+                parts[1] = _SHARED_EXPERT_RENAME[parts[1]]
+            rest = ".".join(parts)
+        return rest
+
+    def _rename_layer_subkey(rest: str) -> Optional[str]:
+        # rest examples: "attn_norm.weight", "ffn_norm.weight",
+        # "hc_attn_fn", "attn.wkv.weight", "ffn.experts.0.w1.weight"
+        if rest == "attn_norm.weight":
+            return "input_layernorm.weight"
+        if rest == "ffn_norm.weight":
+            return "post_attention_layernorm.weight"
+        for hc_prefix in ("hc_attn_", "hc_ffn_"):
+            if rest.startswith(hc_prefix):
+                return f"{hc_prefix[:-1]}.{rest[len(hc_prefix):]}"
+        if rest.startswith("attn."):
+            new_sub = _rename_attn_subkey(rest[len("attn."):])
+            return None if new_sub is None else f"self_attn.{new_sub}"
+        if rest.startswith("ffn."):
+            return f"mlp.{_rename_ffn_subkey(rest[len('ffn.'):])}"
+        return rest
+
+    out: Dict[str, torch.Tensor] = {}
+    # Pending fusions: collected first, materialized at the end so we don't
+    # depend on iteration order.
+    compressor_split: Dict[str, Dict[str, torch.Tensor]] = {}
+    eh_proj_split: Dict[str, Dict[str, torch.Tensor]] = {}
+    # Per-layer wo_a parts: parent_self_attn_prefix → {"weight": fp8, "scale": fp32}
+    wo_a_split: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    def _record_compressor_part(model_key: str, part: str, tensor: torch.Tensor):
+        # model_key looks like "...self_attn.compressor.<part>.weight" or with
+        # ".indexer.compressor.". Strip trailing ".<part>.weight" → ".<part>"
+        # is wgate or wkv; we want a stable "fusion bucket" key that ends at
+        # the parent compressor.
+        bucket = model_key.rsplit(f".{part}.", 1)[0]
+        compressor_split.setdefault(bucket, {})[part] = tensor
+
+    def _emit_or_collect(model_key: str, tensor: torch.Tensor):
+        """Route a (model_key, tensor) pair: handle compressor / wo_a / kv_norm
+        sentinels here so callers stay simple."""
+        if ".compressor." in model_key and (
+            model_key.endswith(".wkv.weight") or model_key.endswith(".wgate.weight")
+        ):
+            part = "wkv" if model_key.endswith(".wkv.weight") else "wgate"
+            _record_compressor_part(model_key, part, tensor)
+            return
+        if "__wo_a__" in model_key:
+            # model_key looks like "...self_attn.__wo_a__.<weight|scale>".
+            parent_prefix, _, leaf = model_key.rpartition(".")  # leaf=weight|scale
+            parent_prefix = parent_prefix.rsplit(".__wo_a__", 1)[0]
+            wo_a_split.setdefault(parent_prefix, {})[leaf] = tensor
+            return
+        if model_key.endswith("kv_a_layernorm.weight__slice_kv_lora__"):
+            base = model_key[: -len("__slice_kv_lora__")]
+            # ckpt layout assumed [kv_lora; rope_pe] — keep first kv_lora_rank.
+            out[base] = tensor[:kv_lora_rank].contiguous()
+            return
+        out[model_key] = tensor
+
+    for k, v in weights.items():
+        # Top-level keys that don't go through the layer/mtp branches.
+        if k == "embed.weight":
+            out["model.embed_tokens.weight"] = v
+            continue
+        if k == "head.weight":
+            out["lm_head.weight"] = v
+            continue
+        if k == "norm.weight":
+            out["model.norm.weight"] = v
+            continue
+        if k.startswith("hc_head_"):
+            out[f"model.hc_head.{k[len('hc_head_'):]}"] = v
+            continue
+
+        # mtp.0.head.weight is intentionally dropped (Flash-Base only); see
+        # docstring caveats.
+        if k == "mtp.0.head.weight":
+            continue
+
+        # mtp.0.* — route to model.layers.{num_hidden_layers}.*
+        if k.startswith("mtp.0."):
+            rest = k[len("mtp.0."):]
+            # MTP-only keys: enorm, hnorm map directly; norm maps to
+            # shared_head.norm; e_proj/h_proj fuse into eh_proj; hc_head_*
+            # maps to layer-local hc_head (the MTP layer's own HC).
+            if rest in ("enorm.weight", "hnorm.weight"):
+                out[f"{mtp_layer_prefix}.{rest}"] = v
+                continue
+            if rest == "norm.weight":
+                out[f"{mtp_layer_prefix}.shared_head.norm.weight"] = v
+                continue
+            if rest.startswith("hc_head_"):
+                out[f"{mtp_layer_prefix}.hc_head.{rest[len('hc_head_'):]}"] = v
+                continue
+            for proj in ("e_proj", "h_proj"):
+                if rest.startswith(f"{proj}."):
+                    suffix = rest[len(f"{proj}."):]
+                    if suffix == "scale":
+                        suffix = "weight_scale_inv"
+                    eh_proj_split.setdefault(mtp_layer_prefix, {})[(proj, suffix)] = v
+                    break
+            else:
+                # General per-layer transform reused for the MTP layer.
+                new_rest = _rename_layer_subkey(rest)
+                if new_rest is None:
+                    continue
+                _emit_or_collect(f"{mtp_layer_prefix}.{new_rest}", v)
+            continue
+
+        # layers.<i>.* — route to model.layers.<i>.*
+        if k.startswith("layers."):
+            parts = k.split(".", 2)
+            if len(parts) < 3:
+                continue
+            layer_idx, rest = parts[1], parts[2]
+            new_rest = _rename_layer_subkey(rest)
+            if new_rest is None:
+                continue
+            _emit_or_collect(f"model.layers.{layer_idx}.{new_rest}", v)
+            continue
+
+        # Anything else: pass through. This catches future top-level keys
+        # added by the upstream release without silently dropping them.
+        out[k] = v
+
+    # Materialize compressor wkv_gate fusion: model has a single Linear with
+    # out_features = state_dim * 2; checkpoint splits it as `wkv` (kv half)
+    # and `wgate` (gate half). Concatenating wkv first matches the order the
+    # compressor kernels expect (kv_score = [kv | gate]).
+    for bucket, parts in compressor_split.items():
+        if "wkv" not in parts or "wgate" not in parts:
+            # Partial — emit what we have so the loader fails loudly with a
+            # specific missing key rather than a silent shape mismatch.
+            for name, tensor in parts.items():
+                out[f"{bucket}.{name}.weight"] = tensor
+            continue
+        out[f"{bucket}.wkv_gate.weight"] = torch.cat([parts["wkv"], parts["wgate"]], dim=0)
+
+    # Materialize eh_proj fusion: model uses a single Linear(hidden*2, hidden);
+    # checkpoint splits it as e_proj (operates on embed-norm) and h_proj
+    # (operates on hidden-norm). Linear stores weight as [out, in], so the
+    # fused weight is concat([e_proj, h_proj], dim=1) so that
+    # eh_proj([e; h]) = e_proj @ e + h_proj @ h.
+    for layer_prefix, parts in eh_proj_split.items():
+        for suffix in ("weight", "weight_scale_inv"):
+            e = parts.get(("e_proj", suffix))
+            h = parts.get(("h_proj", suffix))
+            if e is None and h is None:
+                continue
+            if e is None or h is None:
+                # Partial fusion — pass through under a synthetic name so the
+                # loader raises with a clear key.
+                if e is not None:
+                    out[f"{layer_prefix}.e_proj.{suffix}"] = e
+                if h is not None:
+                    out[f"{layer_prefix}.h_proj.{suffix}"] = h
+                continue
+            cat_dim = 1 if suffix == "weight" else 0
+            out[f"{layer_prefix}.eh_proj.{suffix}"] = torch.cat([e, h], dim=cat_dim)
+
+    # Materialize o_a_proj: ckpt has FP8 ``wo_a.weight`` (out, in) and a
+    # blockwise ``wo_a.scale``; model has bf16 ``o_a_proj`` shape
+    # (n_groups, o_lora_rank, in_dim). Dequantize then reshape. If the caller
+    # didn't pass ``o_a_proj_shape``, fall back to a 2D bf16 cast (loader will
+    # then raise on the first shape mismatch with a clear key).
+    if wo_a_split:
+        for parent_prefix, parts in wo_a_split.items():
+            w = parts.get("weight")
+            s = parts.get("scale")
+            target_key = f"{parent_prefix}.o_a_proj"
+            if w is None:
+                continue
+            if w.dtype == torch.float8_e4m3fn and s is not None:
+                w_bf16 = weight_dequant(w.contiguous().cuda(),
+                                        s.contiguous().cuda()).to(torch.bfloat16).cpu()
+            else:
+                w_bf16 = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
+            if o_a_proj_shape is not None and tuple(w_bf16.shape) != o_a_proj_shape:
+                w_bf16 = w_bf16.reshape(o_a_proj_shape)
+            out[target_key] = w_bf16
+
+    return out
+
+
+class DeepseekV4WeightLoader:
     def __init__(self, model, is_draft_model: bool = False):
         self.model = model
         self.config = model.config
@@ -178,6 +469,52 @@ class MewtwoWeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
+        # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
+        # named-parameter keys before iterating modules. The detection is by
+        # presence of any top-level "layers." key; HF-style checkpoints use
+        # "model.layers." and skip this branch.
+        if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
+            # Probe one ``o_a_proj`` shape from the model so the remap can
+            # reshape ckpt ``wo_a`` (FP8, 2D) into the (n_groups, o_lora_rank,
+            # in_dim) bf16 layout the model expects.
+            o_a_proj_shape = None
+            for n, p in self.model.named_parameters():
+                if n.endswith(".self_attn.o_a_proj"):
+                    o_a_proj_shape = tuple(p.shape)
+                    break
+            weights = _remap_deepseek_v4_checkpoint_keys(
+                weights,
+                num_hidden_layers=self.config.num_hidden_layers,
+                kv_lora_rank=self.config.kv_lora_rank,
+                o_a_proj_shape=o_a_proj_shape,
+            )
+            # Synthesize defaults (with correct shape pulled from the model)
+            # for parameters the model has but the V4 checkpoint omits. We do
+            # this in one place vs scattering zero-fills through the per-
+            # module branches so the missing-key contract is auditable here.
+            #   q_b_layernorm.weight      → ones (identity RMSNorm)
+            #   indexer.k_norm.weight     → ones
+            #   indexer.k_norm.bias       → zeros
+            #   indexer.wk.weight         → zeros (V4 indexer's k path is
+            #                                served by compressor; wk unused)
+            _ones_suffixes = (
+                "self_attn.q_b_layernorm.weight",
+                "self_attn.indexer.k_norm.weight",
+            )
+            _zeros_suffixes = (
+                "self_attn.indexer.k_norm.bias",
+                "self_attn.indexer.wk.weight",
+            )
+            model_params = dict(self.model.named_parameters())
+            for pname, p in model_params.items():
+                if pname in weights:
+                    continue
+                if any(pname.endswith(s) for s in _ones_suffixes):
+                    weights[pname] = torch.ones_like(p, device="cpu")
+                elif any(pname.endswith(s) for s in _zeros_suffixes):
+                    weights[pname] = torch.zeros_like(p, device="cpu")
+
         def requantize_weight_with_new_scale(
             weight, weight_scale, old_scale_2, new_scale_2, device
         ):
@@ -363,7 +700,7 @@ class MewtwoWeightLoader:
         def load_flat_hc_weights(module, names: List[str]) -> bool:
             """Load mHC / HCHead from flat ckpt keys: ``<stem>_{fn,base,scale}``.
 
-            V4 / mewtwo checkpoints store these as flat names (e.g.
+            V4 / DeepSeek-V4 checkpoints store these as flat names (e.g.
             ``hc_attn_fn``) rather than structured (``hc_attn.fn``).
             ``shared_head.hc_head`` (MTP) is rewritten to flat ``hc_head_*``
             under the same parent.
@@ -628,11 +965,11 @@ class MewtwoWeightLoader:
                 elif names[-1] == "self_attn":
                     continue
                 elif names[-1] == "mqa":
-                    # MewtwoTrtllmAttention owns the optional attn_sink
+                    # DeepseekV4TrtllmAttention owns the optional attn_sink
                     # (per-head fp32, already TP-sharded). The checkpoint key
                     # uses the parent attention module name, not the .mqa
                     # suffix. When the key is absent we leave module.attn_sink
-                    # as None so MewtwoTrtllmAttention.forward does not pass
+                    # as None so DeepseekV4TrtllmAttention.forward does not pass
                     # attention_sinks to the kernel.
                     parent_attn_name = ".".join(names[:-1])
                     attn_sink_key = f"{parent_attn_name}.attn_sink"
@@ -675,7 +1012,7 @@ def _get_last_token_states(hidden_states, attn_metadata):
     return hidden_states[last_tokens]
 
 
-class MewtwoMTPHead(nn.Module):
+class DeepseekV4MTPHead(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         config = model_config.pretrained_config
@@ -694,7 +1031,7 @@ class MewtwoMTPHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: Linear,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         if not return_context_logits:
@@ -731,7 +1068,7 @@ class MewtwoMTPHead(nn.Module):
         return logits
 
 
-class MewtwoLogitsProcessor(nn.Module):
+class DeepseekV4LogitsProcessor(nn.Module):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -743,7 +1080,7 @@ class MewtwoLogitsProcessor(nn.Module):
         self.model_config = model_config
         self.hc_mult = config.hc_mult
         self.hidden_dim = config.hidden_size
-        # Keep HCHead and final norm owned by MewtwoModel. This processor only
+        # Keep HCHead and final norm owned by DeepseekV4Model. This processor only
         # borrows them, so checkpoint loading and PP weight removal still happen
         # through the model's normal module tree.
         object.__setattr__(self, "_hc_head", hc_head)
@@ -753,7 +1090,7 @@ class MewtwoLogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         lm_head: Linear,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         if not self.model_config.mapping.is_last_pp_rank():
@@ -771,7 +1108,7 @@ class MewtwoLogitsProcessor(nn.Module):
         return lm_head(hidden_states).float()
 
 
-class MewtwoLinear(Linear):
+class DeepseekV4Linear(Linear):
     """
     A wrapper around Linear because we may optionally use min-latency kernels depending on input shapes.
     """
@@ -823,7 +1160,7 @@ class MewtwoLinear(Linear):
         return output
 
 
-class MewtwoAttention(MLA):
+class DeepseekV4Attention(MLA):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -833,8 +1170,8 @@ class MewtwoAttention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        assert config.qk_rope_head_dim == 64, "MewtwoAttention only supports qk_rope_head_dim=64"
-        assert config.kv_lora_rank == 448, "MewtwoAttention only supports kv_lora_rank=448"
+        assert config.qk_rope_head_dim == 64, "DeepseekV4Attention only supports qk_rope_head_dim=64"
+        assert config.kv_lora_rank == 448, "DeepseekV4Attention only supports kv_lora_rank=448"
         predicted_tokens_per_seq = (
             model_config.spec_config.tokens_per_gen_step
             if model_config.spec_config is not None
@@ -852,7 +1189,7 @@ class MewtwoAttention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=_make_mewtwo_pos_embd_params(model_config, layer_idx),
+            pos_embd_params=_make_deepseek_v4_pos_embd_params(model_config, layer_idx),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -867,7 +1204,7 @@ class MewtwoAttention(MLA):
         self.compressor = getattr(self.mqa, "compressor", None)
 
 
-class MewtwoGate(nn.Module):
+class DeepseekV4Gate(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -916,7 +1253,7 @@ class MewtwoGate(nn.Module):
                 torch.empty(num_experts, dtype=bias_dtype), requires_grad=False
             )
 
-        assert not apply_routing, "MewtwoGate routing is called inside MoE"
+        assert not apply_routing, "DeepseekV4Gate routing is called inside MoE"
 
         def fetch_e_score_correction_bias():
             if not self.is_hashed:
@@ -924,12 +1261,12 @@ class MewtwoGate(nn.Module):
             else:
                 return None
 
-        self._routing_method = MewtwoMoeRoutingMethod(
+        self._routing_method = DeepSeekV4MoeRoutingMethod(
             top_k=self.top_k,
             n_group=self.n_group,
             topk_group=self.topk_group,
             routed_scaling_factor=self.routed_scaling_factor,
-            # Pass a callable to fetch the tensor from MewtwoGate at runtime, ensuring it is on the correct device
+            # Pass a callable to fetch the tensor from DeepseekV4Gate at runtime, ensuring it is on the correct device
             callable_e_score_correction_bias=fetch_e_score_correction_bias,
             callable_tid2eid=lambda: self.tid2eid,
             is_hashed=self.is_hashed,
@@ -954,7 +1291,7 @@ class MewtwoGate(nn.Module):
             )
 
     @property
-    def routing_method(self) -> MewtwoMoeRoutingMethod:
+    def routing_method(self) -> DeepSeekV4MoeRoutingMethod:
         return self._routing_method
 
     def apply(
@@ -967,7 +1304,7 @@ class MewtwoGate(nn.Module):
         return self.routing_method.top_k
 
 
-class MewtwoMoE(nn.Module):
+class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
         *,
@@ -988,7 +1325,7 @@ class MewtwoMoE(nn.Module):
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.gate = MewtwoGate(
+        self.gate = DeepseekV4Gate(
             hidden_size,
             num_experts,
             top_k=top_k,
@@ -1247,7 +1584,7 @@ class MewtwoMoE(nn.Module):
             return final_hidden_states
 
 
-class MewtwoDecoderLayer(DecoderLayer):
+class DeepseekV4DecoderLayer(DecoderLayer):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1286,7 +1623,7 @@ class MewtwoDecoderLayer(DecoderLayer):
             # KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
-        self.self_attn = MewtwoAttention(
+        self.self_attn = DeepseekV4Attention(
             model_config,
             layer_idx=layer_idx_for_attention,
             aux_stream=aux_stream_dict[AuxStreamType.Attention],
@@ -1327,7 +1664,7 @@ class MewtwoDecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MOE_FUSION and not disable_post_moe_fusion
         )
 
-        self.mlp = MewtwoMoE(
+        self.mlp = DeepseekV4MoE(
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.hidden_size,
@@ -1375,7 +1712,7 @@ class MewtwoDecoderLayer(DecoderLayer):
         else:
             self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", True))
         self.next_layer_layernorm: RMSNorm = None
-        # Finalized in MewtwoForCausalLM.post_load_weights once the full layer
+        # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if
         # the next layer is able to absorb it via fused_hc (i.e. the next
         # layer has fused_hc enabled and no engram at its entry). Last layer
@@ -1453,7 +1790,7 @@ class MewtwoDecoderLayer(DecoderLayer):
         self,
         position_ids: torch.IntTensor,
         hc_state,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
         engram_embeddings=None,
@@ -1591,7 +1928,7 @@ class MewtwoDecoderLayer(DecoderLayer):
     def forward_MoE(
         self,
         hidden_states: torch.Tensor,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         input_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
@@ -1610,7 +1947,7 @@ class MewtwoDecoderLayer(DecoderLayer):
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
-            # In Mewtwo the external residual connection is handled by mHC
+            # In DeepSeek-V4 the external residual connection is handled by mHC
             # (hc_ffn.post_mapping), so there is no residual to add here.
             # Use fused allreduce + RMSNorm (no residual addition).
             hidden_states = self.allreduce(
@@ -1682,7 +2019,7 @@ class MewtwoDecoderLayer(DecoderLayer):
         return hidden_states
 
 
-class MewtwoMTP(MewtwoDecoderLayer):
+class DeepseekV4MTP(DeepseekV4DecoderLayer):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1752,7 +2089,7 @@ class MewtwoMTP(MewtwoDecoderLayer):
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
 
-        self.shared_head = MewtwoMTPHead(model_config)
+        self.shared_head = DeepseekV4MTPHead(model_config)
 
     def forward(
         self,
@@ -1760,7 +2097,7 @@ class MewtwoMTP(MewtwoDecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         embed_tokens: Embedding,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
@@ -1816,7 +2153,7 @@ class MewtwoMTP(MewtwoDecoderLayer):
         return hidden_states
 
 
-class MewtwoModel(DecoderModel):
+class DeepseekV4Model(DecoderModel):
     def __init__(
         self, model_config: ModelConfig[PretrainedConfig], mapping_with_cp: Optional[Mapping] = None
     ):
@@ -1868,7 +2205,7 @@ class MewtwoModel(DecoderModel):
             self.engram_hash_provider = EngramHashProvider(engram_config)
             self.engram_layer_ids = engram_config.layer_ids
             # Store engram config and per-layer vocab sizes on the pretrained config so
-            # MewtwoDecoderLayer can read them directly from model_config without extra params.
+            # DeepseekV4DecoderLayer can read them directly from model_config without extra params.
             config.engram_config = engram_config
             config.engram_vocab_sizes_by_layer = {
                 layer_id: [
@@ -1881,7 +2218,7 @@ class MewtwoModel(DecoderModel):
 
         self.layers = nn.ModuleList(
             [
-                MewtwoDecoderLayer(
+                DeepseekV4DecoderLayer(
                     model_config,
                     layer_idx,
                     self.aux_stream_dict,
@@ -1900,7 +2237,7 @@ class MewtwoModel(DecoderModel):
 
     def forward(
         self,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -1990,8 +2327,8 @@ class MewtwoModel(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("MewtwoForCausalLM")
-class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfig]):
+@register_auto_model("DeepseekV4ForCausalLM")
+class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return {"kv_cache_config": {"tokens_per_block": 128}}
@@ -2005,7 +2342,7 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
         # at the end of __init__.
         if model_config.mapping.has_cp_helix():
             print(
-                "[MewtwoForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
+                "[DeepseekV4ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
             )
             self.mapping_with_cp = copy.deepcopy(model_config.mapping)
             # Repurpose KVP ranks to TP while keeping other details the same.
@@ -2027,10 +2364,10 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
             model_config._frozen = True
 
         super().__init__(
-            model=MewtwoModel(model_config, mapping_with_cp=self.mapping_with_cp),
+            model=DeepseekV4Model(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
-        self.logits_processor = MewtwoLogitsProcessor(
+        self.logits_processor = DeepseekV4LogitsProcessor(
             model_config, self.model.hc_head, self.model.norm
         )
 
@@ -2074,14 +2411,14 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
 
         # Undo any manipulations done to mapping.
         if self.mapping_with_cp is not None:
-            print("[MewtwoForCausalLM::__init__] Restoring original mapping.")
+            print("[DeepseekV4ForCausalLM::__init__] Restoring original mapping.")
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
 
     def forward(
         self,
-        attn_metadata: MewtwoTrtllmAttentionMetadata,
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -2100,7 +2437,7 @@ class MewtwoForCausalLM(SpecDecOneEngineForCausalLM[MewtwoModel, PretrainedConfi
         )
 
     def load_weights(self, weights: Dict):
-        weight_loader = MewtwoWeightLoader(self)
+        weight_loader = DeepseekV4WeightLoader(self)
         weight_loader.load_weights(weights)
 
     def post_load_weights(self):

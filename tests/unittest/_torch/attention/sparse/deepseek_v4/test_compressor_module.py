@@ -18,15 +18,15 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionEmbeddingType,
     RotaryScalingType,
 )
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo import MewtwoCacheManager
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoAttentionType
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4AttentionType
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -70,7 +70,7 @@ class DummyAttentionMetadata:
         num_generations: int,
         num_ctx_tokens: int,
         num_tokens: int,
-        kv_cache_manager: MewtwoCacheManager,
+        kv_cache_manager: DeepseekV4CacheManager,
         block_tables: dict,
         cu_seq_lens: dict,
         cu_new_comp_kv: dict,
@@ -624,7 +624,7 @@ def run_ref_segmented_forward(
 class CompressorWrapper:
     """Wrapper around Compressor to manage caches and provide a simpler test interface."""
 
-    # Class-level constants for MewtwoCacheManager
+    # Class-level constants for DeepseekV4CacheManager
     WINDOW_SIZE = 128
     VOCAB_SIZE = 129280
 
@@ -686,8 +686,8 @@ class CompressorWrapper:
             rotate_activation=rotate,
         ).to(DEVICE)
 
-        # Create MewtwoCacheManager
-        self.cache_manager = self._create_mewtwo_cache_manager(compress_ratio)
+        # Create DeepseekV4CacheManager
+        self.cache_manager = self._create_deepseek_v4_cache_manager(compress_ratio)
         # COMPRESS cache has tokens_per_block from cache manager's compressed_block_sizes
         self.tokens_per_block = self.cache_manager.compressed_block_sizes[self.layer_idx]
 
@@ -725,13 +725,13 @@ class CompressorWrapper:
         except Exception:
             pass
 
-    def _create_mewtwo_cache_manager(self, compress_ratio: int) -> MewtwoCacheManager:
-        """Create a MewtwoCacheManager for testing."""
+    def _create_deepseek_v4_cache_manager(self, compress_ratio: int) -> DeepseekV4CacheManager:
+        """Create a DeepseekV4CacheManager for testing."""
         # Single layer with the given compress ratio
         compress_ratios = [compress_ratio]
 
         # Create sparse attention config
-        sparse_attn_config = MewtwoSparseAttentionConfig(
+        sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=INDEX_HEAD_DIM,
             window_size=self.WINDOW_SIZE,
             compress_ratios=compress_ratios,
@@ -753,7 +753,7 @@ class CompressorWrapper:
             cache_dtype = DataType.BF16
 
         # Create cache manager
-        cache_manager = MewtwoCacheManager(
+        cache_manager = DeepseekV4CacheManager(
             kv_cache_config=kv_cache_config,
             kv_cache_type=CacheTypeCpp.SELFKONLY,
             num_layers=len(compress_ratios),
@@ -776,14 +776,14 @@ class CompressorWrapper:
     def _update_kv_cache_reference(self):
         """Update the kv_cache reference from cache manager for test compatibility."""
         compress_type = (
-            MewtwoAttentionType.INDEXER_COMPRESS
+            DeepseekV4AttentionType.INDEXER_COMPRESS
             if self.is_indexer
-            else MewtwoAttentionType.COMPRESS
+            else DeepseekV4AttentionType.COMPRESS
         )
         self.kv_cache = self.cache_manager.get_buffers(self.layer_idx, compress_type)
 
     def _create_request(self, request_id: int, prompt_len: int) -> LlmRequest:
-        """Helper to create a test LlmRequest (following test_mewtwo_cache_manager pattern).
+        """Helper to create a test LlmRequest (following test_deepseek_v4_cache_manager pattern).
 
         Args:
             request_id: Unique request identifier
@@ -910,7 +910,7 @@ class CompressorWrapper:
     def _get_block_table_for_request(
         self,
         req: LlmRequest,
-        attn_type: MewtwoAttentionType,
+        attn_type: DeepseekV4AttentionType,
     ) -> torch.Tensor:
         """Get block table for a request and attention type."""
         page_indices = self.cache_manager.get_cache_indices(
@@ -1102,15 +1102,15 @@ class CompressorWrapper:
 
         # Determine attention types based on is_indexer
         if self.is_indexer:
-            compress_type = MewtwoAttentionType.INDEXER_COMPRESS
-            state_type = MewtwoAttentionType.INDEXER_COMPRESSOR_STATE
-            score_type = MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE
+            compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
+            state_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+            score_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE
         else:
-            compress_type = MewtwoAttentionType.COMPRESS
-            state_type = MewtwoAttentionType.COMPRESSOR_STATE
-            score_type = MewtwoAttentionType.COMPRESSOR_SCORE
+            compress_type = DeepseekV4AttentionType.COMPRESS
+            state_type = DeepseekV4AttentionType.COMPRESSOR_STATE
+            score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
-        # Build block_tables dict keyed by MewtwoAttentionType using cache manager
+        # Build block_tables dict keyed by DeepseekV4AttentionType using cache manager
         block_table_compress_list = []
         block_table_kv_state_list = []
         block_table_score_state_list = []
@@ -1172,7 +1172,7 @@ class CompressorWrapper:
             offset += slot_size
         compressed_mask_cuda_dict = {ratio: compressed_mask_tokens}
 
-        # Build attention metadata using MewtwoCacheManager
+        # Build attention metadata using DeepseekV4CacheManager
         metadata = DummyAttentionMetadata(
             num_contexts=num_contexts,
             num_generations=num_generations,
@@ -1292,7 +1292,7 @@ class CompressorWrapper:
         self.next_request_id = 0
 
         # Recreate the cache manager to reset all caches
-        self.cache_manager = self._create_mewtwo_cache_manager(self.compress_ratio)
+        self.cache_manager = self._create_deepseek_v4_cache_manager(self.compress_ratio)
         self._update_kv_cache_reference()
 
 

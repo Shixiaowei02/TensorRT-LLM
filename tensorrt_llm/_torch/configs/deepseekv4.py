@@ -11,10 +11,10 @@ logger = logging.get_logger(__name__)
 _DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
 
 
-# This is a temporary workaround for Mewtwo model as HF does not support it yet
-# TODO: Remove this once HF supports Mewtwo
-class MewtwoConfig(PretrainedConfig):
-    model_type = "mewtwo"
+# This is a temporary workaround for DeepSeek-V4 model as HF does not support it yet
+# TODO: Remove this once HF supports DeepSeek-V4
+class DeepseekV4Config(PretrainedConfig):
+    model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -67,7 +67,7 @@ class MewtwoConfig(PretrainedConfig):
         hc_sinkhorn_iters=20,
         hc_eps=1e-6,
         window_size=128,
-        compress_rope_theta=40000,
+        compress_rope_theta=160000,
         compress_ratios=None,
         has_engram=False,
         engram_vocab_size=None,
@@ -80,6 +80,13 @@ class MewtwoConfig(PretrainedConfig):
         engram_seed=0,
         **kwargs,
     ):
+        # DeepSeek-V4 HF config uses `sliding_window` and `num_hash_layers`.
+        # Accept them as aliases for the internal names the rest of the code uses.
+        if "sliding_window" in kwargs:
+            window_size = kwargs.pop("sliding_window")
+        if "num_hash_layers" in kwargs:
+            n_hash_layers = kwargs.pop("num_hash_layers")
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

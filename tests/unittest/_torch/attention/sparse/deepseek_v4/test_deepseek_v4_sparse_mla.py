@@ -1,5 +1,5 @@
 """
-Tests for Mewtwo sparse MLA attention.
+Tests for DeepSeek-V4 sparse MLA attention.
 """
 
 import math
@@ -16,19 +16,19 @@ from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo import (
-    MewtwoAttentionType,
-    MewtwoCacheManager,
-    MewtwoTrtllmAttention,
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4AttentionType,
+    DeepseekV4CacheManager,
+    DeepseekV4TrtllmAttention,
 )
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoTrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -44,7 +44,7 @@ class Scenario:
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 512
-    rope_append: bool = False  # Mewtwo requires rope_append=False
+    rope_append: bool = False  # DeepSeek-V4 requires rope_append=False
     hidden_size: int = 7168
     max_position_embeddings: int = 163840
     rope_theta: float = 10000.0
@@ -148,7 +148,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_seq_len: int):
-    sparse_config = MewtwoSparseAttentionConfig(
+    sparse_config = DeepSeekV4SparseAttentionConfig(
         index_n_heads=64,
         index_head_dim=128,
         window_size=scenario.window_size,
@@ -159,7 +159,7 @@ def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_se
     batch_size = len(context_lengths)
     max_input_len = max(context_lengths)
 
-    cache_manager = MewtwoCacheManager(
+    cache_manager = DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             max_tokens=max_seq_len * batch_size,
             enable_block_reuse=False,
@@ -190,7 +190,7 @@ def _create_cache_manager(scenario: Scenario, context_lengths: List[int], max_se
 
 
 def _prefill_compress_buffer(
-    cache_manager: MewtwoCacheManager,
+    cache_manager: DeepseekV4CacheManager,
     layer_idx: int,
     context_lengths: List[int],
     request_ids: List[int],
@@ -202,7 +202,7 @@ def _prefill_compress_buffer(
     Returns flat reference data per request.
     """
     compress_ratio = cache_manager._compress_ratios[layer_idx]
-    buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.COMPRESS)
+    buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
     tokens_per_block_compressed = cache_manager.compressed_block_sizes[layer_idx]
 
     ref_data = []
@@ -212,7 +212,7 @@ def _prefill_compress_buffer(
         ref_data.append(data)
 
         block_ids = cache_manager.get_cache_indices(
-            request_ids[req_idx], layer_idx, MewtwoAttentionType.COMPRESS
+            request_ids[req_idx], layer_idx, DeepseekV4AttentionType.COMPRESS
         )
         for tok_idx in range(num_compressed):
             block_idx = tok_idx // tokens_per_block_compressed
@@ -223,7 +223,7 @@ def _prefill_compress_buffer(
 
 
 def _grow_compress_buffer_for_generation(
-    cache_manager: MewtwoCacheManager,
+    cache_manager: DeepseekV4CacheManager,
     layer_idx: int,
     request_ids: List[int],
     head_dim: int,
@@ -238,7 +238,7 @@ def _grow_compress_buffer_for_generation(
     and the reference data list (in-place).
     """
     compress_ratio = cache_manager._compress_ratios[layer_idx]
-    buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.COMPRESS)
+    buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
     tokens_per_block_compressed = cache_manager.tokens_per_block // compress_ratio
 
     for req_idx in range(len(request_ids)):
@@ -249,7 +249,7 @@ def _grow_compress_buffer_for_generation(
             continue
         new_data = torch.randn(num_new, head_dim, device=device, dtype=torch.bfloat16)
         block_ids = cache_manager.get_cache_indices(
-            request_ids[req_idx], layer_idx, MewtwoAttentionType.COMPRESS
+            request_ids[req_idx], layer_idx, DeepseekV4AttentionType.COMPRESS
         )
         for j in range(num_new):
             tok_idx = old_count + j
@@ -301,7 +301,7 @@ def _softmax_with_sink(
     return (num / denom).to(out_dtype)
 
 
-def calculate_mewtwo_ref_ctx_sparse(
+def calculate_deepseek_v4_ref_ctx_sparse(
     fused_q_rot: torch.Tensor,
     latent_cache_ref: torch.Tensor,
     compressed_ref_data: Optional[List[torch.Tensor]],
@@ -317,7 +317,7 @@ def calculate_mewtwo_ref_ctx_sparse(
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
 ):
-    """Per-token reference attention for Mewtwo context phase.
+    """Per-token reference attention for DeepSeek-V4 context phase.
 
     For compress_ratio==1: only SWA tokens (causal window).
     For compress_ratio==4: SWA tokens + indexer topk compressed tokens.
@@ -429,7 +429,7 @@ def _rotate_gen_inputs(
     return fused_q_rot, torch.cat(new_latent_list, dim=0)
 
 
-def calculate_mewtwo_ref_gen_sparse(
+def calculate_deepseek_v4_ref_gen_sparse(
     fused_q_rot: torch.Tensor,
     new_latent_cache: torch.Tensor,
     latent_cache_ref: torch.Tensor,
@@ -446,7 +446,7 @@ def calculate_mewtwo_ref_gen_sparse(
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
 ):
-    """Reference attention for Mewtwo generation phase."""
+    """Reference attention for DeepSeek-V4 generation phase."""
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
     num_requests = len(seq_lens_kv)
@@ -538,7 +538,7 @@ def _allocate_kv_cache_for_generation(cache_manager, requests: List[LlmRequest])
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
 @pytest.mark.parametrize("num_generation_steps", [2])
-def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int):
+def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps: int):
     generation_seq_len_q = 1
     scenario = Scenario()
     device = torch.device("cuda")
@@ -653,7 +653,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
     # 4. Create attention layers
     layers = {}
     for layer_idx in TEST_LAYERS:
-        layer = MewtwoTrtllmAttention(
+        layer = DeepseekV4TrtllmAttention(
             layer_idx=layer_idx,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -795,7 +795,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
 
     # 7. Context phase
     ctx_seq_lens = torch.tensor(context_lengths, dtype=torch.int)
-    attn_metadata = MewtwoTrtllmAttentionMetadata(
+    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=ctx_seq_lens,
         request_ids=request_ids,
         max_num_requests=batch_size,
@@ -862,7 +862,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        ref_result = calculate_mewtwo_ref_ctx_sparse(
+        ref_result = calculate_deepseek_v4_ref_ctx_sparse(
             fused_q_rot,
             latent_cache_ref,
             compress_ref_data.get(layer_idx),
@@ -924,7 +924,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
 
         gen_seq_lens = torch.tensor([generation_seq_len_q] * batch_size, dtype=torch.int)
         total_gen_tokens = batch_size * generation_seq_len_q
-        gen_metadata = MewtwoTrtllmAttentionMetadata(
+        gen_metadata = DeepseekV4TrtllmAttentionMetadata(
             seq_lens=gen_seq_lens,
             request_ids=request_ids,
             max_num_requests=batch_size,
@@ -1012,7 +1012,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
                 kv_lora_rank,
                 qk_rope_head_dim,
             )
-            ref_result, new_latent_cache = calculate_mewtwo_ref_gen_sparse(
+            ref_result, new_latent_cache = calculate_deepseek_v4_ref_gen_sparse(
                 fused_q_rot,
                 new_latent,
                 latent_cache_ref_all[layer_idx],
@@ -1056,7 +1056,7 @@ def test_mewtwo_sparse_mla(context_lengths: List[int], num_generation_steps: int
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[14, 508, 3947]])
-def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
+def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
     scenario = Scenario()
     device = torch.device("cuda")
     dtype = scenario.dtype
@@ -1161,7 +1161,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
 
     layers = {}
     for li in TEST_LAYERS:
-        layer = MewtwoTrtllmAttention(
+        layer = DeepseekV4TrtllmAttention(
             layer_idx=li,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -1200,7 +1200,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
     ).uniform_(-1, 1)
     prefill_latent = torch.cat([prefill_compressed_kv, prefill_k_pe], dim=-1)
 
-    prefill_metadata = MewtwoTrtllmAttentionMetadata(
+    prefill_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(gen_ctx_lengths, dtype=torch.int),
         request_ids=gen_request_ids,
         max_num_requests=num_gen,
@@ -1274,7 +1274,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
     # 4. Mixed metadata: request 0 = context, requests 1..N = generation.
     mixed_seq_lens = [context_lengths[0]] + [generation_seq_len_q] * num_gen
     mixed_cached_lens = [0] + gen_cached_lens
-    mixed_metadata = MewtwoTrtllmAttentionMetadata(
+    mixed_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(mixed_seq_lens, dtype=torch.int),
         request_ids=request_ids,
         max_num_requests=batch_size,
@@ -1289,7 +1289,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
     )
     mixed_metadata.prepare()
 
-    # 5. Per-layer forward + verify (mirrors forward_impl_with_mewtwo).
+    # 5. Per-layer forward + verify (mirrors forward_impl_with_deepseek_v4).
     for li in TEST_LAYERS:
         ratio = scenario.compress_ratios[li]
         print(f"\n--- Mixed: layer {li}, compress_ratio={ratio} ---")
@@ -1406,7 +1406,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        ctx_ref = calculate_mewtwo_ref_ctx_sparse(
+        ctx_ref = calculate_deepseek_v4_ref_ctx_sparse(
             ctx_q_rot,
             ctx_latent_ref,
             None,
@@ -1437,7 +1437,7 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        gen_ref, _ = calculate_mewtwo_ref_gen_sparse(
+        gen_ref, _ = calculate_deepseek_v4_ref_gen_sparse(
             gen_q_rot,
             new_latent,
             gen_latent_ref,
@@ -1476,4 +1476,4 @@ def test_mewtwo_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_mewtwo_sparse_mla(context_lengths=[4399], num_generation_steps=2)
+    test_deepseek_v4_sparse_mla(context_lengths=[4399], num_generation_steps=2)

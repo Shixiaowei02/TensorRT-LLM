@@ -4,19 +4,19 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo import MewtwoCacheManager
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoAttentionType
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4AttentionType
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
-    Tuple[int, MewtwoAttentionType],  # (layer index, attention type)
+    Tuple[int, DeepseekV4AttentionType],  # (layer index, attention type)
     Tuple[torch.Tensor, torch.Tensor | None],  # (values tensor, scales tensor)
 ]
 
@@ -30,8 +30,8 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-class TestMewtwoCacheManager:
-    # mewtwo specific param
+class TestDeepseekV4CacheManager:
+    # deepseek_v4 specific param
     head_dim = 512
     index_head_dim = 128
     window_size = 128
@@ -80,7 +80,7 @@ class TestMewtwoCacheManager:
         """
         return compress_ratio == self.overlap_compress_layer_ratio
 
-    def _get_window_size(self, compress_ratio: int, attn_type: MewtwoAttentionType) -> int:
+    def _get_window_size(self, compress_ratio: int, attn_type: DeepseekV4AttentionType) -> int:
         """Get the window size for a layer based on its compress ratio and attention type.
 
         Args:
@@ -91,19 +91,19 @@ class TestMewtwoCacheManager:
             The window size for the layer
         """
         state_factor = 2 if self._is_overlap_compressor(compress_ratio) else 1
-        if attn_type == MewtwoAttentionType.SWA:
+        if attn_type == DeepseekV4AttentionType.SWA:
             return self.window_size
         elif attn_type in [
-            MewtwoAttentionType.COMPRESSOR_STATE,
-            MewtwoAttentionType.COMPRESSOR_SCORE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-            MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+            DeepseekV4AttentionType.COMPRESSOR_STATE,
+            DeepseekV4AttentionType.COMPRESSOR_SCORE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             return state_factor * compress_ratio
-        elif attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+        elif attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
             return None
 
-    def _create_mewtwo_cache_manager(
+    def _create_deepseek_v4_cache_manager(
         self,
         tokens_per_block: int,
         max_batch_size: int,
@@ -112,11 +112,11 @@ class TestMewtwoCacheManager:
         dtype: DataType,
         compressor_dtype: DataType,
         max_input_len: Optional[int] = None,
-    ) -> Tuple[MewtwoCacheManager, MewtwoSparseAttentionConfig]:
-        """Helper to create a MewtwoCacheManager for testing."""
+    ) -> Tuple[DeepseekV4CacheManager, DeepSeekV4SparseAttentionConfig]:
+        """Helper to create a DeepseekV4CacheManager for testing."""
 
         # Create sparse attention config
-        sparse_attn_config = MewtwoSparseAttentionConfig(
+        sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=self.index_head_dim,
             window_size=self.window_size,
             compress_ratios=compress_ratios,
@@ -135,7 +135,7 @@ class TestMewtwoCacheManager:
         mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
 
         # Create cache manager
-        cache_manager = MewtwoCacheManager(
+        cache_manager = DeepseekV4CacheManager(
             kv_cache_config=kv_cache_config,
             kv_cache_type=CacheTypeCpp.SELFKONLY,
             num_layers=len(compress_ratios),
@@ -192,7 +192,7 @@ class TestMewtwoCacheManager:
         self,
         seq_len: int,
         head_dim: int,
-        sparse_attn_config: MewtwoSparseAttentionConfig,
+        sparse_attn_config: DeepSeekV4SparseAttentionConfig,
         dtype: torch.dtype,
         compressor_dtype: torch.dtype,
         device: torch.device | None = None,
@@ -214,22 +214,22 @@ class TestMewtwoCacheManager:
         for layer, ratio in enumerate(sparse_attn_config.compress_ratios):
             is_overlap = self._is_overlap_compressor(ratio)
 
-            cache[layer, MewtwoAttentionType.SWA] = (
+            cache[layer, DeepseekV4AttentionType.SWA] = (
                 self._rand_tensor((seq_len, head_dim), dtype, device),
                 None,
             )
 
             if self._is_compress_layer(ratio):
                 compressor_dim = 2 * head_dim if is_overlap else head_dim
-                cache[layer, MewtwoAttentionType.COMPRESS] = (
+                cache[layer, DeepseekV4AttentionType.COMPRESS] = (
                     self._rand_tensor((seq_len // ratio, head_dim), dtype, device),
                     None,
                 )
-                cache[layer, MewtwoAttentionType.COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.COMPRESSOR_STATE] = (
                     self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
                     None,
                 )
-                cache[layer, MewtwoAttentionType.COMPRESSOR_SCORE] = (
+                cache[layer, DeepseekV4AttentionType.COMPRESSOR_SCORE] = (
                     self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -245,17 +245,17 @@ class TestMewtwoCacheManager:
                 indexer_scales = self._rand_tensor(
                     (indexer_num_tokens, num_scales), torch.float32, device
                 )
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESS] = (
+                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESS] = (
                     indexer_values,
                     indexer_scales,
                 )
 
                 indexer_compressor_dim = 2 * indexer_dim if is_overlap else indexer_dim
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE] = (
                     self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
                     None,
                 )
-                cache[layer, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE] = (
+                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE] = (
                     self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -391,7 +391,7 @@ class TestMewtwoCacheManager:
         self,
         req: LlmRequest,
         prompt_len: int,
-        cache_manager: MewtwoCacheManager,
+        cache_manager: DeepseekV4CacheManager,
         cache_values: _RequestCache,
     ) -> None:
         """Write cache values for a request to the cache manager.
@@ -413,13 +413,13 @@ class TestMewtwoCacheManager:
                 compress_ratio=compress_ratios[layer_idx],
             ).squeeze(0)
 
-            if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+            if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
                 seq_len = prompt_len // compress_ratios[layer_idx]
             else:
                 seq_len = prompt_len
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
-            if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
                 # indexer compress is blockwise FP8 quantized
                 values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
                 self._prefill_write_paged_cache(
@@ -443,7 +443,7 @@ class TestMewtwoCacheManager:
         self,
         req: LlmRequest,
         token_idx: int,
-        cache_manager: MewtwoCacheManager,
+        cache_manager: DeepseekV4CacheManager,
         cache_values: _RequestCache,
     ) -> None:
         """Simulate the decode phrase. Write one new token to the cache.
@@ -466,14 +466,14 @@ class TestMewtwoCacheManager:
             ).squeeze(0)
 
             compressed_token_idx = token_idx
-            if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+            if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
                 if (token_idx + 1) % compress_ratios[layer_idx] != 0:
                     # skip if current token will not trigger compression
                     continue
                 compressed_token_idx = token_idx // compress_ratios[layer_idx]
 
             buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer_idx, attn_type))
-            if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+            if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
                 values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
                 self._decode_write_paged_cache(
                     buffer=values_buffer,
@@ -499,7 +499,7 @@ class TestMewtwoCacheManager:
         self,
         req: LlmRequest,
         seq_len: int,
-        cache_manager: MewtwoCacheManager,
+        cache_manager: DeepseekV4CacheManager,
         compress_ratios: List[int],
     ) -> _RequestCache:
         """Read cache values for a request from the cache manager.
@@ -515,21 +515,21 @@ class TestMewtwoCacheManager:
         """
         cache_values: _RequestCache = {}
         for layer, ratio in enumerate(compress_ratios):
-            attn_types = [MewtwoAttentionType.SWA]
+            attn_types = [DeepseekV4AttentionType.SWA]
             if self._is_compress_layer(ratio):
                 attn_types.extend(
                     [
-                        MewtwoAttentionType.COMPRESS,
-                        MewtwoAttentionType.COMPRESSOR_STATE,
-                        MewtwoAttentionType.COMPRESSOR_SCORE,
+                        DeepseekV4AttentionType.COMPRESS,
+                        DeepseekV4AttentionType.COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.COMPRESSOR_SCORE,
                     ]
                 )
             if self._is_sparse_layer(ratio):
                 attn_types.extend(
                     [
-                        MewtwoAttentionType.INDEXER_COMPRESS,
-                        MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-                        MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+                        DeepseekV4AttentionType.INDEXER_COMPRESS,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
                     ]
                 )
 
@@ -544,8 +544,8 @@ class TestMewtwoCacheManager:
                     compress_ratio=ratio,
                 ).squeeze(0)
                 if attn_type in [
-                    MewtwoAttentionType.COMPRESS,
-                    MewtwoAttentionType.INDEXER_COMPRESS,
+                    DeepseekV4AttentionType.COMPRESS,
+                    DeepseekV4AttentionType.INDEXER_COMPRESS,
                 ]:
                     attn_len = seq_len // ratio
                 else:
@@ -553,7 +553,7 @@ class TestMewtwoCacheManager:
                 window_size = self._get_window_size(ratio, attn_type)
 
                 buffer = _view_fp8_as_uint8(cache_manager.get_buffers(layer, attn_type))
-                if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+                if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
                     values_buffer, scales_buffer = self._split_blockwise_buffer(buffer)
                     values = self._read_paged_cache(
                         buffer=values_buffer,
@@ -598,7 +598,7 @@ class TestMewtwoCacheManager:
 
         # Check each tensor value
         for layer_idx, attn_type in expect.keys():
-            if attn_type in [MewtwoAttentionType.COMPRESS, MewtwoAttentionType.INDEXER_COMPRESS]:
+            if attn_type in [DeepseekV4AttentionType.COMPRESS, DeepseekV4AttentionType.INDEXER_COMPRESS]:
                 attn_len = seq_len // compress_ratios[layer_idx]
             else:
                 attn_len = seq_len
@@ -664,7 +664,7 @@ class TestMewtwoCacheManager:
         max_seq_len = max(prompt_lens) + num_generation_steps + 1
         max_input_len = max(prompt_lens)
         # Create cache manager and sparse attention config
-        cache_manager, sparse_attn_config = self._create_mewtwo_cache_manager(
+        cache_manager, sparse_attn_config = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
@@ -777,7 +777,7 @@ class TestMewtwoCacheManager:
     ):
         # Create cache manager and sparse attention config
         num_layers = len(compress_ratios)
-        cache_manager, _ = self._create_mewtwo_cache_manager(
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=4,
             max_seq_len=1024,
@@ -814,7 +814,7 @@ class TestMewtwoCacheManager:
         fill_with_zero: bool,
     ):
         """Test invalid value detection and optional zero-fill behavior in KV cache."""
-        cache_manager, _ = self._create_mewtwo_cache_manager(
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=4,
             max_seq_len=1024,
@@ -830,7 +830,7 @@ class TestMewtwoCacheManager:
         if invalid:
             # Inject invalid into a float buffer so NaN/Inf checks are supported.
             layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
-            buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.COMPRESSOR_STATE)
+            buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESSOR_STATE)
             buffer[0, 0, 0] = torch.nan
 
         result = cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=fill_with_zero)
@@ -853,7 +853,7 @@ class TestMewtwoCacheManager:
 
 
 if __name__ == "__main__":
-    tester = TestMewtwoCacheManager()
+    tester = TestDeepseekV4CacheManager()
     print("=== FP8, prompt_lens=[1024, 2048, 4096], steps=100 ===")
     tester.test_write_read_cache([1, 4, 128], [1024, 2048, 4096], 100, DataType.FP8, DataType.FLOAT)
     print("Test passed")

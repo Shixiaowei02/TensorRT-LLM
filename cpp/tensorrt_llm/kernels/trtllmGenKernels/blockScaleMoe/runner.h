@@ -80,8 +80,8 @@ enum class RoutingMethodType : int64_t
     RenormalizeNaive = 4,
     // MiniMaxM2: Sigmoid -> RoutingBiasAdd -> TopK -> Renormalize(without bias)
     MiniMax2 = 5,
-    // Mewtwo
-    Mewtwo = 6,
+    // DeepSeek-V4
+    DeepSeekV4 = 6,
     // Unspecified
     Unspecified = 7,
 };

@@ -8,30 +8,30 @@ from transformers import PretrainedConfig
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.cache_manager import MewtwoCacheManager
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import (
-    MewtwoIndexer,
-    MewtwoTrtllmAttention,
-    MewtwoTrtllmAttentionMetadata,
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+    DeepseekV4Indexer,
+    DeepseekV4TrtllmAttention,
+    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_mewtwo import (
-    MewtwoForCausalLM,
-    MewtwoMoE,
-    _make_mewtwo_pos_embd_params,
+from tensorrt_llm._torch.models.modeling_deepseekv4 import (
+    DeepseekV4ForCausalLM,
+    DeepseekV4MoE,
+    _make_deepseek_v4_pos_embd_params,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-MEWTWO_TINY_CONFIG = {
-    "architectures": ["MewtwoForCausalLM"],
-    "model_type": "mewtwo",
+DEEPSEEK_V4_TINY_CONFIG = {
+    "architectures": ["DeepseekV4ForCausalLM"],
+    "model_type": "deepseek_v4",
     "hidden_size": 4096,
     "num_attention_heads": 64,
     "num_key_value_heads": 1,
@@ -78,28 +78,28 @@ MEWTWO_TINY_CONFIG = {
 }
 
 
-# class TestMewtwo(unittest.TestCase):
+# class TestDeepSeekV4(unittest.TestCase):
 
 
-def _make_mewtwo_test_config():
-    config = PretrainedConfig(**deepcopy(MEWTWO_TINY_CONFIG))
+def _make_deepseek_v4_test_config():
+    config = PretrainedConfig(**deepcopy(DEEPSEEK_V4_TINY_CONFIG))
     config.torch_dtype = torch.bfloat16
     return config
 
 
 def _make_rope_test_model_config(compress_ratios):
     return SimpleNamespace(
-        pretrained_config=_make_mewtwo_test_config(),
+        pretrained_config=_make_deepseek_v4_test_config(),
         sparse_attention_config=SimpleNamespace(compress_ratios=compress_ratios),
     )
 
 
-def test_mewtwo_rope_params_use_compressed_theta_only_for_compressed_layers():
+def test_deepseek_v4_rope_params_use_compressed_theta_only_for_compressed_layers():
     model_config = _make_rope_test_model_config([128, 4, 1])
     config = model_config.pretrained_config
 
     for layer_idx in [0, 1]:
-        pos_params = _make_mewtwo_pos_embd_params(model_config, layer_idx)
+        pos_params = _make_deepseek_v4_pos_embd_params(model_config, layer_idx)
         assert pos_params.type == PositionEmbeddingType.yarn
         assert pos_params.is_neox is False
         assert pos_params.rope.theta == config.compress_rope_theta
@@ -110,7 +110,7 @@ def test_mewtwo_rope_params_use_compressed_theta_only_for_compressed_layers():
             == config.rope_scaling["original_max_position_embeddings"]
         )
 
-    pos_params = _make_mewtwo_pos_embd_params(model_config, 2)
+    pos_params = _make_deepseek_v4_pos_embd_params(model_config, 2)
     assert pos_params.type == PositionEmbeddingType.yarn
     assert pos_params.is_neox is False
     assert pos_params.rope.theta == config.rope_theta
@@ -121,8 +121,8 @@ def test_mewtwo_rope_params_use_compressed_theta_only_for_compressed_layers():
     assert pos_params.rope.original_max_positions == config.max_position_embeddings
 
 
-def test_mewtwo_rope_params_fallback_to_base_rope_for_non_compressed_edge_cases():
-    config = _make_mewtwo_test_config()
+def test_deepseek_v4_rope_params_fallback_to_base_rope_for_non_compressed_edge_cases():
+    config = _make_deepseek_v4_test_config()
     model_configs = [
         SimpleNamespace(pretrained_config=config, sparse_attention_config=None),
         _make_rope_test_model_config(None),
@@ -134,35 +134,35 @@ def test_mewtwo_rope_params_fallback_to_base_rope_for_non_compressed_edge_cases(
     layer_idxs = [None, 0, 0, 1, -1, 0]
 
     for model_config, layer_idx in zip(model_configs, layer_idxs):
-        pos_params = _make_mewtwo_pos_embd_params(model_config, layer_idx)
+        pos_params = _make_deepseek_v4_pos_embd_params(model_config, layer_idx)
         assert pos_params.rope.theta == config.rope_theta
         assert pos_params.rope.scale_type == RotaryScalingType.none
         assert pos_params.rope.scale == 1.0
 
 
-def test_mewtwo_compressed_rope_falls_back_to_base_theta_if_missing_compress_theta():
+def test_deepseek_v4_compressed_rope_falls_back_to_base_theta_if_missing_compress_theta():
     model_config = _make_rope_test_model_config([4])
     config = model_config.pretrained_config
     delattr(config, "compress_rope_theta")
 
-    pos_params = _make_mewtwo_pos_embd_params(model_config, 0)
+    pos_params = _make_deepseek_v4_pos_embd_params(model_config, 0)
     assert pos_params.rope.theta == config.rope_theta
     assert pos_params.rope.scale_type == RotaryScalingType.yarn
 
 
-def test_mewtwo_compressor_rotate_and_indexer_rope_contracts():
+def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert inspect.signature(Compressor).parameters["rotate_activation"].default is False
 
-    indexer_init = inspect.getsource(MewtwoIndexer.__init__)
+    indexer_init = inspect.getsource(DeepseekV4Indexer.__init__)
     assert "is_neox=False" in indexer_init
     assert "rotate_activation=True" in indexer_init
 
-    attention_init = inspect.getsource(MewtwoTrtllmAttention.__init__)
+    attention_init = inspect.getsource(DeepseekV4TrtllmAttention.__init__)
     assert "rotate_activation=False" in attention_init
 
 
-def test_mewtwo_moe_swiglu_limit_is_routed_only():
-    moe_init = inspect.getsource(MewtwoMoE.__init__)
+def test_deepseek_v4_moe_swiglu_limit_is_routed_only():
+    moe_init = inspect.getsource(DeepseekV4MoE.__init__)
     # Routed experts: swiglu_limit is built once and passed to create_moe.
     assert moe_init.count("swiglu_limit=self.swiglu_limit") == 1
     assert "torch.full" in moe_init  # per-local-expert fp32 tensor for the C++ op.
@@ -175,12 +175,12 @@ def test_mewtwo_moe_swiglu_limit_is_routed_only():
     assert "swiglu_limit" not in shared_expert_block
 
 
-def test_mewtwo_q_b_layernorm_matches_per_head_reference():
+def test_deepseek_v4_q_b_layernorm_matches_per_head_reference():
     """V4 reference Q post-q_b_proj normalization is per-head unweighted RMS:
         q = wq_b(q).unflatten(-1, (n_heads, head_dim))
         q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
-    The mewtwo MLA branch realizes this by calling the standard ``RMSNorm``
+    The deepseek_v4 MLA branch realizes this by calling the standard ``RMSNorm``
     op (so cuda_tile / flashinfer fast paths apply) on a ``[N*n_heads,
     head_dim]`` view. ``has_weights=False`` registers an all-ones buffer so
     no learnable scale is applied — matching the reference, which has no
@@ -215,7 +215,7 @@ def test_mewtwo_q_b_layernorm_matches_per_head_reference():
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=2e-2)
 
 
-def test_mewtwo_q_b_layernorm_differs_from_joint_flat_rms():
+def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
     """Guard against regressing to flat-RMSNorm-over-(n_heads*head_dim).
 
     Per-head normalization treats heads independently, so when heads have
@@ -257,23 +257,23 @@ def test_mewtwo_q_b_layernorm_differs_from_joint_flat_rms():
     assert not torch.allclose(per_head, joint, atol=0.1)
 
 
-def test_mewtwo_mla_q_b_layernorm_init_and_forward_shape():
-    """MLA Mewtwo branch must use the standard RMSNorm op sized to
+def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
+    """MLA DeepSeek-V4 branch must use the standard RMSNorm op sized to
     ``qk_head_dim`` with ``has_weights=False`` (V4 ckpt has no
     ``q_b_layernorm.weight``), and call it on a ``[N*n_heads, head_dim]``
     view of q so the per-row reduction matches per-head reduction."""
     from tensorrt_llm._torch.modules.attention import MLA
 
     init_src = inspect.getsource(MLA.__init__)
-    forward_src = inspect.getsource(MLA.forward_impl_with_mewtwo)
+    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
 
     assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
     assert "has_weights=False" in init_src
     assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
 
 
-def test_mewtwo_sanity():
-    config_dict = deepcopy(MEWTWO_TINY_CONFIG)
+def test_deepseek_v4_sanity():
+    config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
     config = PretrainedConfig(**config_dict)
     config.dtype = torch.bfloat16
     config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -282,7 +282,7 @@ def test_mewtwo_sanity():
     vocab_size = config.vocab_size
     max_batch_size = 4
 
-    sparse_attn_config = MewtwoSparseAttentionConfig(
+    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
         index_n_heads=64,
         index_head_dim=128,
         window_size=128,
@@ -296,7 +296,7 @@ def test_mewtwo_sanity():
     model_config = ModelConfig(
         pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
     )
-    model = MewtwoForCausalLM(model_config).to(device)
+    model = DeepseekV4ForCausalLM(model_config).to(device)
 
     context_sequence_length = [3, 2, 5]
     sequence_length = context_sequence_length + [1, 1]
@@ -309,7 +309,7 @@ def test_mewtwo_sanity():
     request_ids = list(range(len(sequence_length)))
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:3] + past_seen_tokens[3:]
-    tokens_per_block = 128  # Mewtwo requirement
+    tokens_per_block = 128  # DeepSeek-V4 requirement
     max_new_tokens = 1024
     required_blocks = sum(
         (token_num + max_new_tokens + tokens_per_block - 1) // tokens_per_block
@@ -331,7 +331,7 @@ def test_mewtwo_sanity():
     kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
     kv_cache_config.max_util_for_resume = 0.1
 
-    kv_cache_manager = MewtwoCacheManager(
+    kv_cache_manager = DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=num_blocks * tokens_per_block,
@@ -369,7 +369,7 @@ def test_mewtwo_sanity():
         assert success, f"Failed to resize context for request {req_id}"
         reqs.append(req)
 
-    attn_metadata = MewtwoTrtllmAttentionMetadata(
+    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
         num_contexts=len(context_sequence_length),
         max_num_requests=len(sequence_length),
