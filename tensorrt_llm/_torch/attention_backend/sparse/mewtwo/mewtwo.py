@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -900,6 +901,11 @@ class MewtwoIndexer(Indexer):
             layer_idx,
             aux_stream,
         )
+        self.rotary_emb = RotaryEmbedding(
+            pos_embd_params.rope,
+            head_dim=self.rope_dim,
+            is_neox=False,
+        )
         rms_norm_eps = 1e-6
         index_head_dim = sparse_attention_config.index_head_dim
         indexer_mla_params = MLAParams(
@@ -917,6 +923,7 @@ class MewtwoIndexer(Indexer):
             dtype=dtype,
             kv_cache_dtype="fp8_blockwise",
             is_indexer=True,
+            rotate_activation=True,
         )
 
     def _qk_projection_and_rope(self, qr: torch.Tensor, position_ids: torch.Tensor):
@@ -1055,6 +1062,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
                 pos_embd_params,
                 kv_cache_dtype=kv_cache_dtype,
                 dtype=dtype,
+                rotate_activation=False,
             )
 
     def forward(self, *args, **kwargs):

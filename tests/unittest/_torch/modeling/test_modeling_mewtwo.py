@@ -1,5 +1,7 @@
+import inspect
 import weakref
 from copy import deepcopy
+from types import SimpleNamespace
 
 import torch
 from transformers import PretrainedConfig
@@ -7,13 +9,23 @@ from transformers import PretrainedConfig
 # from utils.util import default_dtype
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.sparse.mewtwo.cache_manager import MewtwoCacheManager
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import MewtwoTrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import Compressor
+from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import (
+    MewtwoIndexer,
+    MewtwoTrtllmAttention,
+    MewtwoTrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_mewtwo import MewtwoForCausalLM
+from tensorrt_llm._torch.models.modeling_mewtwo import (
+    MewtwoForCausalLM,
+    MewtwoMoE,
+    _make_mewtwo_pos_embd_params,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -67,6 +79,197 @@ MEWTWO_TINY_CONFIG = {
 
 
 # class TestMewtwo(unittest.TestCase):
+
+
+def _make_mewtwo_test_config():
+    config = PretrainedConfig(**deepcopy(MEWTWO_TINY_CONFIG))
+    config.torch_dtype = torch.bfloat16
+    return config
+
+
+def _make_rope_test_model_config(compress_ratios):
+    return SimpleNamespace(
+        pretrained_config=_make_mewtwo_test_config(),
+        sparse_attention_config=SimpleNamespace(compress_ratios=compress_ratios),
+    )
+
+
+def test_mewtwo_rope_params_use_compressed_theta_only_for_compressed_layers():
+    model_config = _make_rope_test_model_config([128, 4, 1])
+    config = model_config.pretrained_config
+
+    for layer_idx in [0, 1]:
+        pos_params = _make_mewtwo_pos_embd_params(model_config, layer_idx)
+        assert pos_params.type == PositionEmbeddingType.yarn
+        assert pos_params.is_neox is False
+        assert pos_params.rope.theta == config.compress_rope_theta
+        assert pos_params.rope.scale_type == RotaryScalingType.yarn
+        assert pos_params.rope.scale == config.rope_scaling["factor"]
+        assert (
+            pos_params.rope.original_max_positions
+            == config.rope_scaling["original_max_position_embeddings"]
+        )
+
+    pos_params = _make_mewtwo_pos_embd_params(model_config, 2)
+    assert pos_params.type == PositionEmbeddingType.yarn
+    assert pos_params.is_neox is False
+    assert pos_params.rope.theta == config.rope_theta
+    assert pos_params.rope.scale_type == RotaryScalingType.none
+    assert pos_params.rope.scale == 1.0
+    assert pos_params.rope.mscale == 1.0
+    assert pos_params.rope.mscale_all_dim == 0.0
+    assert pos_params.rope.original_max_positions == config.max_position_embeddings
+
+
+def test_mewtwo_rope_params_fallback_to_base_rope_for_non_compressed_edge_cases():
+    config = _make_mewtwo_test_config()
+    model_configs = [
+        SimpleNamespace(pretrained_config=config, sparse_attention_config=None),
+        _make_rope_test_model_config(None),
+        _make_rope_test_model_config([]),
+        _make_rope_test_model_config([128]),
+        _make_rope_test_model_config([128]),
+        _make_rope_test_model_config([0]),
+    ]
+    layer_idxs = [None, 0, 0, 1, -1, 0]
+
+    for model_config, layer_idx in zip(model_configs, layer_idxs):
+        pos_params = _make_mewtwo_pos_embd_params(model_config, layer_idx)
+        assert pos_params.rope.theta == config.rope_theta
+        assert pos_params.rope.scale_type == RotaryScalingType.none
+        assert pos_params.rope.scale == 1.0
+
+
+def test_mewtwo_compressed_rope_falls_back_to_base_theta_if_missing_compress_theta():
+    model_config = _make_rope_test_model_config([4])
+    config = model_config.pretrained_config
+    delattr(config, "compress_rope_theta")
+
+    pos_params = _make_mewtwo_pos_embd_params(model_config, 0)
+    assert pos_params.rope.theta == config.rope_theta
+    assert pos_params.rope.scale_type == RotaryScalingType.yarn
+
+
+def test_mewtwo_compressor_rotate_and_indexer_rope_contracts():
+    assert inspect.signature(Compressor).parameters["rotate_activation"].default is False
+
+    indexer_init = inspect.getsource(MewtwoIndexer.__init__)
+    assert "is_neox=False" in indexer_init
+    assert "rotate_activation=True" in indexer_init
+
+    attention_init = inspect.getsource(MewtwoTrtllmAttention.__init__)
+    assert "rotate_activation=False" in attention_init
+
+
+def test_mewtwo_moe_swiglu_limit_is_routed_only():
+    moe_init = inspect.getsource(MewtwoMoE.__init__)
+    # Routed experts: swiglu_limit is built once and passed to create_moe.
+    assert moe_init.count("swiglu_limit=self.swiglu_limit") == 1
+    assert "torch.full" in moe_init  # per-local-expert fp32 tensor for the C++ op.
+
+    # Shared-expert block must not propagate swiglu_limit (V4 reference: shared
+    # expert has swiglu_limit=0, i.e., disabled).
+    shared_expert_block = moe_init.split("self.shared_experts = GatedMLP", 1)[1].split(
+        "self.allreduce", 1
+    )[0]
+    assert "swiglu_limit" not in shared_expert_block
+
+
+def test_mewtwo_q_b_layernorm_matches_per_head_reference():
+    """V4 reference Q post-q_b_proj normalization is per-head unweighted RMS:
+        q = wq_b(q).unflatten(-1, (n_heads, head_dim))
+        q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)
+
+    The mewtwo MLA branch realizes this by calling the standard ``RMSNorm``
+    op (so cuda_tile / flashinfer fast paths apply) on a ``[N*n_heads,
+    head_dim]`` view. ``has_weights=False`` registers an all-ones buffer so
+    no learnable scale is applied — matching the reference, which has no
+    ``q_b_layernorm.weight`` key in the checkpoint.
+
+    Tolerance accounts for fp32-internal RMSNorm vs bf16-direct reference
+    rounding (one-bf16-ULP at the typical post-norm magnitude).
+    """
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("RMSNorm fast paths require CUDA")
+
+    n_heads, head_dim, eps = 8, 64, 1e-6
+    torch.manual_seed(0)
+    device = "cuda"
+    q = torch.randn(4, n_heads * head_dim, dtype=torch.bfloat16, device=device)
+
+    norm = RMSNorm(
+        hidden_size=head_dim, eps=eps, dtype=torch.bfloat16, has_weights=False, device=device
+    )
+    out = norm(q.view(-1, head_dim)).view_as(q)
+
+    ref = q.unflatten(-1, (n_heads, head_dim))
+    ref = ref * torch.rsqrt(ref.square().float().mean(-1, keepdim=True) + eps).to(ref.dtype)
+    ref = ref.reshape_as(q)
+
+    assert out.shape == q.shape
+    # bf16 ULP at magnitude ~1 is 2^-7 ≈ 7.8e-3; use 2e-2 to absorb worst case.
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=2e-2)
+
+
+def test_mewtwo_q_b_layernorm_differs_from_joint_flat_rms():
+    """Guard against regressing to flat-RMSNorm-over-(n_heads*head_dim).
+
+    Per-head normalization treats heads independently, so when heads have
+    different scales the output differs from a single joint RMS over the
+    flattened dim. The old buggy q_b_layernorm did the joint version.
+    """
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    if not torch.cuda.is_available():
+        import pytest
+
+        pytest.skip("RMSNorm fast paths require CUDA")
+
+    head_dim, eps = 8, 1e-6
+    head_scales = torch.tensor([1.0, 10.0, 0.1, 1.0], dtype=torch.bfloat16)
+    n_heads = head_scales.numel()
+    device = "cuda"
+    torch.manual_seed(0)
+    base = torch.randn(2, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = (base * head_scales.to(device).view(1, n_heads, 1)).reshape(2, n_heads * head_dim)
+
+    per_head_norm = RMSNorm(
+        hidden_size=head_dim, eps=eps, dtype=torch.bfloat16, has_weights=False, device=device
+    )
+    per_head = per_head_norm(q.view(-1, head_dim)).view_as(q)
+
+    joint_norm = RMSNorm(
+        hidden_size=n_heads * head_dim,
+        eps=eps,
+        dtype=torch.bfloat16,
+        has_weights=False,
+        device=device,
+    )
+    joint = joint_norm(q)
+
+    # Per-head and joint differ substantially when heads have wildly different
+    # scales — they only agree when every head has the same RMS, which the
+    # head_scales tensor breaks by construction.
+    assert not torch.allclose(per_head, joint, atol=0.1)
+
+
+def test_mewtwo_mla_q_b_layernorm_init_and_forward_shape():
+    """MLA Mewtwo branch must use the standard RMSNorm op sized to
+    ``qk_head_dim`` with ``has_weights=False`` (V4 ckpt has no
+    ``q_b_layernorm.weight``), and call it on a ``[N*n_heads, head_dim]``
+    view of q so the per-row reduction matches per-head reduction."""
+    from tensorrt_llm._torch.modules.attention import MLA
+
+    init_src = inspect.getsource(MLA.__init__)
+    forward_src = inspect.getsource(MLA.forward_impl_with_mewtwo)
+
+    assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
+    assert "has_weights=False" in init_src
+    assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
 
 
 def test_mewtwo_sanity():

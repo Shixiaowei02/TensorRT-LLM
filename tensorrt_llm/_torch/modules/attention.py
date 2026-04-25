@@ -1268,10 +1268,11 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
             if self.is_mewtwo:
-                self.q_b_layernorm = RMSNorm(hidden_size=self.num_heads_tp *
-                                             self.qk_head_dim,
+                # V4 unweighted per-head RMS on Q post-wq_b; q.view(-1, head_dim) at call site.
+                self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim,
                                              eps=rms_norm_eps,
-                                             dtype=dtype)
+                                             dtype=dtype,
+                                             has_weights=False)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -2016,7 +2017,9 @@ class MLA(nn.Module):
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
-        q = self.q_b_layernorm(self.q_b_proj(q))
+        q = self.q_b_proj(q)
+        # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm reduces per-head.
+        q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
         # Indexer
         topk_indices = None
         if self.indexer is not None:
