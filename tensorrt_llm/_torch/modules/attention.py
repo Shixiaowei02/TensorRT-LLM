@@ -955,8 +955,8 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
-    if mla_layer.is_mewtwo:
-        mla_layer.forward_impl_with_mewtwo(position_ids,
+    if mla_layer.is_deepseek_v4:
+        mla_layer.forward_impl_with_deepseek_v4(position_ids,
                                            hidden_states,
                                            metadata,
                                            output=output)
@@ -1180,13 +1180,13 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
-        # Currently only DSA/Mewtwo sparse attention are supported.
-        self.is_dsa, self.is_mewtwo = False, False
+        # Currently only DSA/DeepSeek-V4 sparse attention are supported.
+        self.is_dsa, self.is_deepseek_v4 = False, False
         if config is not None and config.sparse_attention_config is not None:
             if config.sparse_attention_config.algorithm == "dsa":
                 self.is_dsa = True
-            elif config.sparse_attention_config.algorithm == "mewtwo":
-                self.is_mewtwo = True
+            elif config.sparse_attention_config.algorithm == "deepseek_v4":
+                self.is_deepseek_v4 = True
             else:
                 raise ValueError(
                     f"Invalid sparse attention algorithm: {config.sparse_attention_config.algorithm}"
@@ -1267,7 +1267,7 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
-            if self.is_mewtwo:
+            if self.is_deepseek_v4:
                 # V4 unweighted per-head RMS on Q post-wq_b; q.view(-1, head_dim) at call site.
                 self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim,
                                              eps=rms_norm_eps,
@@ -1303,7 +1303,7 @@ class MLA(nn.Module):
                                       dtype=dtype,
                                       eps=rms_norm_eps)
 
-        if not self.is_mewtwo:
+        if not self.is_deepseek_v4:
             self.kv_b_proj = Linear(
                 self.kv_lora_rank,
                 self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1337,7 +1337,7 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
         self.mapping_o = mapping_o
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             self.o_a_proj = nn.Parameter(
                 torch.empty(
                     (self.n_local_groups, self.o_lora_rank,
@@ -1398,14 +1398,14 @@ class MLA(nn.Module):
             kv_lora_rank=self.kv_lora_rank,
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim if self.is_mewtwo else self.kv_lora_rank,
+            v_head_dim=self.v_head_dim if self.is_deepseek_v4 else self.kv_lora_rank,
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             sparse_attention_config=config.sparse_attention_config,
             dtype=dtype,
             aux_stream=aux_stream,
-            rope_append=not self.is_mewtwo,
+            rope_append=not self.is_deepseek_v4,
         )
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
@@ -1423,7 +1423,7 @@ class MLA(nn.Module):
                 is_neox=pos_embd_params.is_neox,
             )
 
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             self.inverse_rotary_emb = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.qk_rope_head_dim,
@@ -1449,7 +1449,7 @@ class MLA(nn.Module):
         # by DSA for the short-seq path (dense attention, no sparse config).
         _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
                           and not self.apply_rotary_emb)
-        if (not self.is_dsa or _short_seq_mha) and not self.is_mewtwo:
+        if (not self.is_dsa or _short_seq_mha) and not self.is_deepseek_v4:
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1498,7 +1498,7 @@ class MLA(nn.Module):
 
         # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
         # which can be modified after __init__
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             has_fp8_block_scales = (
                 self.o_b_proj.quant_config and
                 self.o_b_proj.quant_config.quant_mode.has_fp8_block_scales())
@@ -1520,7 +1520,7 @@ class MLA(nn.Module):
         self.k_b_proj_trans_dequant = None
         self.v_b_proj_dequant = None
         self.o_a_proj_dequant = None
-        if has_fp8_block_scales and not self.is_mewtwo:
+        if has_fp8_block_scales and not self.is_deepseek_v4:
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
                     (
@@ -1631,7 +1631,7 @@ class MLA(nn.Module):
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
         num_tokens = hidden_states.shape[0]
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             hidden_size = self.num_heads_tp_cp * self.v_head_dim
         else:
             hidden_size = self.o_proj.in_features
@@ -1650,7 +1650,7 @@ class MLA(nn.Module):
         q = (q * attn_scale).to(q.dtype)
         return q
 
-    def _mewtwo_o_proj(self, attn_out_latent: torch.Tensor,
+    def _deepseek_v4_o_proj(self, attn_out_latent: torch.Tensor,
                        position_ids: torch.Tensor) -> torch.Tensor:
         num_tokens = attn_out_latent.shape[0]
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
@@ -1978,12 +1978,12 @@ class MLA(nn.Module):
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             )
 
-    def forward_impl_with_mewtwo(self, position_ids: Optional[torch.Tensor],
+    def forward_impl_with_deepseek_v4(self, position_ids: Optional[torch.Tensor],
                                  hidden_states: torch.Tensor,
                                  attn_metadata: AttentionMetadata,
                                  output: torch.Tensor) -> None:
         """
-        Forward pass for the MLA module with Mewtwo (always in MQA mode).
+        Forward pass for the MLA module with DeepSeek-V4 (always in MQA mode).
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
@@ -1993,7 +1993,7 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        assert self.mha is None and self.mqa is not None, "Mewtwo is only supported in MQA mode"
+        assert self.mha is None and self.mqa is not None, "DeepSeek-V4 is only supported in MQA mode"
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
         num_generations = attn_metadata.num_generations
@@ -2206,7 +2206,7 @@ class MLA(nn.Module):
                                                    latent_cache=latent_cache,
                                                    topk_indices=topk_indices)
         else:
-            assert not self.is_mewtwo, "Mewtwo is not supported on pre-blackwell GPUs."
+            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
                                                         attn_metadata,
@@ -2235,7 +2235,7 @@ class MLA(nn.Module):
                                                       latent_cache=latent_cache,
                                                       topk_indices=topk_indices)
         else:
-            assert not self.is_mewtwo, "Mewtwo is not supported on pre-blackwell GPUs."
+            assert not self.is_deepseek_v4, "DeepSeek-V4 is not supported on pre-blackwell GPUs."
             return self.forward_sparse_mla_kvcache_bf16(q,
                                                         latent_cache,
                                                         attn_metadata,
@@ -2603,7 +2603,7 @@ class MLA(nn.Module):
                 dtype=torch.uint8,
                 device=q.device)
 
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             fused_q = q
             self.mqa.mla_rope_generation(
                 fused_q,
@@ -2708,7 +2708,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
-            output=output if self.is_mewtwo else None,
+            output=output if self.is_deepseek_v4 else None,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
@@ -2723,10 +2723,10 @@ class MLA(nn.Module):
         )
         fused_q = None
 
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():
                 raise RuntimeError(
-                    "Mewtwo + CP Helix is not supported: "
+                    "DeepSeek-V4 + CP Helix is not supported: "
                     "_helix_post_process returns a different tensor, "
                     "bypassing the pre-allocated output buffer.")
             assert attn_out_latent.data_ptr() == output.data_ptr(), \
@@ -2782,7 +2782,7 @@ class MLA(nn.Module):
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             fused_q = q
         else:
             # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
@@ -2842,7 +2842,7 @@ class MLA(nn.Module):
             attn_metadata,
             attention_input_type=attention_input_type,
             out_scale=self.out_scale,
-            output=output if self.is_mewtwo else None,
+            output=output if self.is_deepseek_v4 else None,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
@@ -2850,10 +2850,10 @@ class MLA(nn.Module):
         )
         fused_q = None
 
-        if self.is_mewtwo:
+        if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():
                 raise RuntimeError(
-                    "Mewtwo + CP Helix is not supported: "
+                    "DeepSeek-V4 + CP Helix is not supported: "
                     "_helix_post_process returns a different tensor, "
                     "bypassing the pre-allocated output buffer.")
             assert attn_out_latent.data_ptr() == output.data_ptr(), \
@@ -3061,8 +3061,8 @@ class MLA(nn.Module):
                     q, compressed_kv, k_pe, latent_cache, indexer_intermediates,
                     position_ids, self.layer_idx_str, attn_output)
             else:
-                # Mewtwo and vanilla MLA both use the single custom op.
-                # Mewtwo dispatches to forward_impl_with_mewtwo inside.
+                # DeepSeek-V4 and vanilla MLA both use the single custom op.
+                # DeepSeek-V4 dispatches to forward_impl_with_deepseek_v4 inside.
                 torch.ops.trtllm.mla_custom_op_inplace(hidden_states,
                                                        position_ids,
                                                        self.layer_idx_str,
@@ -3073,8 +3073,8 @@ class MLA(nn.Module):
                                        hidden_states,
                                        attn_metadata,
                                        output=attn_output)
-        elif self.is_mewtwo:
-            self.forward_impl_with_mewtwo(position_ids,
+        elif self.is_deepseek_v4:
+            self.forward_impl_with_deepseek_v4(position_ids,
                                           hidden_states,
                                           attn_metadata,
                                           output=attn_output)
@@ -3085,8 +3085,8 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        if self.is_mewtwo:
-            attn_output = self._mewtwo_o_proj(attn_output, position_ids)
+        if self.is_deepseek_v4:
+            attn_output = self._deepseek_v4_o_proj(attn_output, position_ids)
         else:
             attn_output = _helix_cp_output_projection(
                 self.o_proj, attn_output, attn_metadata, all_reduce_params,
@@ -3114,8 +3114,8 @@ class MLA(nn.Module):
         return weight_param, scale_param
 
     def post_load_weights(self):
-        # In mewtwo mode, kv_b_proj doesn't exist
-        if self.is_mewtwo:
+        # In DeepSeek-V4 mode, kv_b_proj doesn't exist
+        if self.is_deepseek_v4:
             has_fp8_block_scales = False
         else:
             has_fp8_block_scales = (

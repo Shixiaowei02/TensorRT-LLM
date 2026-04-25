@@ -384,7 +384,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.compress_ratios = self.sparse_attention_config.compress_ratios
 
         # Effective tokens-per-block for the indexer k-cache slot mapping.
-        # Mewtwo's indexer cache uses layer-dependent compressed block sizes
+        # DeepSeek-V4's indexer cache uses layer-dependent compressed block sizes
         # (tokens_per_block // compress_ratio), so slot mappings must be built
         # against that stride — not kv_cache_manager.tokens_per_block directly.
         tpb = self.kv_cache_manager.tokens_per_block

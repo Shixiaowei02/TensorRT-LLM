@@ -17,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import (MewtwoSparseAttentionConfig,
+from tensorrt_llm.llmapi import (DeepSeekV4SparseAttentionConfig,
                                  SkipSoftmaxAttentionConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1970,7 +1970,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
                 if isinstance(self.sparse_attention_config,
-                              MewtwoSparseAttentionConfig):
+                              DeepSeekV4SparseAttentionConfig):
                     # TODO: refactor this part of code.
                     if hasattr(metadata, 'sparse_mla_topk_lens'):
                         num_ctx_tokens = metadata.num_ctx_tokens

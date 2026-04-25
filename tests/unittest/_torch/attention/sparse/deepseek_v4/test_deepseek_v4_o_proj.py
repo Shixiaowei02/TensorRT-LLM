@@ -1,5 +1,5 @@
 """
-Test for Mewtwo output projection (_mewtwo_o_proj).
+Test for DeepSeek-V4 output projection (_deepseek_v4_o_proj).
 """
 
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._torch.modules.attention import MLA
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.llm_args import MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -23,7 +23,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..test_sparse_mla_forward import RopeConfig, _calc_diff, apply_rotary_emb, precompute_freqs_cis
 
 
-def calculate_reference_mewtwo_o_proj(
+def calculate_reference_deepseek_v4_o_proj(
     attn_out_latent,
     o_a_proj,
     o_b_proj_weight,
@@ -35,7 +35,7 @@ def calculate_reference_mewtwo_o_proj(
     is_fp8: bool = False,
 ):
     """
-    Reference implementation for Mewtwo output projection based on ref/model.py.
+    Reference implementation for DeepSeek-V4 output projection based on ref/model.py.
 
     Args:
         attn_out_latent: [num_tokens, num_heads, qk_head_dim] attention output
@@ -77,10 +77,10 @@ def calculate_reference_mewtwo_o_proj(
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("num_tokens", [1, 16, 128])
 @pytest.mark.parametrize("dtype_str", ["bf16", "fp8"])
-def test_mewtwo_o_proj(num_tokens: int, dtype_str: str):
-    """Test Mewtwo output projection (_mewtwo_o_proj)."""
+def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
+    """Test DeepSeek-V4 output projection (_deepseek_v4_o_proj)."""
     print(
-        f"\n{'=' * 80}\nTesting: mewtwo_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
+        f"\n{'=' * 80}\nTesting: deepseek_v4_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
     )
 
     if dtype_str == "fp8" and get_sm_version() < 100:
@@ -122,17 +122,17 @@ def test_mewtwo_o_proj(num_tokens: int, dtype_str: str):
         max_position_embeddings=max_position_embeddings,
         rope_theta=10000.0,
         qk_rope_head_dim=qk_rope_head_dim,
-        model_type="mewtwo",
+        model_type="deepseek_v4",
     )
 
-    # Setup model config with mewtwo sparse attention
+    # Setup model config with deepseek_v4 sparse attention
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     pretrained_config = SimpleNamespace(
         rms_norm_eps=1e-6,
     )
 
-    # Create sparse attention config for mewtwo
-    sparse_config = MewtwoSparseAttentionConfig(
+    # Create sparse attention config for deepseek_v4
+    sparse_config = DeepSeekV4SparseAttentionConfig(
         index_n_heads=32,
         index_head_dim=128,
         index_topk=512,
@@ -157,7 +157,7 @@ def test_mewtwo_o_proj(num_tokens: int, dtype_str: str):
         is_neox=False,
     )
 
-    # Create MLA module with mewtwo configuration
+    # Create MLA module with deepseek_v4 configuration
     mla = MLA(
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
@@ -228,13 +228,13 @@ def test_mewtwo_o_proj(num_tokens: int, dtype_str: str):
             mla.o_b_proj.weight_scale.data = fp8_b_scale
 
     # Generate test inputs
-    # Note: for mewtwo, kv_lora_rank equals qk_head_dim
+    # Note: for deepseek_v4, kv_lora_rank equals qk_head_dim
     attn_out_latent = torch.randn(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # Call the mewtwo output projection (mla_rope_inplace modifies attn_out_latent
+    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
     # in-place, so clone before passing to preserve original for reference)
-    output = mla._mewtwo_o_proj(attn_out_latent.clone(), position_ids)
+    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
     # Calculate reference output
     if dtype_str == "bf16":
@@ -255,7 +255,7 @@ def test_mewtwo_o_proj(num_tokens: int, dtype_str: str):
         rope_config.rope_scaling["beta_slow"],
     ).to(device)
 
-    reference_output = calculate_reference_mewtwo_o_proj(
+    reference_output = calculate_reference_deepseek_v4_o_proj(
         attn_out_latent=attn_out_latent,
         o_a_proj=o_a_proj_ref,
         o_b_proj_weight=o_b_proj_weight_ref,

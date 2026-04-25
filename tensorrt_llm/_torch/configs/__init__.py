@@ -1,4 +1,4 @@
 from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
-from tensorrt_llm._torch.configs.mewtwo import MewtwoConfig
+from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 
-__all__ = ["DeepseekV3Config", "MewtwoConfig"]
+__all__ = ["DeepseekV3Config", "DeepseekV4Config"]

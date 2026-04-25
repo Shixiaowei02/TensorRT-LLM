@@ -14,17 +14,17 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
 from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float, rotate_activation
-from ..kernel import mewtwo_local_to_global_indices
+from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-MEWTWO_SPARSE_RATIO = 4
-MEWTWO_OVERLAP_COMPRESSOR_RATIO = 4
+DEEPSEEK_V4_SPARSE_RATIO = 4
+DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
 
 
-class MewtwoAttentionType(Enum):
+class DeepseekV4AttentionType(Enum):
     SWA = 0
     COMPRESS = 1
     COMPRESSOR_STATE = 2
@@ -38,14 +38,14 @@ def is_overlap_compressor(compress_ratio: int) -> bool:
     """
     Check if the compressor of the given layer is working in the overlap mode.
     """
-    return compress_ratio == MEWTWO_OVERLAP_COMPRESSOR_RATIO
+    return compress_ratio == DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO
 
 
 def is_sparse_layer(compress_ratio: int) -> bool:
     """
     Check if the given layer is a sparse layer.
     """
-    return compress_ratio == MEWTWO_SPARSE_RATIO
+    return compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
 
 
 def is_compress_layer(compress_ratio: int) -> bool:
@@ -55,49 +55,49 @@ def is_compress_layer(compress_ratio: int) -> bool:
     return compress_ratio > 1
 
 
-def compress_ratio_has_attention(compress_ratio: int, attn_type: MewtwoAttentionType) -> bool:
+def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4AttentionType) -> bool:
     """
     Check if the given compress ratio has the given attention type.
     """
     is_sparse = is_sparse_layer(compress_ratio)
     is_compress = is_compress_layer(compress_ratio)
 
-    if attn_type == MewtwoAttentionType.SWA:
+    if attn_type == DeepseekV4AttentionType.SWA:
         return True
-    elif attn_type == MewtwoAttentionType.COMPRESS:
+    elif attn_type == DeepseekV4AttentionType.COMPRESS:
         return is_compress
-    elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
         return is_compress
-    elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return is_compress
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return is_sparse
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
         return is_sparse
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return is_sparse
 
 
 def get_attn_dim(
-    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: MewtwoAttentionType
+    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: DeepseekV4AttentionType
 ) -> int:
     """
     Get the dimension of the attention type for a specific layer.
     """
     state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
-    if attn_type == MewtwoAttentionType.SWA:
+    if attn_type == DeepseekV4AttentionType.SWA:
         return head_dim
-    elif attn_type == MewtwoAttentionType.COMPRESS:
+    elif attn_type == DeepseekV4AttentionType.COMPRESS:
         return head_dim
-    elif attn_type == MewtwoAttentionType.COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
         return state_factor * head_dim
-    elif attn_type == MewtwoAttentionType.COMPRESSOR_SCORE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return state_factor * head_dim
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return index_head_dim
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
         return state_factor * index_head_dim
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return state_factor * index_head_dim
 
 
@@ -105,7 +105,7 @@ def get_token_bytes(
     head_dim: int,
     index_head_dim: int,
     compress_ratio: int,
-    attn_type: MewtwoAttentionType,
+    attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
 ) -> int:
     """
@@ -132,30 +132,30 @@ def get_token_bytes(
     dtype_bytes = 1 if has_fp8_kv_cache else 2
     # (indexer) compressor state and score always use float32
     if attn_type in [
-        MewtwoAttentionType.COMPRESSOR_STATE,
-        MewtwoAttentionType.COMPRESSOR_SCORE,
-        MewtwoAttentionType.INDEXER_COMPRESSOR_STATE,
-        MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
     ]:
         dtype_bytes = 4  # (indexer) compressor state and score use float32
     # indexer compress always uses fp8
-    elif attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         dtype_bytes = 1  # indexer compress use fp8
 
     scale_size = 0
     # indexer compress has scaling factor
-    if attn_type == MewtwoAttentionType.INDEXER_COMPRESS:
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         quant_block_size = 128
         scale_size = index_head_dim // quant_block_size * 4  # indexer scale is float32
 
     return attn_dim * dtype_bytes + scale_size
 
 
-class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
+class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
     # The set of (compress ratio, attention type) for the layers
-    attention_type_set: Set[Tuple[int, MewtwoAttentionType]]
+    attention_type_set: Set[Tuple[int, DeepseekV4AttentionType]]
     # The number of total compressed tokens for each compress ratio
     num_total_compressed_tokens: Dict[int, int] = {}
     # The max number of context compressed tokens for each compress ratio
@@ -185,24 +185,24 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         attention_types = []
         for compress_ratio in self.compress_ratio_set:
             if compress_ratio == 1:
-                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
+                attention_types.append((self.compress_ratios[0], DeepseekV4AttentionType.SWA))
             elif compress_ratio == 4:
-                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESS))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_SCORE))
-                attention_types.append((compress_ratio, MewtwoAttentionType.INDEXER_COMPRESS))
+                attention_types.append((self.compress_ratios[0], DeepseekV4AttentionType.SWA))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
                 attention_types.append(
-                    (compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_STATE)
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE)
                 )
                 attention_types.append(
-                    (compress_ratio, MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE)
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
                 )
             else:
-                attention_types.append((self.compress_ratios[0], MewtwoAttentionType.SWA))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESS))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_STATE))
-                attention_types.append((compress_ratio, MewtwoAttentionType.COMPRESSOR_SCORE))
+                attention_types.append((self.compress_ratios[0], DeepseekV4AttentionType.SWA))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
         self.attention_type_set = set(attention_types)
 
         # Create buffers for the compressor
@@ -397,8 +397,8 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             1,  # beam_width
             0,  # num_contexts=0 (indexer always uses gen-style copy index)
             num_seqs,
-            MewtwoAttentionType.INDEXER_COMPRESS,
-            MEWTWO_SPARSE_RATIO,
+            DeepseekV4AttentionType.INDEXER_COMPRESS,
+            DEEPSEEK_V4_SPARSE_RATIO,
         )
         num_cols = offsets.shape[1]
         self.host_indexer_k_cache_block_offsets[:num_seqs, :num_cols] = offsets[:num_seqs]
@@ -410,7 +410,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def prepare_for_block_tables(self):
         """Prepare block tables for all attention types.
 
-        Delegates offset computation to MewtwoCacheManager.get_batch_block_offsets
+        Delegates offset computation to DeepseekV4CacheManager.get_batch_block_offsets
         (single get_copy_index call, deduplicated by pool), then copies to device.
         """
         num_seqs = self.num_seqs
@@ -428,7 +428,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.host_block_tables[key][:num_seqs], non_blocking=True
             )
 
-    def prepare_for_mewtwo_indices(self, token_positions=None):
+    def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
         window_size = self.sparse_attention_config.window_size
         device = self.swa_local_indices_cuda.device
@@ -447,7 +447,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
-        self._prepare_mewtwo_indices_compiled(
+        self._prepare_deepseek_v4_indices_compiled(
             token_positions,
             window_size,
             self.max_compressed_indices[128],
@@ -460,7 +460,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
-    def _prepare_mewtwo_indices_compiled(
+    def _prepare_deepseek_v4_indices_compiled(
         token_positions: torch.Tensor,
         window_size: int,
         max_compressed_indices_128: int,
@@ -528,13 +528,13 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.swa_buffer_ptrs = {
             layer_idx: self.kv_cache_manager.get_buffers(
-                layer_idx, MewtwoAttentionType.SWA
+                layer_idx, DeepseekV4AttentionType.SWA
             ).data_ptr()
             for layer_idx in self.kv_cache_manager.pp_layers
         }
         self.compressed_buffer_ptrs = {
             layer_idx: self.kv_cache_manager.get_buffers(
-                layer_idx, MewtwoAttentionType.COMPRESS
+                layer_idx, DeepseekV4AttentionType.COMPRESS
             ).data_ptr()
             for layer_idx in self.kv_cache_manager.pp_layers
             if is_compress_layer(extend_compress_ratios[layer_idx])
@@ -564,7 +564,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cached_token_lens[:num_requests], non_blocking=True
         )
 
-        # Prepare cu_seq_lens early — needed by prepare_for_mewtwo_indices
+        # Prepare cu_seq_lens early — needed by prepare_for_deepseek_v4_indices
         self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
@@ -573,7 +573,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
-        has_sparse_layers = MEWTWO_SPARSE_RATIO in self.compress_ratio_set
+        has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
 
         # For indexer k cache (only needed when sparse layers exist)
         if has_sparse_layers:
@@ -585,12 +585,12 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For block offsets
         self.prepare_for_block_tables()
 
-        # For mewtwo indices
-        self.prepare_for_mewtwo_indices()
+        # For DeepSeek-V4 indices
+        self.prepare_for_deepseek_v4_indices()
 
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
-            MewtwoIndexer.prepare(metadata=self)
+            DeepseekV4Indexer.prepare(metadata=self)
 
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
@@ -700,7 +700,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
     def on_update_kv_lens(self):
-        """Recompute kv-lens-dependent mewtwo metadata on device."""
+        """Recompute kv-lens-dependent DeepSeek-V4 metadata on device."""
         super().on_update_kv_lens()
 
         batch_size = self.num_seqs
@@ -734,7 +734,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.req_idx_per_token,
         )
 
-        self.prepare_for_mewtwo_indices(token_positions)
+        self.prepare_for_deepseek_v4_indices(token_positions)
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
@@ -877,7 +877,7 @@ class MewtwoTrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             ).to(torch.int)
 
 
-class MewtwoIndexer(Indexer):
+class DeepseekV4Indexer(Indexer):
     def __init__(
         self,
         quant_config: Optional[QuantConfig],
@@ -949,14 +949,14 @@ class MewtwoIndexer(Indexer):
         return q
 
     def _update_k_cache(self, k_fp8, k_scale, metadata):
-        """No-op: Mewtwo's compressor writes to the indexer k cache directly."""
+        """No-op: DeepSeek-V4's compressor writes to the indexer k cache directly."""
         pass
 
     def forward(
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
-        metadata: MewtwoTrtllmAttentionMetadata,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ):
         # compress k
@@ -993,8 +993,8 @@ class MewtwoIndexer(Indexer):
         return topk_indices
 
 
-class MewtwoTrtllmAttention(TrtllmAttention):
-    Metadata = MewtwoTrtllmAttentionMetadata
+class DeepseekV4TrtllmAttention(TrtllmAttention):
+    Metadata = DeepseekV4TrtllmAttentionMetadata
 
     def __init__(
         self,
@@ -1014,7 +1014,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         **kwargs,
     ):
         assert sparse_attention_config is not None, (
-            "sparse_attention_config is required for MewtwoTrtllmAttention and cannot be None"
+            "sparse_attention_config is required for DeepseekV4TrtllmAttention and cannot be None"
         )
         TrtllmAttention.__init__(
             self,
@@ -1035,7 +1035,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
 
         if self.compress_ratio == 4:
-            self.indexer = MewtwoIndexer(
+            self.indexer = DeepseekV4Indexer(
                 quant_config,
                 pos_embd_params,
                 mla_params,
@@ -1075,7 +1075,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: MewtwoTrtllmAttentionMetadata,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
         hidden_states: Optional[torch.Tensor] = None,
         qr: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
@@ -1103,7 +1103,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             self.head_dim,
             index_head_dim,
             self.compress_ratio,
-            MewtwoAttentionType.SWA,
+            DeepseekV4AttentionType.SWA,
             has_fp8_kv_cache,
         )
 
@@ -1118,13 +1118,13 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         # Use global req_id directly
         req_id = metadata.req_idx_per_token[start_idx:end_idx]
         swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
-        block_table_swa = metadata.block_tables[(1, MewtwoAttentionType.SWA)]
+        block_table_swa = metadata.block_tables[(1, DeepseekV4AttentionType.SWA)]
 
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
             block_table_compressed = metadata.block_tables[
-                (self.compress_ratio, MewtwoAttentionType.COMPRESS)
+                (self.compress_ratio, DeepseekV4AttentionType.COMPRESS)
             ]
             if self.compress_ratio == 4:
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
@@ -1137,7 +1137,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
             block_table_compressed = None
             compressed_local_indices = None
 
-        global_indices = mewtwo_local_to_global_indices(
+        global_indices = deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table_swa,
             swa_local_indices=swa_local_indices,
@@ -1159,7 +1159,7 @@ class MewtwoTrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: MewtwoTrtllmAttentionMetadata,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
         **kwargs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None

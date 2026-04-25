@@ -21,7 +21,7 @@ class HCState:
       ``post_mapping``; the 4 tensors carry the inputs needed for the next
       layer to absorb it via ``fused_hc``.
 
-    Only ``modeling_mewtwo.py`` depends on this shape — the kernel-level
+    Only ``modeling_deepseekv4.py`` depends on this shape — the kernel-level
     ``mHC.fused_hc`` still returns a 4-tuple so low-level callers (tests,
     benchmarks) stay unchanged.
     """

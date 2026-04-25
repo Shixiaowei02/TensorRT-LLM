@@ -19,7 +19,7 @@ from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          MewtwoSparseAttentionConfig,
+                                          DeepSeekV4SparseAttentionConfig,
                                           MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -568,7 +568,8 @@ class ModelConfig(Generic[TConfig]):
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave)
-                elif pretrained_config.architectures[0] == "MewtwoForCausalLM":
+                elif pretrained_config.architectures[
+                        0] == "DeepseekV4ForCausalLM":
                     indexer_config = update_sparse_attention_indexer_config(
                         pretrained_config, kwargs)
                     sparse_attention_config = kwargs.get(
@@ -578,7 +579,17 @@ class ModelConfig(Generic[TConfig]):
                         window_size = sparse_attention_config.window_size
                     else:
                         compress_ratios = pretrained_config.compress_ratios
-                        window_size = pretrained_config.window_size
+                        # DeepSeek-V4 HF config names this `sliding_window`;
+                        # the internal config aliases it to `window_size`.
+                        window_size = getattr(pretrained_config, 'window_size',
+                                              None)
+                        if window_size is None:
+                            window_size = pretrained_config.sliding_window
+
+                    # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
+                    # to 1 internally so cache allocation math works. The
+                    # external config keeps the original semantics.
+                    compress_ratios = [1 if r == 0 else r for r in compress_ratios]
 
                     # Adjust compress_ratios length based on MTP config.
                     num_base_layers = pretrained_config.num_hidden_layers
@@ -598,7 +609,7 @@ class ModelConfig(Generic[TConfig]):
                                 :num_base_layers]
 
                     kwargs[
-                        'sparse_attention_config'] = MewtwoSparseAttentionConfig(
+                        'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
                             compress_ratios=compress_ratios,
                             window_size=window_size,
                             **indexer_config)

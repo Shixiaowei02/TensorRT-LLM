@@ -14,11 +14,11 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
 
 if TYPE_CHECKING:
-    from .mewtwo import MewtwoTrtllmAttentionMetadata
+    from .deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 
 # When set to "1", forces wkv_gate to use full FP32 computation (via nn.Linear)
 # instead of the default TF32 path (via F.linear + allow_tf32).
-_USE_FP32_COMPRESSOR = os.environ.get("MEWTWO_COMPRESSOR_FP32", "0") == "1"
+_USE_FP32_COMPRESSOR = os.environ.get("DEEPSEEK_V4_COMPRESSOR_FP32", "0") == "1"
 
 
 @maybe_compile(dynamic=True)
@@ -130,7 +130,7 @@ class Compressor(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        metadata: "MewtwoTrtllmAttentionMetadata",
+        metadata: "DeepseekV4TrtllmAttentionMetadata",
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Forward pass for paged KV compression.
 
@@ -145,7 +145,7 @@ class Compressor(nn.Module):
             - no compressed tokens:    (None, None)
         """
         # Import at runtime to avoid circular dependency
-        from .mewtwo import MewtwoAttentionType
+        from .deepseek_v4 import DeepseekV4AttentionType
 
         # Extract metadata
         num_contexts = metadata.num_contexts
@@ -155,13 +155,13 @@ class Compressor(nn.Module):
 
         # Determine attention types based on whether this is an indexer compressor
         if self.is_indexer:
-            compress_type = MewtwoAttentionType.INDEXER_COMPRESS
-            state_type = MewtwoAttentionType.INDEXER_COMPRESSOR_STATE
-            score_type = MewtwoAttentionType.INDEXER_COMPRESSOR_SCORE
+            compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
+            state_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+            score_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE
         else:
-            compress_type = MewtwoAttentionType.COMPRESS
-            state_type = MewtwoAttentionType.COMPRESSOR_STATE
-            score_type = MewtwoAttentionType.COMPRESSOR_SCORE
+            compress_type = DeepseekV4AttentionType.COMPRESS
+            state_type = DeepseekV4AttentionType.COMPRESSOR_STATE
+            score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
         # Get cache buffers
         kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
@@ -189,7 +189,7 @@ class Compressor(nn.Module):
         # Project input to KV and score.
         # Default: TF32 via F.linear under allow_tf32 context (explicit
         #   CUBLAS_COMPUTE_32F_FAST_TF32 → TF32 tensor cores on Ampere+).
-        # Fallback: strict FP32 via nn.Linear when MEWTWO_COMPRESSOR_FP32=1.
+        # Fallback: strict FP32 via nn.Linear when DEEPSEEK_V4_COMPRESSOR_FP32=1.
         if _USE_FP32_COMPRESSOR:
             kv_score = self.wkv_gate(_to_float(x))
         else:

@@ -14,8 +14,8 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo import \
-    MewtwoCacheManager
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+    DeepseekV4CacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -25,12 +25,12 @@ from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
                                           KvCacheConfig,
-                                          MewtwoSparseAttentionConfig)
+                                          DeepSeekV4SparseAttentionConfig)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .mewtwo.test_compressor_module import RefCompressor
+from .deepseek_v4.test_compressor_module import RefCompressor
 
 try:
     HAS_FLASH_MLA = True
@@ -120,7 +120,7 @@ BATCH_SPECS = {
 def apply_rotary_emb(x: torch.Tensor,
                      freqs_cis: torch.Tensor,
                      inverse: bool = False) -> torch.Tensor:
-    """Apply rotary positional embeddings for Mewtwo."""
+    """Apply rotary positional embeddings for DeepSeek-V4."""
     y = x
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
@@ -136,7 +136,7 @@ def apply_rotary_emb(x: torch.Tensor,
 
 def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
                          beta_slow) -> torch.Tensor:
-    """Precompute rotary embeddings for Mewtwo."""
+    """Precompute rotary embeddings for DeepSeek-V4."""
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
         return dim * math.log(
@@ -189,7 +189,7 @@ def apply_rotary_embedding(
 ) -> torch.Tensor:
     """
     Apply rotary position embedding for DSA.
-    For mewtwo, supports inverse rotation by negating sin.
+    For deepseek_v4, supports inverse rotation by negating sin.
     """
 
     def rotate_half(x):
@@ -379,7 +379,7 @@ def calculate_reference_output_mixed(q_ctx, q_gen, kv_c_all, k_pe_all, W_UK,
     return torch.cat(ref_results, dim=0)
 
 
-def calculate_reference_output_mewtwo_prefill(hidden_states,
+def calculate_reference_output_deepseek_v4_prefill(hidden_states,
                                               indices,
                                               seq_lens,
                                               q,
@@ -397,7 +397,7 @@ def calculate_reference_output_mewtwo_prefill(hidden_states,
                                               n_local_groups,
                                               window_size=512,
                                               compress_ratio=4):
-    """Reference for mewtwo prefill.
+    """Reference for deepseek_v4 prefill.
 
     Implements attention over:
     1. Sliding window: last window_size tokens
@@ -461,7 +461,7 @@ def calculate_reference_output_mewtwo_prefill(hidden_states,
                 if max_compressed_idx > 0:
                     attn_mask[i, seq_len:seq_len + max_compressed_idx] = 0
 
-        # Expand KV for multi-head (mewtwo uses MQA - single KV head for all Q heads)
+        # Expand KV for multi-head (deepseek_v4 uses MQA - single KV head for all Q heads)
         k_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
         # Use full kv_combined as V (not just first v_head_dim dimensions) to match reference
         v_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
@@ -487,7 +487,7 @@ def calculate_reference_output_mewtwo_prefill(hidden_states,
     return torch.cat(results, dim=0).flatten(1)
 
 
-def calculate_reference_output_mewtwo_generation(hidden_states,
+def calculate_reference_output_deepseek_v4_generation(hidden_states,
                                                  gen_indices,
                                                  seq_lens,
                                                  q,
@@ -506,7 +506,7 @@ def calculate_reference_output_mewtwo_generation(hidden_states,
                                                  n_local_groups,
                                                  window_size=512,
                                                  compress_ratio=4):
-    """Reference for mewtwo generation with cached window_kv and compressed_kv.
+    """Reference for deepseek_v4 generation with cached window_kv and compressed_kv.
 
     For generation, we have:
     - 1 new query token and its latent KV
@@ -601,7 +601,7 @@ def calculate_reference_output_mewtwo_generation(hidden_states,
                                 device=device,
                                 dtype=q_seq.dtype)
 
-        # Expand KV for multi-head (mewtwo uses MQA - single KV head for all Q heads)
+        # Expand KV for multi-head (deepseek_v4 uses MQA - single KV head for all Q heads)
         k_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
         v_combined = kv_combined.unsqueeze(1).expand(-1, num_heads, -1)
 
@@ -625,7 +625,7 @@ def calculate_reference_output_mewtwo_generation(hidden_states,
     return torch.cat(results, dim=0).flatten(1)
 
 
-def calculate_reference_output_mewtwo_mixed(hidden_states,
+def calculate_reference_output_deepseek_v4_mixed(hidden_states,
                                             q_ctx,
                                             q_gen,
                                             kv_data,
@@ -646,12 +646,12 @@ def calculate_reference_output_mewtwo_mixed(hidden_states,
                                             n_local_groups,
                                             window_size=512,
                                             compress_ratio=4):
-    """Reference for mewtwo mixed batch (combines context and generation)."""
+    """Reference for deepseek_v4 mixed batch (combines context and generation)."""
     ref_results = [None] * len(seq_lens)
 
     # Process context requests
     if ctx_indices:
-        ctx_results = calculate_reference_output_mewtwo_prefill(
+        ctx_results = calculate_reference_output_deepseek_v4_prefill(
             hidden_states, ctx_indices, seq_lens, q_ctx, kv_data, freqs_cis,
             ref_compressor, num_heads, qk_nope_head_dim, qk_rope_head_dim,
             v_head_dim, softmax_scale, device, o_a_proj, o_b_proj_weight,
@@ -664,7 +664,7 @@ def calculate_reference_output_mewtwo_mixed(hidden_states,
 
     # Process generation requests
     if gen_indices:
-        gen_results = calculate_reference_output_mewtwo_generation(
+        gen_results = calculate_reference_output_deepseek_v4_generation(
             hidden_states,
             gen_indices, seq_lens, q_gen, kv_data, freqs_cis, ref_compressor,
             len(ctx_indices), num_heads, qk_nope_head_dim, qk_rope_head_dim,
@@ -692,16 +692,16 @@ def prepare_reference_inputs(
     qk_head_dim: int,
     device: torch.device,
 ):
-    """Prepare reference inputs for both DSA and Mewtwo sparse attention.
+    """Prepare reference inputs for both DSA and DeepSeek-V4 sparse attention.
 
     Args:
-        sparse_attn_algo: "dsa" or "mewtwo"
+        sparse_attn_algo: "dsa" or "deepseek_v4"
         batch_order: List of request indices in batch order
         ctx_indices: List of context request indices
         batch_query_lens: Query lengths in batch order
         q_original_for_ref: Original Q tensor (unrotated)
         q: Q tensor (may be rotated for generation on SM90)
-        latent_cache: Latent cache [compressed_kv, k_pe] or full KV for mewtwo
+        latent_cache: Latent cache [compressed_kv, k_pe] or full KV for deepseek_v4
         k_pe_original_for_ref: Original k_pe (unrotated)
         cached_lens: Cached token counts per request
         kv_cache_for_ref: Reference cache dict from populate_gen_*_kv_cache
@@ -714,7 +714,7 @@ def prepare_reference_inputs(
         Tuple of (q_for_ref, kv_data):
         - q_for_ref: [total_tokens, num_heads, qk_head_dim]
         - kv_data: For DSA: (all_compressed_kv, all_k_pe_for_ref)
-                   For Mewtwo: all_kv
+                   For DeepSeek-V4: all_kv
     """
     q_for_ref_list = []
     batch_token_offsets = [0] + [
@@ -759,7 +759,7 @@ def prepare_reference_inputs(
         all_k_pe_for_ref = torch.cat(k_pe_list, dim=0)
         return q_for_ref, (all_compressed_kv, all_k_pe_for_ref)
 
-    elif sparse_attn_algo == "mewtwo":
+    elif sparse_attn_algo == "deepseek_v4":
         all_latent_kv = {}
 
         for batch_idx, orig_req_idx in enumerate(batch_order):
@@ -816,12 +816,12 @@ def init_layers(mla_layers: List[MLA], sparse_attn_algo: str,
                     mean=0.0, std=nn_init_std)
                 # Build fused wk+weights_proj weight after random init
                 mla_layer.mqa.indexer.post_load_weights()
-    elif sparse_attn_algo == "mewtwo":
+    elif sparse_attn_algo == "deepseek_v4":
         nn_init_std = 0.02
         with torch.no_grad():
             for mla_layer in mla_layers:
                 if hasattr(mla_layer.mqa, 'indexer'):
-                    # Initialize indexer weights for mewtwo
+                    # Initialize indexer weights for deepseek_v4
                     mla_layer.mqa.indexer.wq_b.weight.normal_(mean=0.0,
                                                               std=nn_init_std)
                     mla_layer.mqa.indexer.weights_proj.weight.normal_(
@@ -936,17 +936,17 @@ def populate_gen_dsa_kv_cache(mla: MLA, AttentionCls: AttentionBackend,
     return kv_cache_for_ref
 
 
-def populate_gen_mewtwo_kv_cache(
+def populate_gen_deepseek_v4_kv_cache(
         mla: MLA, ref_compressor: RefCompressor, AttentionCls: AttentionBackend,
         pretrained_config: DummyPretrainedConfig,
-        kv_cache_manager: MewtwoCacheManager, mapping: Mapping,
-        sparse_config: MewtwoSparseAttentionConfig, gen_indices: List[int],
+        kv_cache_manager: DeepseekV4CacheManager, mapping: Mapping,
+        sparse_config: DeepSeekV4SparseAttentionConfig, gen_indices: List[int],
         cached_lens: List[int], freqs_cis: torch.Tensor, dtype: torch.dtype,
         device: torch.device):
-    """Populate KV cache for mewtwo generation requests by running prefill forward.
+    """Populate KV cache for deepseek_v4 generation requests by running prefill forward.
 
     Unlike DSA which uses mla_rope_append_paged_kv_assign_q to directly write to cache,
-    mewtwo runs a full prefill forward pass to populate both:
+    deepseek_v4 runs a full prefill forward pass to populate both:
     - Window KV cache (recent tokens)
     - Compressed KV cache (via compressor)
 
@@ -1071,7 +1071,7 @@ def populate_gen_mewtwo_kv_cache(
             sparse_attention_config=sparse_config,
         )
         cached_metadata.prepare()
-        _ = mla_forward_impl_with_mewtwo_wo_linear(mla, cached_metadata, q, qr,
+        _ = mla_forward_impl_with_deepseek_v4_wo_linear(mla, cached_metadata, q, qr,
                                                    compressed_kv, k_pe,
                                                    latent_cache, hidden_states,
                                                    position_ids, dtype, device)
@@ -1146,13 +1146,13 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
     return output
 
 
-def mla_forward_impl_with_mewtwo_wo_linear(mla, attn_metadata, q, qr,
+def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
                                            compressed_kv, k_pe, latent_cache,
                                            hidden_states, position_ids, dtype,
                                            device):
-    """Forward implementation for mewtwo sparse attention.
+    """Forward implementation for deepseek_v4 sparse attention.
 
-    For mewtwo, compressed_kv is actually the nope part of KV (qk_nope_head_dim),
+    For deepseek_v4, compressed_kv is actually the nope part of KV (qk_nope_head_dim),
     and k_pe is the rope part (qk_rope_head_dim). Together they form the full KV.
 
     This includes:
@@ -1234,16 +1234,16 @@ def mla_forward_impl_with_mewtwo_wo_linear(mla, attn_metadata, q, qr,
                     reason="FlashMLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("batch_name", list(BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
-@pytest.mark.parametrize("sparse_attn_algo", ["dsa", "mewtwo"])
+@pytest.mark.parametrize("sparse_attn_algo", ["dsa", "deepseek_v4"])
 def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                     sparse_attn_algo: str):
     """Test sparse MLA attention for pure prefill, pure decode, and mixed batches."""
     print(
         f"\n{'='*80}\nTesting: {batch_name}, sparse_attn_algo: {sparse_attn_algo}, kv_cache_dtype: {kv_cache_dtype}\n{'='*80}"
     )
-    if sparse_attn_algo == "mewtwo" and get_sm_version() < 100:
+    if sparse_attn_algo == "deepseek_v4" and get_sm_version() < 100:
         pytest.skip(
-            "Mewtwo sparse MLA unittest is not supported on pre-Blackwell architectures"
+            "DeepSeek-V4 sparse MLA unittest is not supported on pre-Blackwell architectures"
         )
     if kv_cache_dtype == "fp8" and get_sm_version() < 100:
         pytest.skip(
@@ -1289,7 +1289,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         vocab_size = 129280
         compress_ratios = [1, 1, 1]
         tokens_per_block = 64
-    elif sparse_attn_algo == "mewtwo":
+    elif sparse_attn_algo == "deepseek_v4":
         num_heads = 64
         q_lora_rank = 1024
         kv_lora_rank = 448
@@ -1370,7 +1370,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             dtype=torch.float32,
             device=device,
         ).reshape(rope_config.max_position_embeddings, -1, 2).transpose(-2, -1)
-    elif sparse_attn_algo == "mewtwo":
+    elif sparse_attn_algo == "deepseek_v4":
         rope_config = RopeConfig(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -1386,7 +1386,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             max_position_embeddings=max_position_embeddings,
             rope_theta=10000.0,
             qk_rope_head_dim=qk_rope_head_dim,
-            model_type="mewtwo",
+            model_type="deepseek_v4",
         )
         freqs_cis = None  # Will be set after MLA modules are created
 
@@ -1417,9 +1417,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             index_head_dim=128,  # Dimension of indexer heads
             index_topk=topk_tokens,  # Top-k tokens to select (2048)
         )
-    elif sparse_attn_algo == "mewtwo":
-        # (Mewtwo - Mewtwo Sparse Attention)
-        sparse_config = MewtwoSparseAttentionConfig(
+    elif sparse_attn_algo == "deepseek_v4":
+        # (DeepSeek-V4 - DeepSeek-V4 Sparse Attention)
+        sparse_config = DeepSeekV4SparseAttentionConfig(
             index_n_heads=64,  # Number of heads for indexer
             index_head_dim=128,  # Dimension of indexer heads
             index_topk=topk_tokens,  # Top-k tokens to select (512)
@@ -1492,10 +1492,10 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     else:
         print(f"  Testing single layer (baseline)")
 
-    # For mewtwo: derive freqs_cis from the production RotaryEmbedding to
+    # For deepseek_v4: derive freqs_cis from the production RotaryEmbedding to
     # guarantee matching frequencies (the reference precompute_freqs_cis may
     # differ from the production's yarn-scaled frequencies).
-    if sparse_attn_algo == "mewtwo" and freqs_cis is None:
+    if sparse_attn_algo == "deepseek_v4" and freqs_cis is None:
         prod_cos_sin = mla.mqa.compressor.rotary_emb.rotary_cos_sin
         # prod_cos_sin: [max_positions, 2, rope_dim//2]
         prod_cos = prod_cos_sin[:, 0, :]  # [max_positions, rope_dim//2]
@@ -1515,8 +1515,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             2, 0, 1).contiguous()  # [kv_lora_rank, num_heads, qk_nope_head_dim]
         W_UV = kv_b_weight_reshaped[:, qk_nope_head_dim:, :].permute(
             2, 0, 1).contiguous()  # [kv_lora_rank, num_heads, v_head_dim]
-    elif sparse_attn_algo == "mewtwo":
-        # Mewtwo doesn't use W_UK, W_UV expansion - KV is stored at full head_dim
+    elif sparse_attn_algo == "deepseek_v4":
+        # DeepSeek-V4 doesn't use W_UK, W_UV expansion - KV is stored at full head_dim
         W_UK, W_UV = None, None
         # Create compressor for reference calculation
         # Create reference compressor with matching config
@@ -1553,7 +1553,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     cached_lens = [seq_lens[i] - query_lens[i] for i in range(len(seq_lens))]
 
     # Create KV cache manager
-    kv_cache_manager_cls = DSACacheManager if sparse_attn_algo == "dsa" else MewtwoCacheManager
+    kv_cache_manager_cls = DSACacheManager if sparse_attn_algo == "dsa" else DeepseekV4CacheManager
     kv_cache_manager = kv_cache_manager_cls(
         KvCacheConfig(max_tokens=max_tokens,
                       enable_block_reuse=False,
@@ -1613,8 +1613,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                                                      kv_cache_manager, mapping,
                                                      sparse_config, gen_indices,
                                                      cached_lens, dtype, device)
-    elif sparse_attn_algo == "mewtwo":
-        kv_cache_for_ref = populate_gen_mewtwo_kv_cache(
+    elif sparse_attn_algo == "deepseek_v4":
+        kv_cache_for_ref = populate_gen_deepseek_v4_kv_cache(
             mla, ref_compressor, AttentionCls, pretrained_config,
             kv_cache_manager, mapping, sparse_config, gen_indices, cached_lens,
             freqs_cis, dtype, device)
@@ -1691,8 +1691,8 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         output = mla_forward_impl_with_dsa_wo_linear(
             mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
             hidden_states, position_ids, dtype, device)
-    elif sparse_attn_algo == "mewtwo":
-        output = mla_forward_impl_with_mewtwo_wo_linear(
+    elif sparse_attn_algo == "deepseek_v4":
+        output = mla_forward_impl_with_deepseek_v4_wo_linear(
             mla, attn_metadata, q, qr, compressed_kv, k_pe, latent_cache,
             hidden_states, position_ids, dtype, device)
     else:
@@ -1751,13 +1751,13 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             softmax_scale=softmax_scale,
             device=device,
         )
-    elif sparse_attn_algo == "mewtwo":
+    elif sparse_attn_algo == "deepseek_v4":
         # Extract output projection weights for reference calculation
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
         n_local_groups = num_groups  # No TP in this test
 
-        reference_output = calculate_reference_output_mewtwo_mixed(
+        reference_output = calculate_reference_output_deepseek_v4_mixed(
             hidden_states=hidden_states_ref,
             q_ctx=q_ctx_ref,
             q_gen=q_gen_ref,

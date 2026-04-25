@@ -183,8 +183,8 @@ class ModelConfig(BaseModel):
         """ Read the parameter count from HF safetensor metadata. """
         if model_hf_name == "EleutherAI/gpt-j-6b":  # GPT-J repo doesn't use safetensor format.
             param_count = 6053381344
-        # TODO: Remove this once HF supports Mewtwo
-        elif model_hf_name == "mewtwo/Mewtwo":
+        # TODO: Remove this once HF supports DeepSeek-V4
+        elif model_hf_name == "deepseek-ai/DeepSeek-V4":
             param_count = 284347051735
         else:
             model_name_or_path = hf_model_path or model_hf_name

@@ -2057,12 +2057,12 @@ def triton_gather_k_cache(
 
 
 ########################################################
-# Mewtwo local to global index transformation kernel
+# DeepSeek-V4 local to global index transformation kernel
 ########################################################
 
 
 @triton.jit
-def _mewtwo_local_to_global_kernel(
+def _deepseek_v4_local_to_global_kernel(
     req_id_ptr,
     block_table_swa_ptr,
     block_table_compressed_ptr,
@@ -2164,7 +2164,7 @@ def _mewtwo_local_to_global_kernel(
         tl.store(compressed_out_ptr, compressed_global_index)
 
 
-def mewtwo_local_to_global_indices(
+def deepseek_v4_local_to_global_indices(
         req_id: torch.Tensor,  # int32 [num_tokens]
         block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
         swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
@@ -2287,7 +2287,7 @@ def mewtwo_local_to_global_indices(
     out_stride0, out_stride1 = out.stride()
 
     # Launch kernel
-    _mewtwo_local_to_global_kernel[grid](
+    _deepseek_v4_local_to_global_kernel[grid](
         req_id_c,
         block_table_swa_c,
         block_table_compressed_c,

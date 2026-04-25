@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for TF32 vs FP32 computation paths in the Mewtwo Compressor wkv_gate."""
+"""Tests for TF32 vs FP32 computation paths in the DeepSeek-V4 Compressor wkv_gate."""
 
 import os
 from unittest import mock
@@ -10,11 +10,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor import _to_float
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import _to_float
 from tensorrt_llm._torch.modules.linear import Linear
 
 DEVICE = "cuda"
-# Typical Mewtwo dimensions
+# Typical DeepSeek-V4 dimensions
 DIM = 4096
 HEAD_DIM = 512
 STATE_DIM = 2 * HEAD_DIM  # overlap=True for compress_ratio=4
@@ -115,19 +115,19 @@ def test_tf32_path_produces_correct_results(num_tokens):
 
 
 def test_env_var_selects_fp32_path():
-    """MEWTWO_COMPRESSOR_FP32=1 env var causes module-level flag to be True."""
+    """DEEPSEEK_V4_COMPRESSOR_FP32=1 env var causes module-level flag to be True."""
     # Re-import the module with the env var set to verify behavior.
     import importlib
 
-    import tensorrt_llm._torch.attention_backend.sparse.mewtwo.compressor as mod
+    import tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor as mod
 
-    with mock.patch.dict(os.environ, {"MEWTWO_COMPRESSOR_FP32": "1"}):
+    with mock.patch.dict(os.environ, {"DEEPSEEK_V4_COMPRESSOR_FP32": "1"}):
         importlib.reload(mod)
         assert mod._USE_FP32_COMPRESSOR is True
 
     # Restore default
     with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("MEWTWO_COMPRESSOR_FP32", None)
+        os.environ.pop("DEEPSEEK_V4_COMPRESSOR_FP32", None)
         importlib.reload(mod)
         assert mod._USE_FP32_COMPRESSOR is False
 

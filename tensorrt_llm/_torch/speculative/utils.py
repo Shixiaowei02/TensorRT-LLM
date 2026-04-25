@@ -149,7 +149,7 @@ def get_mtp_hidden_size(model_config) -> int:
     hidden_size = getattr(pretrained_config, "hidden_size", None)
     if hidden_size is None:
         hidden_size = getattr(model_config, "hidden_size")
-    if getattr(pretrained_config, "model_type", None) == "mewtwo":
+    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
         return hidden_size * getattr(pretrained_config, "hc_mult", 1)
     return hidden_size
 

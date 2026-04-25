@@ -1,5 +1,5 @@
 """
-Tests for Mewtwo Index Transform Kernel.
+Tests for DeepSeek-V4 Index Transform Kernel.
 """
 
 from dataclasses import dataclass
@@ -9,17 +9,17 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import mewtwo_local_to_global_indices
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo import (
-    MewtwoAttentionType,
-    MewtwoCacheManager,
+from tensorrt_llm._torch.attention_backend.sparse.kernel import deepseek_v4_local_to_global_indices
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4AttentionType,
+    DeepseekV4CacheManager,
 )
-from tensorrt_llm._torch.attention_backend.sparse.mewtwo.mewtwo import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import get_token_bytes
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MewtwoSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -41,7 +41,7 @@ class Scenario:
     compress_ratio: int = 1
     swa_topk: int = 128
     compressed_topk: int = 512
-    compressed_attn_type: MewtwoAttentionType = MewtwoAttentionType.COMPRESS
+    compressed_attn_type: DeepseekV4AttentionType = DeepseekV4AttentionType.COMPRESS
 
 
 scenarios = [
@@ -79,19 +79,19 @@ index_transform_cases.append(
 
 
 def _create_cache_manager(scenario: Scenario, num_layers: int = 1):
-    """Create a MewtwoCacheManager for testing."""
+    """Create a DeepseekV4CacheManager for testing."""
     base_ratios = [1, 4, 128]
     compress_ratios = [base_ratios[i % len(base_ratios)] for i in range(num_layers)]
     if scenario.layer_idx < num_layers:
         compress_ratios[scenario.layer_idx] = scenario.compress_ratio
-    sparse_attn_config = MewtwoSparseAttentionConfig(
+    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
         index_head_dim=scenario.index_head_dim,
         window_size=scenario.window_size,
         compress_ratios=compress_ratios,
     )
 
     max_tokens = scenario.max_seq_len * scenario.max_batch_size
-    cache_manager = MewtwoCacheManager(
+    cache_manager = DeepseekV4CacheManager(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=max_tokens,
@@ -185,7 +185,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
 
     # Get pointers and offsets
     swa_pool_base_ptr = cache_manager.swa_pool_ptr
-    swa_buffer_ptr = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA).data_ptr()
+    swa_buffer_ptr = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.SWA).data_ptr()
 
     # Single token stride for all buffers
     has_fp8_kv_cache = scenario.dtype == DataType.FP8
@@ -193,7 +193,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         scenario.head_dim,
         scenario.index_head_dim,
         scenario.compress_ratio,
-        MewtwoAttentionType.SWA,
+        DeepseekV4AttentionType.SWA,
         has_fp8_kv_cache,
     )
     swa_offset = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride
@@ -222,7 +222,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         )
 
     # Get buffers and write random values
-    swa_buffer = cache_manager.get_buffers(layer_idx, MewtwoAttentionType.SWA)
+    swa_buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.SWA)
     swa_buffer.copy_(torch.randn_like(swa_buffer))
 
     if has_compressed:
@@ -233,7 +233,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
 
     # Get block tables
     block_tables_swa = [
-        cache_manager.get_cache_indices(req.py_request_id, layer_idx, MewtwoAttentionType.SWA)
+        cache_manager.get_cache_indices(req.py_request_id, layer_idx, DeepseekV4AttentionType.SWA)
         for req in requests
     ]
     block_tables_compressed = (
@@ -298,7 +298,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
         compressed_local_indices = None
 
     # Run kernel
-    global_indices = mewtwo_local_to_global_indices(
+    global_indices = deepseek_v4_local_to_global_indices(
         req_id=req_id,
         block_table_swa=block_table_swa_t,
         swa_local_indices=swa_local_indices,
@@ -394,12 +394,12 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     "scenario, context_lengths, is_large_gap_case",
     index_transform_cases,
 )
-def test_mewtwo_indices_transform(
+def test_deepseek_v4_indices_transform(
     scenario: Optional[Scenario],
     context_lengths: Optional[List[int]],
     is_large_gap_case: bool,
 ):
-    """Test Mewtwo index transformation kernel by verifying VALUES."""
+    """Test DeepSeek-V4 index transformation kernel by verifying VALUES."""
     if is_large_gap_case:
         _run_large_address_gap_int32_safe_test()
         return
@@ -474,7 +474,7 @@ def _run_large_address_gap_int32_safe_test():
     compressed_local_indices = torch.stack(compressed_indices_list)
 
     # Run kernel with separate base pointers
-    global_indices = mewtwo_local_to_global_indices(
+    global_indices = deepseek_v4_local_to_global_indices(
         req_id=req_id,
         block_table_swa=block_table_swa,
         swa_local_indices=swa_local_indices,

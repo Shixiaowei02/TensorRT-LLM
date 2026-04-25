@@ -349,11 +349,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return self.skip_indexer_for_short_seqs
 
 
-class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
+class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     """
-    Configuration for Mewtwo Sparse Attention.
+    Configuration for DeepSeek-V4 Sparse Attention.
     """
-    algorithm: Literal["mewtwo"] = "mewtwo"
+    algorithm: Literal["deepseek_v4"] = "deepseek_v4"
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
@@ -361,7 +361,9 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
 
     compress_ratios: List[int] = Field(
         default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
-        description="The compress ratios of each layer.")
+        description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
+        "for uncompressed/SWA-only layers; internal allocation code normalizes "
+        "0 to 1, while checkpoint-facing semantics remain unchanged.")
 
     window_size: int = Field(
         default=128,
@@ -374,7 +376,7 @@ class MewtwoSparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        # Mewtwo does not support short/long CUDA graph separation.
+        # DeepSeek-V4 does not support short/long CUDA graph separation.
         return False
 
 
@@ -2189,7 +2191,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
-        MewtwoSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
     ],
     Field(discriminator="algorithm"),
