@@ -1081,6 +1081,9 @@ int AttentionOp::mlaGeneration(
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
 
+        // Per-head attention sink added to the softmax denominator.
+        tllmRunnerParams.attentionSinksPtr = generation_params.attention_sinks;
+
         // MLA uses different head dimensions for Qk and V.
         tllmRunnerParams.mHeadDimQk = head_size;
         tllmRunnerParams.mHeadDimV = head_size_v;
