@@ -501,7 +501,8 @@ class ModelConfig(Generic[TConfig]):
     def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
                                                  checkpoint_dir: str,
                                                  moe_backend: str,
-                                                 layer_quant_config):
+                                                 layer_quant_config,
+                                                 spec_config=None):
         layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
             checkpoint_dir)
         if layout != "mxfp4":
@@ -521,7 +522,12 @@ class ModelConfig(Generic[TConfig]):
         else:
             layer_quant_config = dict(layer_quant_config)
 
-        for layer_idx in range(pretrained_config.num_hidden_layers):
+        num_moe_layers = pretrained_config.num_hidden_layers
+        if (spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_moe_layers += spec_config.num_nextn_predict_layers
+
+        for layer_idx in range(num_moe_layers):
             layer_quant_config[
                 f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
 
@@ -678,16 +684,14 @@ class ModelConfig(Generic[TConfig]):
                     # to 1 internally so cache allocation math works. The
                     # external config keeps the original semantics.
                     compress_ratios = [
-                        ratio if ratio > 0 else 1
-                        for ratio in compress_ratios
+                        ratio if ratio > 0 else 1 for ratio in compress_ratios
                     ]
 
                     # Adjust compress_ratios length based on MTP config.
                     num_base_layers = pretrained_config.num_hidden_layers
                     spec_config = kwargs.get('spec_config', None)
-                    mtp_enabled = (
-                        spec_config is not None
-                        and spec_config.spec_dec_mode.is_mtp_one_model())
+                    mtp_enabled = (spec_config is not None and
+                                   spec_config.spec_dec_mode.is_mtp_one_model())
                     if mtp_enabled:
                         mtp_num_layers = spec_config.num_nextn_predict_layers
                         total_layers = num_base_layers + mtp_num_layers
@@ -696,8 +700,7 @@ class ModelConfig(Generic[TConfig]):
                                 total_layers - len(compress_ratios))
                     else:
                         if len(compress_ratios) > num_base_layers:
-                            compress_ratios = compress_ratios[
-                                :num_base_layers]
+                            compress_ratios = compress_ratios[:num_base_layers]
 
                     kwargs[
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
@@ -791,7 +794,7 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
                 pretrained_config, checkpoint_dir, moe_backend,
-                layer_quant_config)
+                layer_quant_config, kwargs.get('spec_config', None))
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
