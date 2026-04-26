@@ -69,6 +69,7 @@ class DeepseekV4Config(PretrainedConfig):
         window_size=128,
         compress_rope_theta=160000,
         compress_ratios=None,
+        swiglu_limit=10.0,
         has_engram=False,
         engram_vocab_size=None,
         engram_max_ngram_size=3,
@@ -80,12 +81,17 @@ class DeepseekV4Config(PretrainedConfig):
         engram_seed=0,
         **kwargs,
     ):
-        # DeepSeek-V4 HF config uses `sliding_window` and `num_hash_layers`.
+        # DeepSeek-V4 HF config uses `sliding_window`, `num_hash_layers`,
+        # and `head_dim` for these internal fields.
         # Accept them as aliases for the internal names the rest of the code uses.
         if "sliding_window" in kwargs:
             window_size = kwargs.pop("sliding_window")
         if "num_hash_layers" in kwargs:
             n_hash_layers = kwargs.pop("num_hash_layers")
+        if "head_dim" in kwargs:
+            v_head_dim = kwargs.pop("head_dim")
+        if "score_func" in kwargs:
+            scoring_func = kwargs.pop("score_func")
 
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -145,6 +151,7 @@ class DeepseekV4Config(PretrainedConfig):
         # kv compression
         self.compress_rope_theta = compress_rope_theta
         self.compress_ratios = compress_ratios
+        self.swiglu_limit = swiglu_limit
 
         # Engram configuration
         self.has_engram = has_engram

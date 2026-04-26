@@ -1,21 +1,80 @@
 import os
+from contextlib import contextmanager
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm.quantization.utils import fp8_utils
 
 if TYPE_CHECKING:
     from .deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 
-# When set to "1", run the wkv_gate GEMM in fp32 instead of the weight's
-# native bf16 dtype, for accuracy debugging.
+# When set to "1", forces wkv_gate to use full FP32 computation (via nn.Linear)
+# instead of the default TF32 path (via F.linear + allow_tf32).
 _USE_FP32_COMPRESSOR = os.environ.get("DEEPSEEK_V4_COMPRESSOR_FP32", "0") == "1"
+
+
+@maybe_compile(dynamic=True)
+def _to_float(x: torch.Tensor) -> torch.Tensor:
+    """Cast to float32 for TF32 GEMM (following DSA pattern)."""
+    return x.float()
+
+
+def _scatter_compressed_kv_to_cache(
+    kv_out: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    start_pos: torch.Tensor,
+    cu_new_comp_kv: torch.Tensor,
+    compressed_mask: torch.Tensor,
+    tokens_per_block: int,
+) -> None:
+    total_tokens = kv_out.shape[0]
+    if total_tokens == 0:
+        return
+
+    token_idx = torch.arange(total_tokens, dtype=torch.int32, device=kv_out.device)
+    batch_size = start_pos.shape[0]
+    seq_idx_raw = torch.searchsorted(cu_new_comp_kv[1:batch_size + 1], token_idx, right=True)
+    seq_idx = seq_idx_raw.clamp(max=batch_size - 1)
+    offset = token_idx - cu_new_comp_kv[seq_idx]
+    valid = (seq_idx_raw < batch_size) & compressed_mask[:total_tokens]
+
+    safe_seq_idx = torch.where(valid, seq_idx, torch.zeros_like(seq_idx))
+    safe_offset = torch.where(valid, offset, torch.zeros_like(offset))
+    cache_pos = start_pos[safe_seq_idx] + safe_offset
+    logical_block = (cache_pos // tokens_per_block).clamp(max=block_table.shape[1] - 1)
+    token_offset = cache_pos % tokens_per_block
+    phys_block = block_table[safe_seq_idx, logical_block]
+
+    current = kv_cache[phys_block.long(), token_offset.long(), :kv_out.shape[-1]]
+    updated = torch.where(valid.unsqueeze(-1), kv_out, current)
+    kv_cache[phys_block.long(), token_offset.long(), :kv_out.shape[-1]] = updated
+
+
+@contextmanager
+def _tf32_matmul_enabled():
+    """Temporarily enable TF32 for FP32 matmul in this scope.
+
+    Forces PyTorch/cuBLASLt to use CUBLAS_COMPUTE_32F_FAST_TF32 which
+    guarantees TF32 tensor cores. Plain CUBLAS_COMPUTE_32F (used by
+    torch.ops.trtllm.cublas_mm) falls back to SIMT SGEMM based on
+    cuBLASLt heuristics for small M.
+    """
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
 
 
 class KVCacheDtype(IntEnum):
@@ -82,12 +141,11 @@ class Compressor(nn.Module):
         self.rotate_activation = rotate_activation
 
         # Modules
-        # wkv_gate dtype follows the checkpoint (bf16 in V4).
         self.wkv_gate = Linear(
             self.dim,
             self.state_dim * 2,
             bias=False,
-            dtype=dtype,
+            dtype=torch.float32,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
@@ -161,16 +219,15 @@ class Compressor(nn.Module):
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
-        # GEMM at the weight dtype, then upcast to fp32 to match the
-        # downstream cache element type (kv_score and the paged caches share
-        # IoElemT in the kernel template).
+        # Project input to KV and score.
+        # Default: TF32 via F.linear under allow_tf32 context (explicit
+        #   CUBLAS_COMPUTE_32F_FAST_TF32 -> TF32 tensor cores on Ampere+).
+        # Fallback: strict FP32 via nn.Linear when DEEPSEEK_V4_COMPRESSOR_FP32=1.
         if _USE_FP32_COMPRESSOR:
-            kv_score = torch.nn.functional.linear(x.float(), self.wkv_gate.weight.float())
+            kv_score = self.wkv_gate(_to_float(x))
         else:
-            kv_score = torch.nn.functional.linear(
-                x.to(self.wkv_gate.weight.dtype),
-                self.wkv_gate.weight,
-            ).float()
+            with _tf32_matmul_enabled():
+                kv_score = F.linear(_to_float(x), self.wkv_gate.weight)
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
@@ -239,10 +296,17 @@ class Compressor(nn.Module):
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
 
+        kv_out = None
+        needs_kv_out = fp8_output is not None or (
+            not self.is_indexer and self.kv_cache_dtype == KVCacheDtype.DEFAULT
+        )
+        if needs_kv_out:
+            kv_out = torch.empty_like(kv_comp)
+
         # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
         torch.ops.trtllm.compressor_postprocess_scatter(
             kv_comp,
-            None,
+            kv_out,
             self.norm.weight,
             self.norm.variance_epsilon,
             self.rotary_emb.rotary_cos_sin,
@@ -263,5 +327,17 @@ class Compressor(nn.Module):
         )
 
         if fp8_output is not None:
+            fp8_output, scale_output = fp8_utils.fp8_quantize_1x128_sf_transpose(kv_out)
             return fp8_output.view(torch.float8_e4m3fn), scale_output
+        if kv_out is not None:
+            _scatter_compressed_kv_to_cache(
+                kv_out,
+                kv_cache,
+                block_table,
+                start_pos,
+                cu_new_comp_kv,
+                compressed_mask,
+                compress_tokens_per_block,
+            )
+            return kv_out, None
         return kv_comp, None

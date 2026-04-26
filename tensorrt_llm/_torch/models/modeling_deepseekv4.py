@@ -86,31 +86,6 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
 
 
-def _make_deepseek_v4_pos_embd_params(
-    model_config: ModelConfig[PretrainedConfig], layer_idx: Optional[int]
-) -> PositionalEmbeddingParams:
-    """Per-layer RoPE: compressed layers use ``compress_rope_theta`` + yarn;
-    non-compressed (ratio ≤ 1) layers use base ``rope_theta`` with yarn off."""
-    config = model_config.pretrained_config
-    sparse_cfg = model_config.sparse_attention_config
-    ratios = getattr(sparse_cfg, "compress_ratios", None) or ()
-    compress_ratio = (
-        ratios[layer_idx] if (layer_idx is not None and 0 <= layer_idx < len(ratios)) else 1
-    )
-
-    rope = RopeParams.from_config(config)
-    if compress_ratio > 1:
-        rope.theta = getattr(config, "compress_rope_theta", rope.theta)
-    else:
-        rope.theta = config.rope_theta
-        rope.scale_type = RotaryScalingType.none
-        rope.scale = rope.short_m_scale = rope.long_m_scale = 1.0
-        rope.mscale = 1.0
-        rope.mscale_all_dim = 0.0
-        rope.original_max_positions = rope.max_positions
-    return PositionalEmbeddingParams(type=PositionEmbeddingType.yarn, rope=rope, is_neox=False)
-
-
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
@@ -157,11 +132,56 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     """
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
+    if s.dtype != torch.float32:
+        s = s.float()
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))  # noqa: E731
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
+
+def _deepseek_v4_pos_embd_params(config: PretrainedConfig,
+                                 model_config: ModelConfig,
+                                 layer_idx: Optional[int]
+                                 ) -> PositionalEmbeddingParams:
+    rope_params = RopeParams.from_config(config)
+
+    compress_ratios = None
+    if model_config.sparse_attention_config is not None:
+        compress_ratios = getattr(model_config.sparse_attention_config,
+                                  "compress_ratios", None)
+    if not compress_ratios:
+        compress_ratios = getattr(config, "compress_ratios", None)
+
+    compress_ratio = 0
+    if compress_ratios and layer_idx is not None:
+        compress_ratio = compress_ratios[min(layer_idx,
+                                             len(compress_ratios) - 1)]
+
+    if compress_ratio > 1:
+        rope_params.theta = getattr(config, "compress_rope_theta",
+                                    rope_params.theta)
+        rope_params.scale_type = RotaryScalingType.yarn
+        # DeepSeek-V4 reference applies YaRN frequency interpolation but does
+        # not scale the cos/sin amplitudes.
+        rope_params.mscale = 0.0
+        rope_params.mscale_all_dim = 0.0
+        pos_type = PositionEmbeddingType.yarn
+    else:
+        # DeepSeek-V4 reference uses base RoPE, without YaRN, for SWA-only
+        # layers. Internal configs normalize checkpoint ratio 0 to 1, so both
+        # values are treated as uncompressed here.
+        rope_params.theta = getattr(config, "rope_theta", rope_params.theta)
+        rope_params.scale_type = RotaryScalingType.none
+        rope_params.scale = 1.0
+        pos_type = PositionEmbeddingType.rope_gptj
+
+    return PositionalEmbeddingParams(
+        type=pos_type,
+        rope=rope_params,
+        is_neox=False,
+    )
 
 
 @torch.compile(dynamic=True)
@@ -190,12 +210,8 @@ _SHARED_EXPERT_RENAME = {
 }
 
 
-def _remap_deepseek_v4_checkpoint_keys(
-    weights: Dict,
-    num_hidden_layers: int,
-    kv_lora_rank: int = 448,
-    o_a_proj_shape: Optional[tuple] = None,
-) -> Dict:
+def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
+                                       kv_lora_rank: int = 448) -> Dict:
     """Convert DeepSeek-V4 checkpoint keys to model named-parameter keys.
 
     Why: the upstream DS-V4 release uses keys like ``layers.X.attn.wkv.weight``,
@@ -207,33 +223,32 @@ def _remap_deepseek_v4_checkpoint_keys(
     the model has but the checkpoint does not (so the existing loader's strict
     key lookup does not raise).
 
-    Args:
-        weights: raw checkpoint state dict.
-        num_hidden_layers: routes ``mtp.0.*`` into ``model.layers.{N}.*``.
-        kv_lora_rank: model's ``kv_a_layernorm`` hidden size. The V4 ckpt
-            ``kv_norm.weight`` is sized ``kv_lora_rank + qk_rope_head_dim``
-            (it normalizes both halves of ``wkv``); the model only normalizes
-            the ``kv_lora`` half, so we slice to the first ``kv_lora_rank``
-            entries assuming layout ``[kv_lora; rope_pe]``.
-        o_a_proj_shape: target shape for ``o_a_proj`` (e.g. ``(n_groups,
-            o_lora_rank, in_dim)``). When provided alongside ``wo_a.weight``
-            and ``wo_a.scale``, we dequantize FP8→bf16 then reshape.
-
     Caveats — limitations carried as TODOs (kept here so future readers can
     audit them in one place rather than chasing comments):
-      * ``self_attn.q_b_layernorm.weight`` is synthesized as ones (identity scale)
-        because the V4 release omits it; revisit if a real value ships.
       * ``self_attn.indexer.wk.weight`` and ``self_attn.indexer.k_norm.{weight,bias}``
         are zero-filled — V4 indexer's k path is served by the compressor, so
         the base ``Indexer.wk`` / ``k_norm`` are unused at forward time.
-      * FP4 expert path (plan Phase 4) is not added: the published configs use
-        ``quant_method=fp8``; if FP4 weights ship later, extend the scale rename
-        to recognize ``weight_scale`` / ``weight_scale_2`` / ``input_scale``.
+      * Routed experts can use either FP8 block scales or the packed MXFP4
+        layout. The first routed expert weight determines the scale suffix used
+        for all routed expert tensors in the shard.
+      * ``self_attn.o_a_proj`` is loaded by the DeepSeek-V4 loader because it
+        is a direct MLA parameter, not a child Linear module.
       * ``mtp.0.head.weight`` is dropped — DeepSeekV4MTP reuses the main
         ``lm_head`` via ``shared_head``. Flash omits this key entirely; Flash-Base
         carries it but matches the main head, so we let the main head win.
     """
     mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
+    routed_moe_scale_name = "weight_scale_inv"
+    for key, value in weights.items():
+        if (
+            key.startswith("layers.")
+            and ".ffn.experts." in key
+            and key.endswith(".weight")
+            and getattr(value, "ndim", 0) == 2
+            and value.dtype in (torch.int8, torch.uint8)
+        ):
+            routed_moe_scale_name = "weight_scale"
+            break
 
     def _rename_attn_subkey(rest: str) -> Optional[str]:
         # rest examples: "wq_a.weight", "wq_a.scale", "wo_a.weight",
@@ -244,18 +259,18 @@ def _remap_deepseek_v4_checkpoint_keys(
         # key. Pass through unchanged.
         if rest == "attn_sink":
             return "attn_sink"
-        # `wo_a` collects to ``o_a_proj`` via a fusion bucket below — emit a
-        # sentinel here so the dispatch below can route it.
-        if rest in ("wo_a.weight", "wo_a.scale"):
-            return f"__wo_a__.{rest.split('.')[1]}"
+        # `wo_a` is an nn.Parameter on the model side (not a Linear), so
+        # `wo_a.weight` carries the value directly into `o_a_proj` without
+        # a trailing ``.weight``. Retain `.scale` so the loader can dequantize
+        # FP8 block-scaled checkpoints before assigning the bf16 parameter.
+        if rest == "wo_a.weight":
+            return "o_a_proj"
+        if rest == "wo_a.scale":
+            return "o_a_proj.weight_scale_inv"
         # Compressor / indexer paths — pass through with .scale rename, plus
         # wkv+wgate fusion handled separately below.
         if rest.startswith("compressor.") or rest.startswith("indexer."):
             return rest.replace(".scale", ".weight_scale_inv")
-        # ``kv_norm`` shape rewrite: ckpt is (kv_lora_rank + rope_dim,) but the
-        # model only normalizes kv_lora_rank.
-        if rest == "kv_norm.weight":
-            return "kv_a_layernorm.weight__slice_kv_lora__"
         head, sep, tail = rest.partition(".")
         new_head = _ATTN_PARAM_RENAME.get(head, head)
         if tail == "scale":
@@ -264,11 +279,14 @@ def _remap_deepseek_v4_checkpoint_keys(
 
     def _rename_ffn_subkey(rest: str) -> str:
         # Examples:
-        #   gate.weight                                    → gate.weight
-        #   gate.tid2eid                                   → gate.tid2eid (hashed gates)
-        #   gate.bias                                      → gate.e_score_correction_bias (non-hashed)
-        #   experts.<i>.<w1|w2|w3>.<weight|scale>          → experts.<i>.<w1|w2|w3>.<weight|weight_scale_inv>
-        #   shared_experts.<w1|w3|w2>.<weight|scale>       → shared_experts.<gate|up|down>_proj.<weight|weight_scale_inv>
+        #   gate.weight / gate.tid2eid → gate.weight / gate.tid2eid
+        #   gate.bias → gate.e_score_correction_bias
+        #   experts.<i>.<w1|w2|w3>.<weight|scale> → experts.<i>.<w1|w2|w3>.<weight|weight_scale*>
+        #   shared_experts.<w1|w3|w2>.<weight|scale> → shared_experts.<gate|up|down>_proj.<weight|weight_scale_inv>
+        if rest == "gate.bias":
+            return "gate.e_score_correction_bias"
+        if rest.startswith("experts.") and rest.endswith(".scale"):
+            return f"{rest[:-len('.scale')]}.{routed_moe_scale_name}"
         rest = rest.replace(".scale", ".weight_scale_inv")
         # Non-hashed layers carry the routing logit bias as `gate.bias`; the
         # model wires it through `DeepseekV4Gate.e_score_correction_bias`.
@@ -303,8 +321,6 @@ def _remap_deepseek_v4_checkpoint_keys(
     # depend on iteration order.
     compressor_split: Dict[str, Dict[str, torch.Tensor]] = {}
     eh_proj_split: Dict[str, Dict[str, torch.Tensor]] = {}
-    # Per-layer wo_a parts: parent_self_attn_prefix → {"weight": fp8, "scale": fp32}
-    wo_a_split: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def _record_compressor_part(model_key: str, part: str, tensor: torch.Tensor):
         # model_key looks like "...self_attn.compressor.<part>.weight" or with
@@ -315,25 +331,19 @@ def _remap_deepseek_v4_checkpoint_keys(
         compressor_split.setdefault(bucket, {})[part] = tensor
 
     def _emit_or_collect(model_key: str, tensor: torch.Tensor):
-        """Route a (model_key, tensor) pair: handle compressor / wo_a / kv_norm
-        sentinels here so callers stay simple."""
+        """Route a (model_key, tensor) pair and collect compressor fusions."""
         if ".compressor." in model_key and (
             model_key.endswith(".wkv.weight") or model_key.endswith(".wgate.weight")
         ):
             part = "wkv" if model_key.endswith(".wkv.weight") else "wgate"
             _record_compressor_part(model_key, part, tensor)
             return
-        if "__wo_a__" in model_key:
-            # model_key looks like "...self_attn.__wo_a__.<weight|scale>".
-            parent_prefix, _, leaf = model_key.rpartition(".")  # leaf=weight|scale
-            parent_prefix = parent_prefix.rsplit(".__wo_a__", 1)[0]
-            wo_a_split.setdefault(parent_prefix, {})[leaf] = tensor
-            return
-        if model_key.endswith("kv_a_layernorm.weight__slice_kv_lora__"):
-            base = model_key[: -len("__slice_kv_lora__")]
-            # ckpt layout assumed [kv_lora; rope_pe] — keep first kv_lora_rank.
-            out[base] = tensor[:kv_lora_rank].contiguous()
-            return
+        if (routed_moe_scale_name == "weight_scale"
+                and ".mlp.experts." in model_key
+                and (model_key.endswith(".weight")
+                     or model_key.endswith(".weight_scale"))
+                and tensor.dtype != torch.uint8):
+            tensor = tensor.view(torch.uint8)
         out[model_key] = tensor
 
     for k, v in weights.items():
@@ -437,27 +447,6 @@ def _remap_deepseek_v4_checkpoint_keys(
             cat_dim = 1 if suffix == "weight" else 0
             out[f"{layer_prefix}.eh_proj.{suffix}"] = torch.cat([e, h], dim=cat_dim)
 
-    # Materialize o_a_proj: ckpt has FP8 ``wo_a.weight`` (out, in) and a
-    # blockwise ``wo_a.scale``; model has bf16 ``o_a_proj`` shape
-    # (n_groups, o_lora_rank, in_dim). Dequantize then reshape. If the caller
-    # didn't pass ``o_a_proj_shape``, fall back to a 2D bf16 cast (loader will
-    # then raise on the first shape mismatch with a clear key).
-    if wo_a_split:
-        for parent_prefix, parts in wo_a_split.items():
-            w = parts.get("weight")
-            s = parts.get("scale")
-            target_key = f"{parent_prefix}.o_a_proj"
-            if w is None:
-                continue
-            if w.dtype == torch.float8_e4m3fn and s is not None:
-                w_bf16 = weight_dequant(w.contiguous().cuda(),
-                                        s.contiguous().cuda()).to(torch.bfloat16).cpu()
-            else:
-                w_bf16 = w.to(torch.bfloat16) if w.dtype != torch.bfloat16 else w
-            if o_a_proj_shape is not None and tuple(w_bf16.shape) != o_a_proj_shape:
-                w_bf16 = w_bf16.reshape(o_a_proj_shape)
-            out[target_key] = w_bf16
-
     return out
 
 
@@ -475,31 +464,20 @@ class DeepseekV4WeightLoader:
         # presence of any top-level "layers." key; HF-style checkpoints use
         # "model.layers." and skip this branch.
         if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
-            # Probe one ``o_a_proj`` shape from the model so the remap can
-            # reshape ckpt ``wo_a`` (FP8, 2D) into the (n_groups, o_lora_rank,
-            # in_dim) bf16 layout the model expects.
-            o_a_proj_shape = None
-            for n, p in self.model.named_parameters():
-                if n.endswith(".self_attn.o_a_proj"):
-                    o_a_proj_shape = tuple(p.shape)
-                    break
             weights = _remap_deepseek_v4_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
-                o_a_proj_shape=o_a_proj_shape,
             )
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do
             # this in one place vs scattering zero-fills through the per-
             # module branches so the missing-key contract is auditable here.
-            #   q_b_layernorm.weight      → ones (identity RMSNorm)
             #   indexer.k_norm.weight     → ones
             #   indexer.k_norm.bias       → zeros
             #   indexer.wk.weight         → zeros (V4 indexer's k path is
             #                                served by compressor; wk unused)
             _ones_suffixes = (
-                "self_attn.q_b_layernorm.weight",
                 "self_attn.indexer.k_norm.weight",
             )
             _zeros_suffixes = (
@@ -662,6 +640,58 @@ class DeepseekV4WeightLoader:
 
             return kv_b_proj, k_nope_weight_trans
 
+        def load_o_a_proj(module_name: str, module) -> None:
+            weight_name = f"{module_name}.o_a_proj"
+            o_a_proj = weights[weight_name][:].unflatten(
+                0,
+                [
+                    module.num_groups,
+                    module.o_lora_rank,
+                ],
+            )
+
+            scale_name = f"{weight_name}.weight_scale_inv"
+            o_a_proj_scale = weights.get(scale_name)
+            if o_a_proj_scale is not None:
+                o_a_proj_scale = o_a_proj_scale[:].unflatten(
+                    0,
+                    [
+                        module.num_groups,
+                        module.o_lora_rank // 128,
+                    ],
+                )
+            elif o_a_proj.dtype == torch.float8_e4m3fn:
+                raise KeyError(f"Missing FP8 block scale for {weight_name}")
+
+            if not self.model_config.mapping.enable_attention_dp:
+                o_a_proj = split_matrix_tp(o_a_proj, tp_size, tp_rank, 0)
+                if o_a_proj_scale is not None:
+                    o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size,
+                                                     tp_rank, 0)
+
+            if o_a_proj_scale is not None:
+                o_a_proj = weight_dequant(
+                    o_a_proj.reshape(-1, o_a_proj.shape[-1]).contiguous().cuda(),
+                    o_a_proj_scale.reshape(-1,
+                                           o_a_proj_scale.shape[-1]).contiguous(
+                                           ).cuda(),
+                ).view(o_a_proj.shape)
+
+            module.o_a_proj.data.copy_(
+                o_a_proj.reshape(module.o_a_proj.shape).to(
+                    module.o_a_proj.dtype))
+
+            if (getattr(module, "o_a_proj_scale", None) is not None
+                    and o_a_proj_scale is not None):
+                module.o_a_proj_scale.data.copy_(
+                    o_a_proj_scale.reshape(module.o_a_proj_scale.shape))
+
+            if (getattr(module, "o_a_proj_dequant", None) is not None
+                    and o_a_proj_scale is not None):
+                module.o_a_proj_dequant.data.copy_(
+                    o_a_proj.reshape(module.o_a_proj_dequant.shape).to(
+                        module.o_a_proj_dequant.dtype))
+
         def split_kv_b_proj(kv_b_proj: torch.Tensor, is_scale: bool) -> torch.Tensor:
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
             local_v_head_dim = v_head_dim if not is_scale else v_head_dim // 128
@@ -719,13 +749,28 @@ class DeepseekV4WeightLoader:
             return True
 
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
-            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+            if name.startswith("draft_model"):
+                continue
+            names = name.split(".")
+            parent_module_name = ".".join(names[:-1])
+
+            if names[-1] == "mqa":
+                parent_attn_name = ".".join(names[:-1])
+                attn_sink_key = f"{parent_attn_name}.attn_sink"
+                if attn_sink_key in weights:
+                    sink_full = weights[attn_sink_key][:]
+                    if not self.model_config.mapping.enable_attention_dp:
+                        sink_full = split(sink_full, tp_size, tp_rank)
+                    sink_full = sink_full.to(torch.float32).cuda()
+                    module.attn_sink = nn.Parameter(sink_full,
+                                                    requires_grad=False)
+                continue
+
+            if len(module._parameters) <= 0:
                 continue
             elif any(skip_module in name for skip_module in skip_modules):
                 continue
             else:
-                names = name.split(".")
-                parent_module_name = ".".join(names[:-1])
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
                     mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
                     names[2] = str(
@@ -963,6 +1008,16 @@ class DeepseekV4WeightLoader:
                     )
                     module.load_weights(weights=[module_weights])
                 elif names[-1] == "self_attn":
+                    if f"{name}.o_a_proj" in weights:
+                        load_o_a_proj(name, module)
+                    attn_sink_key = f"{name}.attn_sink"
+                    if attn_sink_key in weights:
+                        sink_full = weights[attn_sink_key][:]
+                        if not self.model_config.mapping.enable_attention_dp:
+                            sink_full = split(sink_full, tp_size, tp_rank)
+                        sink_full = sink_full.to(torch.float32).cuda()
+                        module.mqa.attn_sink = nn.Parameter(
+                            sink_full, requires_grad=False)
                     continue
                 elif names[-1] == "mqa":
                     # DeepseekV4TrtllmAttention owns the optional attn_sink
@@ -1189,7 +1244,8 @@ class DeepseekV4Attention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=_make_deepseek_v4_pos_embd_params(model_config, layer_idx),
+            pos_embd_params=_deepseek_v4_pos_embd_params(
+                config, model_config, layer_idx),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -1225,10 +1281,7 @@ class DeepseekV4Gate(nn.Module):
             torch.empty((num_experts, hidden_size), dtype=dtype), requires_grad=False
         )
         self.moe_backend = moe_backend
-        if moe_backend == "TRTLLM":
-            bias_dtype = torch.bfloat16
-        else:
-            bias_dtype = torch.float32
+        bias_dtype = torch.float32
 
         self.is_hashed = is_hashed
         self.top_k = top_k
@@ -1273,10 +1326,8 @@ class DeepseekV4Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = torch.ops.trtllm.dsv3_router_gemm_op(
-            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
-        )
-        return logits
+        return torch.nn.functional.linear(hidden_states.float(),
+                                          self.weight.float())
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -1339,19 +1390,39 @@ class DeepseekV4MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
         )
-        # V4 reference: routed experts share one swiglu_limit; fused MoE op
-        # requires a per-local-expert fp32 tensor (cpp/.../moeOp.cpp).
+        experts_quant_config = self._get_experts_quant_config(
+            model_config, layer_idx)
+        if (override_quant_config is not None
+                and experts_quant_config is model_config.quant_config):
+            experts_quant_config = override_quant_config
+
         swiglu_limit = getattr(config, "swiglu_limit", None)
-        self.swiglu_limit = (
-            None
-            if not swiglu_limit or not math.isfinite(swiglu_limit)
-            else torch.full(
-                (num_experts // model_config.mapping.moe_ep_size,),
-                float(swiglu_limit),
-                dtype=torch.float32,
-                device="cuda",
-            )
-        )
+        moe_swiglu_limit = None
+        if swiglu_limit is not None:
+            supports_swiglu_limit = True
+            if (model_config.moe_backend or "").upper() == "TRTLLM":
+                supports_swiglu_limit = False
+                if experts_quant_config is not None:
+                    mode = experts_quant_config.layer_quant_mode
+                    supports_swiglu_limit = (
+                        mode.has_nvfp4()
+                        or mode.has_w4a16_mxfp4()
+                        or mode.has_w4a8_mxfp4_fp8()
+                        or mode.has_w4a8_mxfp4_mxfp8()
+                    )
+            if supports_swiglu_limit:
+                moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+                num_slots = (
+                    moe_load_balancer_config.num_slots
+                    if moe_load_balancer_config and moe_load_balancer_config.num_slots
+                    else num_experts
+                )
+                local_num_slots = num_slots // model_config.mapping.moe_ep_size
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                moe_swiglu_limit = torch.full(
+                    (local_num_slots,), float(swiglu_limit), dtype=torch.float32, device=device
+                )
+
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1360,19 +1431,17 @@ class DeepseekV4MoE(nn.Module):
             dtype=dtype,
             reduce_results=False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
-            override_quant_config=override_quant_config,
+            override_quant_config=experts_quant_config,
             aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx,
-            swiglu_limit=self.swiglu_limit,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
             weight_loading_mode=(
                 MoEWeightLoadingMode.W4A8_CUSTOM
-                if self._get_experts_quant_config(
-                    model_config, layer_idx
-                ).layer_quant_mode.is_int4_weight_only_per_group()
+                if experts_quant_config.layer_quant_mode.is_int4_weight_only_per_group()
                 else MoEWeightLoadingMode.VANILLA
             ),
+            swiglu_limit=moe_swiglu_limit,
         )
 
         self.mapping = model_config.mapping
@@ -1616,6 +1685,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             config.hidden_size,
             config.hc_sinkhorn_iters,
             dtype=torch.float32,
+            post_mult_value=2.0,
         )
 
         layer_idx_for_attention = layer_idx
@@ -1639,6 +1709,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             config.hidden_size,
             config.hc_sinkhorn_iters,
             dtype=torch.float32,
+            post_mult_value=2.0,
         )
 
         # FIXME: incompatible with mixed quantization mode
@@ -1660,9 +1731,11 @@ class DeepseekV4DecoderLayer(DecoderLayer):
 
         has_tp = mapping.has_tp()
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
-        self.fusion_config.POST_MOE_FUSION = (
-            self.fusion_config.PRE_MOE_FUSION and not disable_post_moe_fusion
-        )
+        # DeepSeek-V4 applies the next RMSNorm after mHC post_mapping and the
+        # next layer's mHC pre_mapping. Fusing the post-MoE all-reduce with the
+        # next RMSNorm would normalize the raw MoE output before mHC post_mapping,
+        # which is not equivalent.
+        self.fusion_config.POST_MOE_FUSION = False
 
         self.mlp = DeepseekV4MoE(
             num_experts=self.num_experts,
@@ -1698,19 +1771,20 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         )
         self.layer_idx = layer_idx
         # is_first_layer is baked in at __init__ time so the Python-side branch in
-        # forward() resolves at CUDA-graph capture time (layer 0 captures the hc_pre
-        # path, all other layers capture the fused_hc path).
+        # forward() resolves at CUDA-graph capture time.
         self.is_first_layer = layer_idx == 0
         # fused_hc knob: pretrained-config attr `enable_fused_hc` controls whether
         # the MHC boundary fusion (`mHC.fused_hc`) is used. When False, fall back
         # to the unfused `post_mapping → pre_mapping` chain (same path engram
         # layers already take). Env var TRTLLM_MHC_ENABLE_FUSED_HC overrides the
-        # config attr (set to "0" to force-disable). Default: True.
+        # config attr (set to "1" to force-enable while validating fused_hc).
+        # Default is disabled because fused_hc must be bit-equivalent to the
+        # explicit post_mapping -> pre_mapping chain before it can safely replace it.
         _env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
         if _env is not None:
             self.enable_fused_hc = _env not in ("0", "false", "False")
         else:
-            self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", True))
+            self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", False))
         self.next_layer_layernorm: RMSNorm = None
         # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if
@@ -2013,8 +2087,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         else:
             if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
-            if self.next_layer_layernorm is not None:
-                hidden_states = self.next_layer_layernorm(hidden_states)
 
         return hidden_states
 
