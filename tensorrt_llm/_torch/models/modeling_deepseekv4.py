@@ -141,27 +141,23 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     return y
 
 
-def _deepseek_v4_pos_embd_params(config: PretrainedConfig,
-                                 model_config: ModelConfig,
-                                 layer_idx: Optional[int]
-                                 ) -> PositionalEmbeddingParams:
+def _deepseek_v4_pos_embd_params(
+    config: PretrainedConfig, model_config: ModelConfig, layer_idx: Optional[int]
+) -> PositionalEmbeddingParams:
     rope_params = RopeParams.from_config(config)
 
     compress_ratios = None
     if model_config.sparse_attention_config is not None:
-        compress_ratios = getattr(model_config.sparse_attention_config,
-                                  "compress_ratios", None)
+        compress_ratios = getattr(model_config.sparse_attention_config, "compress_ratios", None)
     if not compress_ratios:
         compress_ratios = getattr(config, "compress_ratios", None)
 
     compress_ratio = 0
     if compress_ratios and layer_idx is not None:
-        compress_ratio = compress_ratios[min(layer_idx,
-                                             len(compress_ratios) - 1)]
+        compress_ratio = compress_ratios[min(layer_idx, len(compress_ratios) - 1)]
 
     if compress_ratio > 1:
-        rope_params.theta = getattr(config, "compress_rope_theta",
-                                    rope_params.theta)
+        rope_params.theta = getattr(config, "compress_rope_theta", rope_params.theta)
         rope_params.scale_type = RotaryScalingType.yarn
         # DeepSeek-V4 reference applies YaRN frequency interpolation but does
         # not scale the cos/sin amplitudes.
@@ -210,8 +206,9 @@ _SHARED_EXPERT_RENAME = {
 }
 
 
-def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
-                                       kv_lora_rank: int = 448) -> Dict:
+def _remap_deepseek_v4_checkpoint_keys(
+    weights: Dict, num_hidden_layers: int, kv_lora_rank: int = 448
+) -> Dict:
     """Convert DeepSeek-V4 checkpoint keys to model named-parameter keys.
 
     Why: the upstream DS-V4 release uses keys like ``layers.X.attn.wkv.weight``,
@@ -286,7 +283,7 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
         if rest == "gate.bias":
             return "gate.e_score_correction_bias"
         if rest.startswith("experts.") and rest.endswith(".scale"):
-            return f"{rest[:-len('.scale')]}.{routed_moe_scale_name}"
+            return f"{rest[: -len('.scale')]}.{routed_moe_scale_name}"
         rest = rest.replace(".scale", ".weight_scale_inv")
         # Non-hashed layers carry the routing logit bias as `gate.bias`; the
         # model wires it through `DeepseekV4Gate.e_score_correction_bias`.
@@ -306,21 +303,23 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
             return "input_layernorm.weight"
         if rest == "ffn_norm.weight":
             return "post_attention_layernorm.weight"
-        for hc_prefix in ("hc_attn_", "hc_ffn_"):
-            if rest.startswith(hc_prefix):
-                return f"{hc_prefix[:-1]}.{rest[len(hc_prefix):]}"
+        # ``hc_attn_*`` and ``hc_ffn_*`` are loaded by ``load_flat_hc_weights``
+        # which builds the lookup key as ``f"{stem}_{a}"`` with the parent
+        # module path as the stem (e.g. ``model.layers.0.hc_attn_fn``). Pass
+        # the flat-underscore form through unchanged so that lookup succeeds.
+        if rest.startswith("hc_attn_") or rest.startswith("hc_ffn_"):
+            return rest
         if rest.startswith("attn."):
-            new_sub = _rename_attn_subkey(rest[len("attn."):])
+            new_sub = _rename_attn_subkey(rest[len("attn.") :])
             return None if new_sub is None else f"self_attn.{new_sub}"
         if rest.startswith("ffn."):
-            return f"mlp.{_rename_ffn_subkey(rest[len('ffn.'):])}"
+            return f"mlp.{_rename_ffn_subkey(rest[len('ffn.') :])}"
         return rest
 
     out: Dict[str, torch.Tensor] = {}
     # Pending fusions: collected first, materialized at the end so we don't
     # depend on iteration order.
     compressor_split: Dict[str, Dict[str, torch.Tensor]] = {}
-    eh_proj_split: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def _record_compressor_part(model_key: str, part: str, tensor: torch.Tensor):
         # model_key looks like "...self_attn.compressor.<part>.weight" or with
@@ -338,11 +337,12 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
             part = "wkv" if model_key.endswith(".wkv.weight") else "wgate"
             _record_compressor_part(model_key, part, tensor)
             return
-        if (routed_moe_scale_name == "weight_scale"
-                and ".mlp.experts." in model_key
-                and (model_key.endswith(".weight")
-                     or model_key.endswith(".weight_scale"))
-                and tensor.dtype != torch.uint8):
+        if (
+            routed_moe_scale_name == "weight_scale"
+            and ".mlp.experts." in model_key
+            and (model_key.endswith(".weight") or model_key.endswith(".weight_scale"))
+            and tensor.dtype != torch.uint8
+        ):
             tensor = tensor.view(torch.uint8)
         out[model_key] = tensor
 
@@ -358,7 +358,10 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
             out["model.norm.weight"] = v
             continue
         if k.startswith("hc_head_"):
-            out[f"model.hc_head.{k[len('hc_head_'):]}"] = v
+            # ``load_flat_hc_weights`` looks up ``f"{stem}_{a}"`` with stem set
+            # to the module's full name path (``model.hc_head``). Emit the flat
+            # checkpoint key under the parent prefix so the lookup matches.
+            out[f"model.{k}"] = v
             continue
 
         # mtp.0.head.weight is intentionally dropped (Flash-Base only); see
@@ -368,10 +371,11 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
 
         # mtp.0.* — route to model.layers.{num_hidden_layers}.*
         if k.startswith("mtp.0."):
-            rest = k[len("mtp.0."):]
+            rest = k[len("mtp.0.") :]
             # MTP-only keys: enorm, hnorm map directly; norm maps to
-            # shared_head.norm; e_proj/h_proj fuse into eh_proj; hc_head_*
-            # maps to layer-local hc_head (the MTP layer's own HC).
+            # shared_head.norm; hc_head_* maps under shared_head; e_proj /
+            # h_proj are loaded as two separate Linear modules (no fused
+            # eh_proj on the MTP layer).
             if rest in ("enorm.weight", "hnorm.weight"):
                 out[f"{mtp_layer_prefix}.{rest}"] = v
                 continue
@@ -379,14 +383,19 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
                 out[f"{mtp_layer_prefix}.shared_head.norm.weight"] = v
                 continue
             if rest.startswith("hc_head_"):
-                out[f"{mtp_layer_prefix}.hc_head.{rest[len('hc_head_'):]}"] = v
+                # The MTP HCHead is wired at ``...shared_head.hc_head``, so
+                # ``load_flat_hc_weights`` matches ``names[-1] == "hc_head"``
+                # first and computes ``stem = ".".join(names)`` with the full
+                # module path. Emit at that full path with the flat suffix
+                # so the lookup matches.
+                out[f"{mtp_layer_prefix}.shared_head.{rest}"] = v
                 continue
             for proj in ("e_proj", "h_proj"):
                 if rest.startswith(f"{proj}."):
-                    suffix = rest[len(f"{proj}."):]
+                    suffix = rest[len(f"{proj}.") :]
                     if suffix == "scale":
                         suffix = "weight_scale_inv"
-                    eh_proj_split.setdefault(mtp_layer_prefix, {})[(proj, suffix)] = v
+                    out[f"{mtp_layer_prefix}.{proj}.{suffix}"] = v
                     break
             else:
                 # General per-layer transform reused for the MTP layer.
@@ -425,28 +434,6 @@ def _remap_deepseek_v4_checkpoint_keys(weights: Dict, num_hidden_layers: int,
             continue
         out[f"{bucket}.wkv_gate.weight"] = torch.cat([parts["wkv"], parts["wgate"]], dim=0)
 
-    # Materialize eh_proj fusion: model uses a single Linear(hidden*2, hidden);
-    # checkpoint splits it as e_proj (operates on embed-norm) and h_proj
-    # (operates on hidden-norm). Linear stores weight as [out, in], so the
-    # fused weight is concat([e_proj, h_proj], dim=1) so that
-    # eh_proj([e; h]) = e_proj @ e + h_proj @ h.
-    for layer_prefix, parts in eh_proj_split.items():
-        for suffix in ("weight", "weight_scale_inv"):
-            e = parts.get(("e_proj", suffix))
-            h = parts.get(("h_proj", suffix))
-            if e is None and h is None:
-                continue
-            if e is None or h is None:
-                # Partial fusion — pass through under a synthetic name so the
-                # loader raises with a clear key.
-                if e is not None:
-                    out[f"{layer_prefix}.e_proj.{suffix}"] = e
-                if h is not None:
-                    out[f"{layer_prefix}.h_proj.{suffix}"] = h
-                continue
-            cat_dim = 1 if suffix == "weight" else 0
-            out[f"{layer_prefix}.eh_proj.{suffix}"] = torch.cat([e, h], dim=cat_dim)
-
     return out
 
 
@@ -477,9 +464,7 @@ class DeepseekV4WeightLoader:
             #   indexer.k_norm.bias       → zeros
             #   indexer.wk.weight         → zeros (V4 indexer's k path is
             #                                served by compressor; wk unused)
-            _ones_suffixes = (
-                "self_attn.indexer.k_norm.weight",
-            )
+            _ones_suffixes = ("self_attn.indexer.k_norm.weight",)
             _zeros_suffixes = (
                 "self_attn.indexer.k_norm.bias",
                 "self_attn.indexer.wk.weight",
@@ -666,31 +651,29 @@ class DeepseekV4WeightLoader:
             if not self.model_config.mapping.enable_attention_dp:
                 o_a_proj = split_matrix_tp(o_a_proj, tp_size, tp_rank, 0)
                 if o_a_proj_scale is not None:
-                    o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size,
-                                                     tp_rank, 0)
+                    o_a_proj_scale = split_matrix_tp(o_a_proj_scale, tp_size, tp_rank, 0)
 
             if o_a_proj_scale is not None:
                 o_a_proj = weight_dequant(
                     o_a_proj.reshape(-1, o_a_proj.shape[-1]).contiguous().cuda(),
-                    o_a_proj_scale.reshape(-1,
-                                           o_a_proj_scale.shape[-1]).contiguous(
-                                           ).cuda(),
+                    o_a_proj_scale.reshape(-1, o_a_proj_scale.shape[-1]).contiguous().cuda(),
                 ).view(o_a_proj.shape)
 
             module.o_a_proj.data.copy_(
-                o_a_proj.reshape(module.o_a_proj.shape).to(
-                    module.o_a_proj.dtype))
+                o_a_proj.reshape(module.o_a_proj.shape).to(module.o_a_proj.dtype)
+            )
 
-            if (getattr(module, "o_a_proj_scale", None) is not None
-                    and o_a_proj_scale is not None):
+            if getattr(module, "o_a_proj_scale", None) is not None and o_a_proj_scale is not None:
                 module.o_a_proj_scale.data.copy_(
-                    o_a_proj_scale.reshape(module.o_a_proj_scale.shape))
+                    o_a_proj_scale.reshape(module.o_a_proj_scale.shape)
+                )
 
-            if (getattr(module, "o_a_proj_dequant", None) is not None
-                    and o_a_proj_scale is not None):
+            if getattr(module, "o_a_proj_dequant", None) is not None and o_a_proj_scale is not None:
                 module.o_a_proj_dequant.data.copy_(
                     o_a_proj.reshape(module.o_a_proj_dequant.shape).to(
-                        module.o_a_proj_dequant.dtype))
+                        module.o_a_proj_dequant.dtype
+                    )
+                )
 
         def split_kv_b_proj(kv_b_proj: torch.Tensor, is_scale: bool) -> torch.Tensor:
             local_qk_nope_head_dim = qk_nope_head_dim if not is_scale else qk_nope_head_dim // 128
@@ -762,8 +745,7 @@ class DeepseekV4WeightLoader:
                     if not self.model_config.mapping.enable_attention_dp:
                         sink_full = split(sink_full, tp_size, tp_rank)
                     sink_full = sink_full.to(torch.float32).cuda()
-                    module.attn_sink = nn.Parameter(sink_full,
-                                                    requires_grad=False)
+                    module.attn_sink = nn.Parameter(sink_full, requires_grad=False)
                 continue
 
             if len(module._parameters) <= 0:
@@ -1016,8 +998,7 @@ class DeepseekV4WeightLoader:
                         if not self.model_config.mapping.enable_attention_dp:
                             sink_full = split(sink_full, tp_size, tp_rank)
                         sink_full = sink_full.to(torch.float32).cuda()
-                        module.mqa.attn_sink = nn.Parameter(
-                            sink_full, requires_grad=False)
+                        module.mqa.attn_sink = nn.Parameter(sink_full, requires_grad=False)
                     continue
                 elif names[-1] == "mqa":
                     # DeepseekV4TrtllmAttention owns the optional attn_sink
@@ -1225,7 +1206,9 @@ class DeepseekV4Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        assert config.qk_rope_head_dim == 64, "DeepseekV4Attention only supports qk_rope_head_dim=64"
+        assert config.qk_rope_head_dim == 64, (
+            "DeepseekV4Attention only supports qk_rope_head_dim=64"
+        )
         assert config.kv_lora_rank == 448, "DeepseekV4Attention only supports kv_lora_rank=448"
         predicted_tokens_per_seq = (
             model_config.spec_config.tokens_per_gen_step
@@ -1244,8 +1227,7 @@ class DeepseekV4Attention(MLA):
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
-            pos_embd_params=_deepseek_v4_pos_embd_params(
-                config, model_config, layer_idx),
+            pos_embd_params=_deepseek_v4_pos_embd_params(config, model_config, layer_idx),
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
@@ -1326,8 +1308,7 @@ class DeepseekV4Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(hidden_states.float(),
-                                          self.weight.float())
+        return torch.nn.functional.linear(hidden_states.float(), self.weight.float())
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -1390,10 +1371,8 @@ class DeepseekV4MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
         )
-        experts_quant_config = self._get_experts_quant_config(
-            model_config, layer_idx)
-        if (override_quant_config is not None
-                and experts_quant_config is model_config.quant_config):
+        experts_quant_config = self._get_experts_quant_config(model_config, layer_idx)
+        if override_quant_config is not None and experts_quant_config is model_config.quant_config:
             experts_quant_config = override_quant_config
 
         swiglu_limit = getattr(config, "swiglu_limit", None)
@@ -2130,6 +2109,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2137,6 +2117,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
         else:
@@ -2148,6 +2129,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
+                quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2158,6 +2140,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
+                quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
 
@@ -2199,8 +2182,8 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         tp_size = self.model_config.mapping.tp_size
         tp_rank = self.model_config.mapping.tp_rank
         if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
-            inputs_embeds = torch.chunk(inputs_embeds, tp_size, dim=-1)[tp_rank]
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+            inputs_embeds = torch.chunk(inputs_embeds, tp_size, dim=-1)[tp_rank].contiguous()
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank].contiguous()
 
         inputs_embeds = self.e_proj(inputs_embeds).unsqueeze(1)
         hidden_states = self.h_proj(hidden_states)
