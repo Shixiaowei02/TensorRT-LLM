@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycle)
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
@@ -13,7 +14,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
-from ..dsa import DSAtrtllmAttentionMetadata, Indexer, _to_float, rotate_activation
+from ..dsa import DSAtrtllmAttentionMetadata, Indexer, rotate_activation
 from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor
 
@@ -901,6 +902,16 @@ class DeepseekV4Indexer(Indexer):
             layer_idx,
             aux_stream,
         )
+        # Override base Indexer.weights_proj to bf16 (matches V4 checkpoint).
+        self.weights_proj = Linear(
+            self.hidden_size,
+            self.n_heads,
+            bias=False,
+            dtype=dtype,
+            quant_config=None,
+            skip_create_weights_in_init=skip_create_weights_in_init,
+            use_custom_cublas_mm=True,
+        )
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
@@ -925,6 +936,11 @@ class DeepseekV4Indexer(Indexer):
             is_indexer=True,
             rotate_activation=True,
         )
+
+    def post_load_weights(self):
+        # V4 does not use the V3 fused fp32 wk+weights_proj GEMM, and the
+        # base concat would now hit an fp32/bf16 dtype mismatch.
+        return
 
     def _qk_projection_and_rope(self, qr: torch.Tensor, position_ids: torch.Tensor):
         """Project Q and apply RoPE.
@@ -965,7 +981,7 @@ class DeepseekV4Indexer(Indexer):
         # multi-stream q proj/rope and weights proj
         q, weights = maybe_execute_in_parallel(
             lambda: self._qk_projection_and_rope(qr, position_ids),
-            lambda: self.weights_proj(_to_float(hidden_states)),
+            lambda: self.weights_proj(hidden_states),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
