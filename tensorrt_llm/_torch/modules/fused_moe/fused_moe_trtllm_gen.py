@@ -796,6 +796,7 @@ class TRTLLMGenFusedMoE(MoE):
         run_post_quant_allgather = (self.use_dp and self.parallel_size > 1
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
+        requires_separated_routing = self.routing_method.requires_separated_routing
 
         x_sf = None
         token_selected_experts = None
@@ -806,7 +807,7 @@ class TRTLLMGenFusedMoE(MoE):
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
-        if post_quant_comm:
+        if post_quant_comm or requires_separated_routing:
             self._load_balancer_start_wait_gpu_stage(is_first_call)
 
             token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -838,6 +839,7 @@ class TRTLLMGenFusedMoE(MoE):
             # Use routed slots for subsequent processing
             token_selected_experts = token_selected_slots
 
+        if post_quant_comm:
             x, x_sf = self.quantize_input(x)
 
         if self.enable_alltoall:
@@ -978,7 +980,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Call the extracted run_moe interface
         # Determine router_logits based on post_quant_comm
-        router_logits_arg = None if post_quant_comm else router_logits
+        router_logits_arg = None if (
+            post_quant_comm or requires_separated_routing) else router_logits
 
         final_hidden_states = self.run_moe(
             x=x,

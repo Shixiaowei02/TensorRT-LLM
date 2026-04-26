@@ -2906,9 +2906,13 @@ class BaseLlmArgs(StrictBaseModel):
         if self.skip_tokenizer_init:
             self.tokenizer = None
         elif self.custom_tokenizer:
-            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
-            if isinstance(self.tokenizer,
-                          (TokenizerBase, PreTrainedTokenizerBase)):
+            # IPC workers receive the tokenizer object that was already loaded
+            # in the parent LLM process. Reuse TRT-LLM tokenizer wrappers as-is.
+            if isinstance(self.tokenizer, TokenizerBase):
+                return self
+            # A raw HF tokenizer object would bypass the requested custom
+            # wrapper, so keep rejecting that combination.
+            if isinstance(self.tokenizer, PreTrainedTokenizerBase):
                 raise ValueError(
                     "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
                     "Please specify a tokenizer path or leave it as None to load from model path."
@@ -2918,6 +2922,8 @@ class BaseLlmArgs(StrictBaseModel):
             TOKENIZER_ALIASES = {
                 'deepseek_v32':
                 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+                'deepseek_v4':
+                'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
                 'glm_moe_dsa':
                 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
             }

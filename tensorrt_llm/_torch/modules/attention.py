@@ -1299,7 +1299,9 @@ class MLA(nn.Module):
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
             self.q_b_proj = self.q_proj
 
-        self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
+        kv_a_layernorm_hidden_size = (self.kv_lora_rank + self.qk_rope_head_dim
+                                      if self.is_deepseek_v4 else kv_lora_rank)
+        self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size,
                                       dtype=dtype,
                                       eps=rms_norm_eps)
 
@@ -1847,7 +1849,8 @@ class MLA(nn.Module):
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 
         q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+            -1)
 
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
@@ -2004,16 +2007,19 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        q, kv = self.kv_a_proj_with_mqa(hidden_states).split([
+            self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim
+        ], -1)
 
-        q, compressed_kv = maybe_execute_in_parallel(
+        q, kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
-            lambda: self.kv_a_layernorm(compressed_kv),
+            lambda: self.kv_a_layernorm(kv),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
         )
+        compressed_kv, k_pe = kv.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], -1)
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 

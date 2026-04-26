@@ -1,8 +1,10 @@
 import inspect
+import json
+import struct
 import weakref
 from copy import deepcopy
-from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import PretrainedConfig
 
@@ -15,12 +17,16 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
+    DeepseekV4Gate,
     DeepseekV4MoE,
-    _make_deepseek_v4_pos_embd_params,
+    _deepseek_v4_pos_embd_params,
+    _remap_deepseek_v4_checkpoint_keys,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -28,6 +34,7 @@ from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 DEEPSEEK_V4_TINY_CONFIG = {
     "architectures": ["DeepseekV4ForCausalLM"],
@@ -78,80 +85,253 @@ DEEPSEEK_V4_TINY_CONFIG = {
 }
 
 
-# class TestDeepSeekV4(unittest.TestCase):
+def _write_safetensors_header(path, tensor_name, dtype, shape):
+    header = {
+        tensor_name: {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [0, 0],
+        }
+    }
+    payload = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(payload)) + payload)
 
 
-def _make_deepseek_v4_test_config():
-    config = PretrainedConfig(**deepcopy(DEEPSEEK_V4_TINY_CONFIG))
-    config.torch_dtype = torch.bfloat16
-    return config
+def test_deepseek_v4_config_aliases():
+    config = DeepseekV4Config(num_hash_layers=5,
+                              sliding_window=256,
+                              head_dim=128,
+                              score_func="sigmoid",
+                              swiglu_limit=9.0)
+
+    assert config.model_type == "deepseek_v4"
+    assert config.n_hash_layers == 5
+    assert config.window_size == 256
+    assert config.v_head_dim == 128
+    assert config.scoring_func == "sigmoid"
+    assert config.swiglu_limit == 9.0
 
 
-def _make_rope_test_model_config(compress_ratios):
-    return SimpleNamespace(
-        pretrained_config=_make_deepseek_v4_test_config(),
-        sparse_attention_config=SimpleNamespace(compress_ratios=compress_ratios),
-    )
+def test_deepseek_v4_model_defaults_keep_tokens_per_block():
+    class LlmArgs:
+        pass
+
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
+
+    assert defaults == {"kv_cache_config": {"tokens_per_block": 128}}
 
 
-def test_deepseek_v4_rope_params_use_compressed_theta_only_for_compressed_layers():
-    model_config = _make_rope_test_model_config([128, 4, 1])
-    config = model_config.pretrained_config
+def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
+    weights = {
+        "layers.0.ffn.experts.0.w1.weight": torch.tensor(
+            [[-1, 2], [3, -4]], dtype=torch.int8),
+        "layers.0.ffn.experts.0.w1.scale": torch.tensor(
+            [1, 2], dtype=torch.int8),
+    }
 
-    for layer_idx in [0, 1]:
-        pos_params = _make_deepseek_v4_pos_embd_params(model_config, layer_idx)
-        assert pos_params.type == PositionEmbeddingType.yarn
-        assert pos_params.is_neox is False
-        assert pos_params.rope.theta == config.compress_rope_theta
-        assert pos_params.rope.scale_type == RotaryScalingType.yarn
-        assert pos_params.rope.scale == config.rope_scaling["factor"]
-        assert (
-            pos_params.rope.original_max_positions
-            == config.rope_scaling["original_max_position_embeddings"]
-        )
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
 
-    pos_params = _make_deepseek_v4_pos_embd_params(model_config, 2)
-    assert pos_params.type == PositionEmbeddingType.yarn
-    assert pos_params.is_neox is False
-    assert pos_params.rope.theta == config.rope_theta
-    assert pos_params.rope.scale_type == RotaryScalingType.none
-    assert pos_params.rope.scale == 1.0
-    assert pos_params.rope.mscale == 1.0
-    assert pos_params.rope.mscale_all_dim == 0.0
-    assert pos_params.rope.original_max_positions == config.max_position_embeddings
+    assert remapped[
+        "model.layers.0.mlp.experts.0.w1.weight"].dtype == torch.uint8
+    assert remapped[
+        "model.layers.0.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
 
 
-def test_deepseek_v4_rope_params_fallback_to_base_rope_for_non_compressed_edge_cases():
-    config = _make_deepseek_v4_test_config()
-    model_configs = [
-        SimpleNamespace(pretrained_config=config, sparse_attention_config=None),
-        _make_rope_test_model_config(None),
-        _make_rope_test_model_config([]),
-        _make_rope_test_model_config([128]),
-        _make_rope_test_model_config([128]),
-        _make_rope_test_model_config([0]),
-    ]
-    layer_idxs = [None, 0, 0, 1, -1, 0]
+def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
+    weights = {
+        "layers.0.ffn.experts.0.w1.weight": torch.zeros(
+            (2, 2), dtype=torch.float32),
+        "layers.0.ffn.experts.0.w1.scale": torch.ones(
+            (2, 2), dtype=torch.float32),
+    }
 
-    for model_config, layer_idx in zip(model_configs, layer_idxs):
-        pos_params = _make_deepseek_v4_pos_embd_params(model_config, layer_idx)
-        assert pos_params.rope.theta == config.rope_theta
-        assert pos_params.rope.scale_type == RotaryScalingType.none
-        assert pos_params.rope.scale == 1.0
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert "model.layers.0.mlp.experts.0.w1.weight_scale_inv" in remapped
+    assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
 
 
-def test_deepseek_v4_compressed_rope_falls_back_to_base_theta_if_missing_compress_theta():
-    model_config = _make_rope_test_model_config([4])
-    config = model_config.pretrained_config
-    delattr(config, "compress_rope_theta")
+def test_deepseek_v4_kv_norm_keeps_full_head_dim():
+    weights = {
+        "layers.0.attn.kv_norm.weight": torch.arange(512, dtype=torch.float32),
+    }
 
-    pos_params = _make_deepseek_v4_pos_embd_params(model_config, 0)
-    assert pos_params.rope.theta == config.rope_theta
-    assert pos_params.rope.scale_type == RotaryScalingType.yarn
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    tensor = remapped["model.layers.0.self_attn.kv_a_layernorm.weight"]
+    assert tensor.shape == (512, )
+    assert tensor[-1].item() == 511
+
+
+def test_deepseek_v4_gate_bias_maps_to_score_correction_bias():
+    weights = {
+        "layers.0.ffn.gate.bias": torch.arange(4, dtype=torch.float32),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert torch.equal(
+        remapped["model.layers.0.mlp.gate.e_score_correction_bias"],
+        weights["layers.0.ffn.gate.bias"])
+
+
+def test_deepseek_v4_gate_uses_fp32_reference_linear():
+    gate = DeepseekV4Gate(hidden_size=4,
+                          num_experts=3,
+                          top_k=2,
+                          n_group=1,
+                          topk_group=1,
+                          routed_scaling_factor=1.0,
+                          is_hashed=False,
+                          dtype=torch.bfloat16,
+                          moe_backend="TRTLLM")
+    hidden_states = torch.tensor([[1.0, -2.0, 3.0, -4.0]],
+                                 dtype=torch.bfloat16)
+    weight = torch.tensor([[1.0, 2.0, 3.0, 4.0],
+                           [-1.0, 1.0, -1.0, 1.0],
+                           [0.5, -0.5, 0.25, -0.25]],
+                          dtype=torch.bfloat16)
+    gate.weight.copy_(weight)
+
+    logits = gate(hidden_states)
+
+    assert gate.e_score_correction_bias.dtype == torch.float32
+    assert logits.dtype == torch.float32
+    assert torch.equal(logits,
+                       torch.nn.functional.linear(hidden_states.float(),
+                                                  weight.float()))
+
+
+def test_deepseek_v4_attn_sink_remap():
+    weights = {
+        "layers.0.attn.attn_sink": torch.arange(4, dtype=torch.float32),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert torch.equal(remapped["model.layers.0.self_attn.attn_sink"],
+                       weights["layers.0.attn.attn_sink"])
+
+
+def test_deepseek_v4_flat_hc_weight_remap():
+    weights = {
+        "layers.0.hc_attn_fn": torch.tensor([1.0]),
+        "layers.0.hc_ffn_scale": torch.tensor([2.0]),
+        "hc_head_base": torch.tensor([3.0]),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert torch.equal(remapped["model.layers.0.hc_attn.fn"],
+                       weights["layers.0.hc_attn_fn"])
+    assert torch.equal(remapped["model.layers.0.hc_ffn.scale"],
+                       weights["layers.0.hc_ffn_scale"])
+    assert torch.equal(remapped["model.hc_head.base"],
+                       weights["hc_head_base"])
+
+
+def test_deepseek_v4_o_a_proj_scale_remap():
+    weights = {
+        "layers.0.attn.wo_a.weight": torch.zeros(
+            (8, 8), dtype=torch.float8_e4m3fn),
+        "layers.0.attn.wo_a.scale": torch.ones(
+            (1, 1), dtype=torch.float32),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert "model.layers.0.self_attn.o_a_proj" in remapped
+    assert "model.layers.0.self_attn.o_a_proj.weight_scale_inv" in remapped
+
+
+def test_deepseek_v4_q_b_layernorm_matches_per_head_reference():
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    if not torch.cuda.is_available():
+        pytest.skip("RMSNorm fast paths require CUDA")
+
+    eps = 1e-6
+    num_heads = 2
+    head_dim = 4
+    device = torch.device("cuda")
+    norm = RMSNorm(hidden_size=head_dim,
+                   eps=eps,
+                   dtype=torch.bfloat16,
+                   device=device,
+                   has_weights=False)
+    hidden_states = torch.arange(1, 17, dtype=torch.bfloat16,
+                                 device=device).reshape(2, 8)
+
+    output = norm(hidden_states.view(-1, head_dim)).view_as(hidden_states)
+
+    ref = hidden_states.view(2, num_heads, head_dim)
+    ref = ref * torch.rsqrt(
+        ref.square().float().mean(dim=-1, keepdim=True) + eps).to(ref.dtype)
+    torch.testing.assert_close(output, ref.reshape(2, 8), rtol=1e-2, atol=2e-2)
+    assert list(norm.named_parameters()) == []
+
+
+def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    if not torch.cuda.is_available():
+        pytest.skip("RMSNorm fast paths require CUDA")
+
+    eps = 1e-6
+    head_dim = 4
+    device = torch.device("cuda")
+    head_scales = torch.tensor([1.0, 10.0, 0.1, 1.0],
+                               dtype=torch.bfloat16,
+                               device=device)
+    num_heads = head_scales.numel()
+    base = torch.arange(1, 1 + 2 * num_heads * head_dim,
+                        dtype=torch.bfloat16, device=device).view(
+                            2, num_heads, head_dim)
+    hidden_states = (base * head_scales.view(1, num_heads, 1)).reshape(
+        2, num_heads * head_dim)
+
+    per_head_norm = RMSNorm(hidden_size=head_dim,
+                            eps=eps,
+                            dtype=torch.bfloat16,
+                            device=device,
+                            has_weights=False)
+    per_head = per_head_norm(hidden_states.view(-1, head_dim)).view_as(
+        hidden_states)
+
+    joint_norm = RMSNorm(hidden_size=num_heads * head_dim,
+                         eps=eps,
+                         dtype=torch.bfloat16,
+                         device=device,
+                         has_weights=False)
+    joint = joint_norm(hidden_states)
+
+    assert not torch.allclose(per_head, joint, atol=0.1)
+
+
+def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
+    from tensorrt_llm._torch.modules.attention import MLA
+
+    init_src = inspect.getsource(MLA.__init__)
+    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
+
+    assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
+    assert "has_weights=False" in init_src
+    assert "kv_a_layernorm_hidden_size = (" in init_src
+    assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
+    assert "self.kv_a_layernorm = RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src
+    assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
-    assert inspect.signature(Compressor).parameters["rotate_activation"].default is False
+    assert inspect.signature(
+        Compressor).parameters["rotate_activation"].default is False
 
     indexer_init = inspect.getsource(DeepseekV4Indexer.__init__)
     assert "is_neox=False" in indexer_init
@@ -163,114 +343,127 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
 
 def test_deepseek_v4_moe_swiglu_limit_is_routed_only():
     moe_init = inspect.getsource(DeepseekV4MoE.__init__)
-    # Routed experts: swiglu_limit is built once and passed to create_moe.
-    assert moe_init.count("swiglu_limit=self.swiglu_limit") == 1
-    assert "torch.full" in moe_init  # per-local-expert fp32 tensor for the C++ op.
+    assert "moe_swiglu_limit = None" in moe_init
+    assert "supports_swiglu_limit = False" in moe_init
+    assert "mode.has_w4a8_mxfp4_mxfp8()" in moe_init
+    assert "swiglu_limit=moe_swiglu_limit" in moe_init
 
-    # Shared-expert block must not propagate swiglu_limit (V4 reference: shared
-    # expert has swiglu_limit=0, i.e., disabled).
-    shared_expert_block = moe_init.split("self.shared_experts = GatedMLP", 1)[1].split(
-        "self.allreduce", 1
-    )[0]
+    shared_expert_block = moe_init.split(
+        "self.shared_experts = GatedMLP", 1)[1].split(
+            "self.allreduce", 1)[0]
     assert "swiglu_limit" not in shared_expert_block
 
 
-def test_deepseek_v4_q_b_layernorm_matches_per_head_reference():
-    """V4 reference Q post-q_b_proj normalization is per-head unweighted RMS:
-        q = wq_b(q).unflatten(-1, (n_heads, head_dim))
-        q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)
+def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
+    captured = {}
 
-    The deepseek_v4 MLA branch realizes this by calling the standard ``RMSNorm``
-    op (so cuda_tile / flashinfer fast paths apply) on a ``[N*n_heads,
-    head_dim]`` view. ``has_weights=False`` registers an all-ones buffer so
-    no learnable scale is applied — matching the reference, which has no
-    ``q_b_layernorm.weight`` key in the checkpoint.
+    def fake_forward(self, *args, **kwargs):
+        captured.update(kwargs)
+        return "ok"
 
-    Tolerance accounts for fp32-internal RMSNorm vs bf16-direct reference
-    rounding (one-bf16-ULP at the typical post-norm magnitude).
-    """
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    monkeypatch.setattr(TrtllmAttention, "forward", fake_forward)
+    attn = object.__new__(DeepseekV4TrtllmAttention)
+    sink = torch.ones(4, dtype=torch.float32)
+    attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
 
-    if not torch.cuda.is_available():
-        import pytest
+    assert DeepseekV4TrtllmAttention.forward(attn, "q") == "ok"
+    assert captured["attention_sinks"].data_ptr() == sink.data_ptr()
 
-        pytest.skip("RMSNorm fast paths require CUDA")
 
-    n_heads, head_dim, eps = 8, 64, 1e-6
-    torch.manual_seed(0)
-    device = "cuda"
-    q = torch.randn(4, n_heads * head_dim, dtype=torch.bfloat16, device=device)
+def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version",
+                        lambda: 100)
 
-    norm = RMSNorm(
-        hidden_size=head_dim, eps=eps, dtype=torch.bfloat16, has_weights=False, device=device
+    assert ModelConfig.resolve_moe_backend(
+        "AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
+
+
+def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version",
+                        lambda: 100)
+    tensor_name = "layers.0.ffn.experts.0.w1.weight"
+    shard_name = "model-00001-of-00001.safetensors"
+    header = {
+        tensor_name: {
+            "dtype": "I8",
+            "shape": [2, 2],
+            "data_offsets": [0, 0],
+        },
+    }
+    payload = json.dumps(header).encode("utf-8")
+    (tmp_path / shard_name).write_bytes(
+        struct.pack("<Q", len(payload)) + payload)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {
+            tensor_name: shard_name,
+        }}))
+    config = DeepseekV4Config(num_hidden_layers=2)
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        config, str(tmp_path), "TRTLLM", None)
+
+    quant_config = layer_quant_config["model.layers.0.mlp.experts"]
+    assert layer_quant_config[
+        "model.layers.1.mlp.experts"].quant_algo == quant_config.quant_algo
+    assert quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+    assert quant_config.group_size == 32
+
+
+def test_deepseek_v4_routed_moe_quant_config_ignores_fp8_header(tmp_path):
+    tensor_name = "layers.0.ffn.experts.0.w1.weight"
+    shard_name = "model-00001-of-00001.safetensors"
+    _write_safetensors_header(tmp_path / shard_name, tensor_name, "F8_E4M3",
+                              [2, 2])
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {
+            tensor_name: shard_name
+        }}))
+    existing = {"existing": object()}
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        DeepseekV4Config(), str(tmp_path), "TRTLLM", existing)
+
+    assert layer_quant_config is existing
+
+
+def test_deepseek_v4_rope_params_follow_layer_compress_ratio():
+    config = DeepseekV4Config(
+        compress_ratios=[0, 4],
+        rope_theta=10000.0,
+        compress_rope_theta=160000.0,
+        rope_scaling={
+            "type": "yarn",
+            "factor": 16.0,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        },
     )
-    out = norm(q.view(-1, head_dim)).view_as(q)
-
-    ref = q.unflatten(-1, (n_heads, head_dim))
-    ref = ref * torch.rsqrt(ref.square().float().mean(-1, keepdim=True) + eps).to(ref.dtype)
-    ref = ref.reshape_as(q)
-
-    assert out.shape == q.shape
-    # bf16 ULP at magnitude ~1 is 2^-7 ≈ 7.8e-3; use 2e-2 to absorb worst case.
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=2e-2)
-
-
-def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
-    """Guard against regressing to flat-RMSNorm-over-(n_heads*head_dim).
-
-    Per-head normalization treats heads independently, so when heads have
-    different scales the output differs from a single joint RMS over the
-    flattened dim. The old buggy q_b_layernorm did the joint version.
-    """
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-
-    if not torch.cuda.is_available():
-        import pytest
-
-        pytest.skip("RMSNorm fast paths require CUDA")
-
-    head_dim, eps = 8, 1e-6
-    head_scales = torch.tensor([1.0, 10.0, 0.1, 1.0], dtype=torch.bfloat16)
-    n_heads = head_scales.numel()
-    device = "cuda"
-    torch.manual_seed(0)
-    base = torch.randn(2, n_heads, head_dim, dtype=torch.bfloat16, device=device)
-    q = (base * head_scales.to(device).view(1, n_heads, 1)).reshape(2, n_heads * head_dim)
-
-    per_head_norm = RMSNorm(
-        hidden_size=head_dim, eps=eps, dtype=torch.bfloat16, has_weights=False, device=device
+    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 1],
+        window_size=128,
     )
-    per_head = per_head_norm(q.view(-1, head_dim)).view_as(q)
+    model_config = ModelConfig(pretrained_config=config,
+                               sparse_attention_config=sparse_attn_config)
 
-    joint_norm = RMSNorm(
-        hidden_size=n_heads * head_dim,
-        eps=eps,
-        dtype=torch.bfloat16,
-        has_weights=False,
-        device=device,
-    )
-    joint = joint_norm(q)
+    dense_rope = _deepseek_v4_pos_embd_params(config, model_config, 0)
+    compressed_rope = _deepseek_v4_pos_embd_params(config, model_config, 1)
+    active_config_rope = _deepseek_v4_pos_embd_params(config, model_config, 2)
 
-    # Per-head and joint differ substantially when heads have wildly different
-    # scales — they only agree when every head has the same RMS, which the
-    # head_scales tensor breaks by construction.
-    assert not torch.allclose(per_head, joint, atol=0.1)
-
-
-def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    """MLA DeepSeek-V4 branch must use the standard RMSNorm op sized to
-    ``qk_head_dim`` with ``has_weights=False`` (V4 ckpt has no
-    ``q_b_layernorm.weight``), and call it on a ``[N*n_heads, head_dim]``
-    view of q so the per-row reduction matches per-head reduction."""
-    from tensorrt_llm._torch.modules.attention import MLA
-
-    init_src = inspect.getsource(MLA.__init__)
-    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
-
-    assert "self.q_b_layernorm = RMSNorm(hidden_size=self.qk_head_dim" in init_src
-    assert "has_weights=False" in init_src
-    assert "self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)" in forward_src
-
+    assert dense_rope.type == PositionEmbeddingType.rope_gptj
+    assert dense_rope.rope.scale_type == RotaryScalingType.none
+    assert dense_rope.rope.theta == 10000.0
+    assert dense_rope.rope.scale == 1.0
+    assert compressed_rope.type == PositionEmbeddingType.yarn
+    assert compressed_rope.rope.scale_type == RotaryScalingType.yarn
+    assert compressed_rope.rope.theta == 160000.0
+    assert compressed_rope.rope.scale == 16.0
+    assert compressed_rope.rope.mscale == 0.0
+    assert compressed_rope.rope.mscale_all_dim == 0.0
+    assert active_config_rope.type == PositionEmbeddingType.rope_gptj
+    assert active_config_rope.rope.scale_type == RotaryScalingType.none
+    assert active_config_rope.rope.theta == 10000.0
 
 def test_deepseek_v4_sanity():
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
@@ -297,6 +490,7 @@ def test_deepseek_v4_sanity():
         pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
     )
     model = DeepseekV4ForCausalLM(model_config).to(device)
+    assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
 
     context_sequence_length = [3, 2, 5]
     sequence_length = context_sequence_length + [1, 1]

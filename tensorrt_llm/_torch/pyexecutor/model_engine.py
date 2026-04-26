@@ -722,6 +722,7 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
+        curr_max_num_tokens = int(curr_max_num_tokens)
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
             (1 + self.max_total_draft_tokens) // self.max_beam_width)

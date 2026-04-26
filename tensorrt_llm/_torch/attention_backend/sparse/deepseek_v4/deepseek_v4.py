@@ -965,8 +965,8 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _update_k_cache(self, k_fp8, k_scale, metadata):
-        """No-op: DeepSeek-V4's compressor writes to the indexer k cache directly."""
-        pass
+        """Overwrite the fused compressor's FP8 cache with reference-style FP4-QAT values."""
+        super()._update_k_cache(k_fp8, k_scale, metadata)
 
     def forward(
         self,

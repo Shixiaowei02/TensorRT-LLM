@@ -155,6 +155,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -178,29 +180,37 @@ class ConfigurableMoE(MoE):
         tmp_skip_create_weights_in_init = model_config.skip_create_weights_in_init
         model_config._frozen = False
         model_config.skip_create_weights_in_init = True
+        original_quant_config = model_config.quant_config
+        if override_quant_config is not None:
+            model_config.quant_config = override_quant_config
         model_config._frozen = True
 
-        backend = create_moe_backend(
-            moe_cls=moe_cls,
-            routing_method=routing_method,
-            num_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            dtype=self.dtype,
-            reduce_results=self.reduce_results,
-            model_config=model_config,
-            aux_stream_dict=self.aux_stream_dict,
-            weight_loading_mode=self.weight_loading_mode,
-            bias=kwargs.get("bias", False),
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            layer_idx=None,
-            swiglu_alpha=kwargs.get("swiglu_alpha"),
-            swiglu_beta=kwargs.get("swiglu_beta"),
-            swiglu_limit=kwargs.get("swiglu_limit"),
-            init_load_balancer=False,
-            without_comm=True,
-            activation_type=self.activation_type,
-        )
+        try:
+            backend = create_moe_backend(
+                moe_cls=moe_cls,
+                routing_method=routing_method,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                dtype=self.dtype,
+                reduce_results=self.reduce_results,
+                model_config=model_config,
+                aux_stream_dict=self.aux_stream_dict,
+                weight_loading_mode=self.weight_loading_mode,
+                bias=kwargs.get("bias", False),
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                layer_idx=None,
+                swiglu_alpha=kwargs.get("swiglu_alpha"),
+                swiglu_beta=kwargs.get("swiglu_beta"),
+                swiglu_limit=kwargs.get("swiglu_limit"),
+                init_load_balancer=False,
+                without_comm=True,
+                activation_type=self.activation_type,
+            )
+        finally:
+            model_config._frozen = False
+            model_config.quant_config = original_quant_config
+            model_config._frozen = True
 
         self.validate_backend(backend)
         self.backend = backend

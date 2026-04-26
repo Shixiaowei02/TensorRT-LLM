@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+_DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
+_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 
 @contextlib.contextmanager
@@ -252,6 +256,11 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            sm_version = get_sm_version()
+            if 100 <= sm_version < 120:
+                return "TRTLLM"
+
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
             # Select the best performing backend based on SM version
@@ -443,6 +452,85 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def _read_safetensors_header(path: Path) -> Dict[str, Any]:
+        with open(path, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            return json.loads(f.read(header_size))
+
+    @staticmethod
+    def _get_safetensors_header_for_tensor(checkpoint_dir: str,
+                                           tensor_name: str) -> Optional[Dict]:
+        checkpoint_path = Path(checkpoint_dir)
+        candidates = []
+        index_path = checkpoint_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_name = index.get("weight_map", {}).get(tensor_name)
+            if shard_name is not None:
+                candidates.append(checkpoint_path / shard_name)
+
+        candidates.extend(sorted(checkpoint_path.glob("*.safetensors")))
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen or not candidate.exists():
+                continue
+            seen.add(candidate)
+            header = ModelConfig._read_safetensors_header(candidate)
+            if tensor_name in header:
+                return header[tensor_name]
+        return None
+
+    @staticmethod
+    def _detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir: str) -> Optional[str]:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return None
+
+        dtype = tensor_info.get("dtype")
+        shape = tensor_info.get("shape", [])
+        if dtype == "I8" and len(shape) == 2:
+            return "mxfp4"
+        if dtype is not None and dtype.startswith("F8_"):
+            return "fp8_block_scales"
+        return None
+
+    @staticmethod
+    def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
+                                                 checkpoint_dir: str,
+                                                 moe_backend: str,
+                                                 layer_quant_config):
+        layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir)
+        if layout != "mxfp4":
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+            moe_backend)
+        experts_quant_config.group_size = 32
+        experts_quant_config.exclude_modules = [
+            'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+            'embedding', 'unembedding'
+        ]
+
+        if layer_quant_config is None:
+            layer_quant_config = {}
+        else:
+            layer_quant_config = dict(layer_quant_config)
+
+        for layer_idx in range(pretrained_config.num_hidden_layers):
+            layer_quant_config[
+                f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected DeepSeek-V4 routed MoE MXFP4 checkpoint layout; using "
+            "%s for routed experts.", experts_quant_config.quant_algo)
+        return layer_quant_config
+
+    @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -589,7 +677,10 @@ class ModelConfig(Generic[TConfig]):
                     # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
                     # to 1 internally so cache allocation math works. The
                     # external config keeps the original semantics.
-                    compress_ratios = [1 if r == 0 else r for r in compress_ratios]
+                    compress_ratios = [
+                        ratio if ratio > 0 else 1
+                        for ratio in compress_ratios
+                    ]
 
                     # Adjust compress_ratios length based on MTP config.
                     num_base_layers = pretrained_config.num_hidden_layers
@@ -626,9 +717,10 @@ class ModelConfig(Generic[TConfig]):
             except OSError:
                 return None
 
-        # Some checkpoints lack torch_dtype, populate with dtype
-        pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
-                                                None)
+        # Some checkpoints lack torch_dtype, populate with dtype.
+        if getattr(pretrained_config, 'torch_dtype', None) is None:
+            pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
+                                                    None)
 
         # Apply model_kwargs to override config parameters if provided
         model_kwargs = kwargs.pop('model_kwargs', None)
@@ -695,6 +787,11 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
+                pretrained_config, checkpoint_dir, moe_backend,
+                layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
