@@ -65,6 +65,22 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name
 
+    def shutdown(self):
+        cpp_agent = getattr(self, "_cpp_agent", None)
+        if cpp_agent is None:
+            return
+        try:
+            cpp_agent.shutdown()
+        except Exception:
+            pass
+        self._cpp_agent = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
     def register_memory(self, descs: RegMemoryDescs):
         """Register memory regions."""
         cpp_descs = self._convert_reg_memory_descs(descs)

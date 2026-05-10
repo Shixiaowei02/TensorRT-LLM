@@ -380,6 +380,31 @@ def _get_attn_types_for_layer(
     return types
 
 
+# Mirror transceiver.py windowed-block trim: only in-window blocks are transferred.
+_WINDOWED_ATTN_TYPES = {
+    DeepseekV4AttentionType.SWA,
+    DeepseekV4AttentionType.COMPRESSOR_STATE,
+    DeepseekV4AttentionType.COMPRESSOR_SCORE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+}
+
+
+def _expected_valid_blocks(
+    attn_type: DeepseekV4AttentionType, compress_ratio: int, prompt_len: int
+) -> Optional[int]:
+    if attn_type == DeepseekV4AttentionType.SWA:
+        window = WINDOW_SIZE
+    elif attn_type in _WINDOWED_ATTN_TYPES:
+        state_factor = 2 if compress_ratio == OVERLAP_COMPRESSOR_RATIO else 1
+        window = state_factor * compress_ratio
+    else:
+        return None
+    total = (prompt_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+    stale = max(0, (prompt_len + 1 - window) // TOKENS_PER_BLOCK)
+    return total - stale
+
+
 def _split_blockwise_buffer(
     buffer: torch.Tensor,
     index_head_dim: int = INDEX_HEAD_DIM,
@@ -508,6 +533,17 @@ def verify_all_requests(
                     ctx_data, ctx_scales = _read_cache_data(ctx_mgr, layer_idx, attn_type, ctx_rid)
                     gen_data, gen_scales = _read_cache_data(gen_mgr, layer_idx, attn_type, gen_rid)
 
+                    expected_valid = _expected_valid_blocks(
+                        attn_type, compress_ratios[layer_idx], req_len
+                    )
+                    if expected_valid is not None:
+                        if expected_valid <= 0:
+                            ctx_data = ctx_data[:0]
+                            gen_data = gen_data[:0]
+                        else:
+                            ctx_data = ctx_data[-expected_valid:]
+                            gen_data = gen_data[-expected_valid:]
+
                     assert ctx_data.shape == gen_data.shape, (
                         f"Shape mismatch at req={req_idx} layer={layer_idx} "
                         f"attn={attn_type.name}: ctx={ctx_data.shape} gen={gen_data.shape}"
@@ -588,163 +624,168 @@ def run_deepseek_v4_transfer_test(
     ctx_tcs = create_instance_transceivers(ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config)
     gen_tcs = create_instance_transceivers(gen_tp, gen_pp, gen_enable_dp, gen_managers, config)
 
-    ctx_info_endpoint = _get_ctx_info_endpoint(ctx_tcs[0])
+    try:
+        ctx_info_endpoint = _get_ctx_info_endpoint(ctx_tcs[0])
 
-    # ===== 4. Create requests and determine handle map =====
-    # handle_map: rank -> [(req_idx, ctx_request, gen_request)]
-    ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
-    gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
-    ctx_request_ids: List[int] = []
-    gen_request_ids: List[int] = []
+        # ===== 4. Create requests and determine handle map =====
+        # handle_map: rank -> [(req_idx, ctx_request, gen_request)]
+        ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
+        gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
+        ctx_request_ids: List[int] = []
+        gen_request_ids: List[int] = []
 
-    sampling_params = SamplingParams()
+        sampling_params = SamplingParams()
 
-    for req_idx, req_len in enumerate(request_lengths):
-        unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-        ctx_rid = req_idx * 2
-        gen_rid = req_idx * 2 + 1
-        ctx_request_ids.append(ctx_rid)
-        gen_request_ids.append(gen_rid)
+        for req_idx, req_len in enumerate(request_lengths):
+            unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+            ctx_rid = req_idx * 2
+            gen_rid = req_idx * 2 + 1
+            ctx_request_ids.append(ctx_rid)
+            gen_request_ids.append(gen_rid)
 
-        ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
+            ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
 
-        ctx_request = LlmRequest(
-            request_id=ctx_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
-        )
-        ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            ctx_request = LlmRequest(
+                request_id=ctx_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
-        gen_request = LlmRequest(
-            request_id=gen_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        )
-        gen_request.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=ctx_rid,
-            ctx_dp_rank=ctx_dp_rank,
-            ctx_info_endpoint=ctx_info_endpoint,
-            disagg_request_id=unique_rid,
-        )
+            gen_request = LlmRequest(
+                request_id=gen_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            )
+            gen_request.py_disaggregated_params = DisaggregatedParams(
+                ctx_request_id=ctx_rid,
+                ctx_dp_rank=ctx_dp_rank,
+                ctx_info_endpoint=ctx_info_endpoint,
+                disagg_request_id=unique_rid,
+            )
 
-        for rank in range(ctx_world):
-            tp_rank = rank % ctx_tp
-            should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
-            if should_handle:
-                ctx_handle_map[rank].append((req_idx, ctx_request))
+            for rank in range(ctx_world):
+                tp_rank = rank % ctx_tp
+                should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
+                if should_handle:
+                    ctx_handle_map[rank].append((req_idx, ctx_request))
 
+            for rank in range(gen_world):
+                tp_rank = rank % gen_tp
+                should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
+                if should_handle:
+                    gen_handle_map[rank].append((req_idx, gen_request))
+
+        # ===== 5. Allocate KV cache for all ranks =====
+        # Uses prepare_context + resize_context (the V2 manager path).
+        # prepare_resources is a no-op for non-draft KVCacheManagerV2.
+        # All ranks must allocate BEFORE mutating shared request objects
+        # (add_new_token changes is_first_context_chunk).
+        gen_batches: Dict[int, ScheduledRequests] = {}
         for rank in range(gen_world):
-            tp_rank = rank % gen_tp
-            should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
-            if should_handle:
-                gen_handle_map[rank].append((req_idx, gen_request))
+            reqs = [req for _, req in gen_handle_map[rank]]
+            if reqs:
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = reqs
+                for req in reqs:
+                    gen_managers[rank].prepare_context(req)
+                    gen_managers[rank].resize_context(req, req.context_chunk_size)
+                gen_batches[rank] = batch
 
-    # ===== 5. Allocate KV cache for all ranks =====
-    # Uses prepare_context + resize_context (the V2 manager path).
-    # prepare_resources is a no-op for non-draft KVCacheManagerV2.
-    # All ranks must allocate BEFORE mutating shared request objects
-    # (add_new_token changes is_first_context_chunk).
-    gen_batches: Dict[int, ScheduledRequests] = {}
-    for rank in range(gen_world):
-        reqs = [req for _, req in gen_handle_map[rank]]
-        if reqs:
-            batch = ScheduledRequests()
-            batch.context_requests_last_chunk = reqs
-            for req in reqs:
-                gen_managers[rank].prepare_context(req)
-                gen_managers[rank].resize_context(req, req.context_chunk_size)
-            gen_batches[rank] = batch
+        ctx_batches: Dict[int, ScheduledRequests] = {}
+        for rank in range(ctx_world):
+            reqs = [req for _, req in ctx_handle_map[rank]]
+            if reqs:
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = reqs
+                for req in reqs:
+                    ctx_managers[rank].prepare_context(req)
+                    ctx_managers[rank].resize_context(req, req.context_chunk_size)
+                ctx_batches[rank] = batch
 
-    ctx_batches: Dict[int, ScheduledRequests] = {}
-    for rank in range(ctx_world):
-        reqs = [req for _, req in ctx_handle_map[rank]]
-        if reqs:
-            batch = ScheduledRequests()
-            batch.context_requests_last_chunk = reqs
-            for req in reqs:
-                ctx_managers[rank].prepare_context(req)
-                ctx_managers[rank].resize_context(req, req.context_chunk_size)
-            ctx_batches[rank] = batch
+        # ===== 5.5. context_current_position + add_new_token =====
+        # Set position on each unique request once (needed for transfer metadata).
+        seen: set = set()
+        for rank in range(ctx_world):
+            for _, req in ctx_handle_map[rank]:
+                if req.py_request_id not in seen:
+                    req.context_current_position = req.prompt_len
+                    req.add_new_token(req.prompt_len, 0)
+                    seen.add(req.py_request_id)
 
-    # ===== 5.5. context_current_position + add_new_token =====
-    # Set position on each unique request once (needed for transfer metadata).
-    seen: set = set()
-    for rank in range(ctx_world):
-        for _, req in ctx_handle_map[rank]:
-            if req.py_request_id not in seen:
-                req.context_current_position = req.prompt_len
-                req.add_new_token(req.prompt_len, 0)
-                seen.add(req.py_request_id)
+        seen = set()
+        for rank in range(gen_world):
+            for _, req in gen_handle_map[rank]:
+                if req.py_request_id not in seen:
+                    req.context_current_position = req.prompt_len
+                    req.add_new_token(req.prompt_len, 0)
+                    seen.add(req.py_request_id)
 
-    seen = set()
-    for rank in range(gen_world):
-        for _, req in gen_handle_map[rank]:
-            if req.py_request_id not in seen:
-                req.context_current_position = req.prompt_len
-                req.add_new_token(req.prompt_len, 0)
-                seen.add(req.py_request_id)
+        # ===== 5.6. update_resources BEFORE transfer (mode: update_before) =====
+        if update_before_transfer:
+            for rank, batch in ctx_batches.items():
+                ctx_managers[rank].update_resources(batch)
+            for rank, batch in gen_batches.items():
+                gen_managers[rank].update_resources(batch)
 
-    # ===== 5.6. update_resources BEFORE transfer (mode: update_before) =====
-    if update_before_transfer:
-        for rank, batch in ctx_batches.items():
-            ctx_managers[rank].update_resources(batch)
-        for rank, batch in gen_batches.items():
-            gen_managers[rank].update_resources(batch)
+        # ===== 6. gen receive + ctx send =====
+        for rank in range(gen_world):
+            for _, req in gen_handle_map[rank]:
+                gen_tcs[rank].request_and_receive_async(req)
+        for rank in range(ctx_world):
+            for _, req in ctx_handle_map[rank]:
+                ctx_tcs[rank].respond_and_send_async(req)
 
-    # ===== 6. gen receive + ctx send =====
-    for rank in range(gen_world):
-        for _, req in gen_handle_map[rank]:
-            gen_tcs[rank].request_and_receive_async(req)
-    for rank in range(ctx_world):
-        for _, req in ctx_handle_map[rank]:
-            ctx_tcs[rank].respond_and_send_async(req)
+        # ===== 7. Wait for completion (threaded, dist calls inside) =====
+        run_concurrent(
+            ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
+        )
+        run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
-    # ===== 7. Wait for completion (threaded, dist calls inside) =====
-    run_concurrent(ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True))
-    run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+        # ===== 7.5. update_resources AFTER transfer (mode: update_after) =====
+        if not update_before_transfer:
+            for rank, batch in ctx_batches.items():
+                ctx_managers[rank].update_resources(batch)
+            for rank, batch in gen_batches.items():
+                gen_managers[rank].update_resources(batch)
 
-    # ===== 7.5. update_resources AFTER transfer (mode: update_after) =====
-    if not update_before_transfer:
-        for rank, batch in ctx_batches.items():
-            ctx_managers[rank].update_resources(batch)
-        for rank, batch in gen_batches.items():
-            gen_managers[rank].update_resources(batch)
+        # ===== 8. Verify =====
+        verify_all_requests(
+            request_lengths=request_lengths,
+            compress_ratios=compress_ratios,
+            ctx_managers=ctx_managers,
+            gen_managers=gen_managers,
+            ctx_tp=ctx_tp,
+            ctx_pp=ctx_pp,
+            gen_tp=gen_tp,
+            gen_pp=gen_pp,
+            ctx_enable_dp=ctx_enable_dp,
+            gen_enable_dp=gen_enable_dp,
+            ctx_request_ids=ctx_request_ids,
+            gen_request_ids=gen_request_ids,
+        )
 
-    # ===== 8. Verify =====
-    verify_all_requests(
-        request_lengths=request_lengths,
-        compress_ratios=compress_ratios,
-        ctx_managers=ctx_managers,
-        gen_managers=gen_managers,
-        ctx_tp=ctx_tp,
-        ctx_pp=ctx_pp,
-        gen_tp=gen_tp,
-        gen_pp=gen_pp,
-        ctx_enable_dp=ctx_enable_dp,
-        gen_enable_dp=gen_enable_dp,
-        ctx_request_ids=ctx_request_ids,
-        gen_request_ids=gen_request_ids,
-    )
-
-    # ===== 9. Cleanup =====
-    for tc in ctx_tcs:
-        tc.shutdown()
-    for tc in gen_tcs:
-        tc.shutdown()
-    for mgr in ctx_managers:
-        mgr.shutdown()
-    for mgr in gen_managers:
-        mgr.shutdown()
+    finally:
+        for tc in ctx_tcs + gen_tcs:
+            try:
+                tc.shutdown()
+            except Exception:
+                pass
+        for mgr in ctx_managers + gen_managers:
+            try:
+                mgr.shutdown()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

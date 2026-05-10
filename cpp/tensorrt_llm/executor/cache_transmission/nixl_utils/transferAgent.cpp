@@ -812,9 +812,24 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
     return status == NIXL_SUCCESS;
 }
 
+void NixlTransferAgent::shutdown() noexcept
+{
+    if (mShutdown.exchange(true))
+    {
+        return;
+    }
+    TLLM_LOG_DEBUG("NixlTransferAgent::shutdown");
+    mExtraParams.backends.clear();
+    mRawBackend = nullptr;
+    mRawAgent.reset();
+    mLocalVramRegionInfo.clear();
+    mRemoteVramRegionInfo.clear();
+}
+
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
+    shutdown();
 }
 
 NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)

@@ -1606,6 +1606,13 @@ class TransferWorker:
         finalizer = getattr(self, "_finalizer", None)
         if finalizer is not None:
             finalizer()
+        agent = getattr(self, "_agent", None)
+        if agent is not None:
+            try:
+                agent.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker.shutdown: agent.shutdown error: {e}")
+            self._agent = None
 
     def __del__(self):
         try:

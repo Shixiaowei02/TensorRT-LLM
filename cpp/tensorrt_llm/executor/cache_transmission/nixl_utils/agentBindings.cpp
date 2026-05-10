@@ -247,6 +247,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
+        .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"))
         .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"))
         .def("load_remote_agent",

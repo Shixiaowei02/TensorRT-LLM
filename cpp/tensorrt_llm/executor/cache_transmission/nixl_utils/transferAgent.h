@@ -73,6 +73,9 @@ public:
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
 
+    /// Synchronously release NIXL agent / UCX / prog_thread. Idempotent.
+    void shutdown() noexcept;
+
     void registerMemory(RegisterDescs const& descs) override;
 
     void deregisterMemory(RegisterDescs const& descs) override;
@@ -111,6 +114,7 @@ private:
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
+    std::atomic<bool> mShutdown{false};
 
     std::vector<char> mDRamSrcBuffer;
     std::vector<char> mDRamDstBuffer;
