@@ -1,9 +1,14 @@
+import os
 from dataclasses import dataclass, field
 from unittest import TestCase
 from unittest.mock import Mock
 
 import pytest
 import torch
+
+# Exclude UCX IB transport to avoid NIXL setup hangs in environments where
+# IB is misconfigured or unreachable.
+os.environ.setdefault("UCX_TLS", "^ib")
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (

@@ -388,12 +388,22 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
+            status = self._agent.submit_transfer_requests(request)
+            if not status.wait():
                 agent_result = AgentResult.FAILED
+                last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+                agent_name = getattr(self._agent, "name", "<?>")
+                detail = (
+                    f"KV transfer failed for request {write_meta.unique_rid}: "
+                    f"nixl_status={last_status} agent={agent_name} "
+                    f"peer={write_meta.peer_name} peer_rank={write_meta.peer_rank} "
+                    f"peer_endpoint={write_meta.peer_endpoint} slice={write_meta.slice_id} "
+                    f"op=WRITE src_size={write_meta.src_ptrs.size} "
+                    f"dst_size={write_meta.dst_ptrs.size}"
+                )
+                logger.error(detail)
                 if not write_meta.task_future.done():
-                    write_meta.task_future.set_exception(
-                        RuntimeError(f"KV transfer failed for request {write_meta.unique_rid}")
-                    )
+                    write_meta.task_future.set_exception(RuntimeError(detail))
                 task.status = TaskStatus.ERROR
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
@@ -1256,12 +1266,14 @@ class RxSession(RxSessionBase):
                     ri = self._receiver._registrar.self_rank_info
                     task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
         elif status == AgentResult.FAILED:
+            detail = (
+                f"KV transfer failed for request {self.request_id} slice {slice_id} "
+                f"peer_rank={peer_rank} is_last_slice={is_last_slice} "
+                f"(reported by remote agent; see sender-side log for nixl_status)"
+            )
+            logger.error(detail)
             if not task.future.done():
-                task.future.set_exception(
-                    RuntimeError(
-                        f"KV transfer failed for request {self.request_id} slice {slice_id}"
-                    )
-                )
+                task.future.set_exception(RuntimeError(detail))
             task.status = TaskStatus.ERROR
         else:
             raise ValueError(

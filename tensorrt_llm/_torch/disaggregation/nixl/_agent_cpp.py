@@ -28,7 +28,16 @@ class BindingsNixlTransferStatus(TransferStatus):
         """Wait for transfer to complete (releases GIL)."""
         if timeout_ms is None:
             timeout_ms = -1
-        return self._cpp_status.wait(timeout_ms) == TransferState.SUCCESS
+        state = self._cpp_status.wait(timeout_ms)
+        return state == TransferState.SUCCESS
+
+    def last_status_str(self) -> str:
+        get = getattr(self._cpp_status, "get_last_status_str", None)
+        return get() if get is not None else "<unavailable>"
+
+    def last_status(self) -> int:
+        get = getattr(self._cpp_status, "get_last_status", None)
+        return int(get()) if get is not None else -1
 
 
 class BindingsNixlTransferAgent(BaseTransferAgent):

@@ -8,6 +8,10 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
+
+# Exclude UCX IB transport to avoid NIXL setup hangs in environments where
+# IB is misconfigured or unreachable.
+os.environ.setdefault("UCX_TLS", "^ib")
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 

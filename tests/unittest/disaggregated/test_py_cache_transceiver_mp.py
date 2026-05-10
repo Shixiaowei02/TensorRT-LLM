@@ -15,6 +15,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# Exclude UCX IB transport to avoid NIXL setup hangs in environments where
+# IB is misconfigured or unreachable.
+os.environ.setdefault("UCX_TLS", "^ib")
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm

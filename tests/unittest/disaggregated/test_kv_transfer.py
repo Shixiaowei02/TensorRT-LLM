@@ -1,8 +1,13 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
+
+# Exclude UCX IB transport to avoid NIXL setup hangs in environments where
+# IB is misconfigured or unreachable.
+os.environ.setdefault("UCX_TLS", "^ib")
 from dataclasses import dataclass
 from typing import List, Optional
 

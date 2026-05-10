@@ -3,6 +3,10 @@ import subprocess
 
 import pytest
 
+# Exclude UCX IB transport to avoid NIXL setup hangs in environments where
+# IB is misconfigured or unreachable.
+os.environ.setdefault("UCX_TLS", "^ib")
+
 
 def test_load_agent_missing_module():
     """_load_agent returns (None, ImportError) for a non-existent module.
