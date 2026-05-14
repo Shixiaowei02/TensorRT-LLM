@@ -65,6 +65,7 @@ class NixlTransferAgent(BaseTransferAgent):
         self.agent = nixl_agent(name, agent_config)
 
     def shutdown(self):
+        # nixl_agent has no explicit close; cleanup is GC-driven once all status refs drop.
         if getattr(self, "agent", None) is None:
             return
         self.agent = None

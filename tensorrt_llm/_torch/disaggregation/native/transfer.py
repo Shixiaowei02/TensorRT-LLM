@@ -21,7 +21,8 @@ except ImportError:
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
-    BaseTransferAgent,
+    AgentClosedError,
+    AgentHandle,
     MemoryDescs,
     MemoryType,
     RegMemoryDescs,
@@ -59,6 +60,8 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+
+# All NIXL transfer agent access in this module goes through AgentHandle; see base/agent.py.
 
 
 @dataclass
@@ -225,11 +228,13 @@ class Sender(SenderBase):
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
-        agent: BaseTransferAgent,
+        handle: AgentHandle,
     ):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
-        self._agent = agent
+        self._handle = handle
+        with handle.use() as agent:
+            self._agent_name = getattr(agent, "name", "<?>")
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -321,6 +326,7 @@ class Sender(SenderBase):
         unique_rid = tx_session.disagg_request_id
         pre_cancel = False
         with self._sessions_lock:
+            # weakref: strong owner is KvCacheTransceiverV2._send_sessions; Sender only borrows.
             self._sessions[unique_rid] = weakref.ref(tx_session)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
@@ -479,25 +485,26 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            status = self._agent.submit_transfer_requests(request)
-            if not status.wait():
-                agent_result = AgentResult.FAILED
-                last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
-                agent_name = getattr(self._agent, "name", "<?>")
-                detail = (
-                    f"KV transfer agent failed: "
-                    f"unique_rid={write_meta.unique_rid} "
-                    f"slice={write_meta.slice_id} "
-                    f"peer_rank={write_meta.peer_rank} "
-                    f"peer_endpoint={write_meta.peer_endpoint} "
-                    f"op={getattr(request, 'op', '?')} "
-                    f"remote={getattr(request, 'remote_name', '?')} "
-                    f"src_size={int(write_meta.src_ptrs.size)} "
-                    f"dst_size={int(write_meta.dst_ptrs.size)} "
-                    f"nixl_status={last_status} agent={agent_name}"
-                )
-                logger.error(detail)
-                task.fail(RuntimeError(detail))
+            with self._handle.use() as agent:
+                status = agent.submit_transfer_requests(request)
+                if not status.wait():
+                    agent_result = AgentResult.FAILED
+                    last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
+                    agent_name = self._agent_name
+                    detail = (
+                        f"KV transfer agent failed: "
+                        f"unique_rid={write_meta.unique_rid} "
+                        f"slice={write_meta.slice_id} "
+                        f"peer_rank={write_meta.peer_rank} "
+                        f"peer_endpoint={write_meta.peer_endpoint} "
+                        f"op={getattr(request, 'op', '?')} "
+                        f"remote={getattr(request, 'remote_name', '?')} "
+                        f"src_size={int(write_meta.src_ptrs.size)} "
+                        f"dst_size={int(write_meta.dst_ptrs.size)} "
+                        f"nixl_status={last_status} agent={agent_name}"
+                    )
+                    logger.error(detail)
+                    task.fail(RuntimeError(detail))
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
@@ -555,9 +562,10 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
-                agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
+            with self._handle.use() as agent:
+                if not agent.submit_transfer_requests(request).wait():
+                    agent_result = AgentResult.FAILED
+                    session.set_exception("aux transfer agent request failed")
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
 
@@ -871,10 +879,11 @@ class Sender(SenderBase):
 
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
-        self._agent.load_remote_agent(
-            ri.instance_name + str(ri.instance_rank),
-            ri.transfer_engine_info,
-        )
+        with self._handle.use() as agent:
+            agent.load_remote_agent(
+                ri.instance_name + str(ri.instance_rank),
+                ri.transfer_engine_info,
+            )
         with self._loaded_remote_agents_lock:
             self._loaded_remote_agents.add(agent_name)
         logger.debug(
@@ -1013,7 +1022,13 @@ class Sender(SenderBase):
         # Invalidate all loaded remote agents to release fabric/POSIX FD resources.
         for agent_name in loaded_agents:
             try:
-                self._agent.invalidate_remote_agent(agent_name)
+                with self._handle.use() as agent:
+                    agent.invalidate_remote_agent(agent_name)
+            except AgentClosedError:
+                logger.warning(
+                    f"Handle already closed while invalidating remote agent '{agent_name}'"
+                )
+                break
             except Exception as e:
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
@@ -1273,10 +1288,8 @@ class Receiver(ReceiverBase):
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
-        agent: BaseTransferAgent,
     ):
         self._registrar = peer_registrar
-        self._agent = agent
         self._dealers = {}
         self._sender_ep_instance_map = {}
 
@@ -1312,6 +1325,7 @@ class Receiver(ReceiverBase):
     def setup_session(self, rx_session: RxSessionBase):
         pre_cancel = False
         with self._sessions_lock:
+            # weakref: strong owner is KvCacheTransceiverV2._recv_sessions; Receiver only borrows.
             self._sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
             if rx_session.disagg_request_id in self._pre_cancelled_rids:
                 pre_cancel = True
@@ -1883,22 +1897,6 @@ def _make_aux_buffer(
     )
 
 
-def _deregister_registered_memory(transfer_agent, registered_memorys):
-    try:
-        if transfer_agent is None or not registered_memorys:
-            return
-        while registered_memorys:
-            register_memory = registered_memorys[0]
-            try:
-                logger.info(f"Deregistering transfer memory: {register_memory}")
-                transfer_agent.deregister_memory(register_memory)
-            except Exception:
-                logger.error("deregister memory failed in finalizer")
-            registered_memorys.pop(0)
-    except Exception:
-        logger.error("unexpected error in _deregister_registered_memory finalizer")
-
-
 @dataclass
 class TransferWorkerConfig:
     kv_cache_manager: KVCacheManager
@@ -1970,23 +1968,25 @@ class TransferWorker:
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
-        self._agent = _create_nixl_agent(
+        agent = _create_nixl_agent(
             self._rank_info.instance_name + str(self._rank_info.instance_rank)
         )
-        self._registered_mem: list = []
-        self._finalizer = weakref.finalize(
-            self, _deregister_registered_memory, self._agent, self._registered_mem
-        )
+        self._handle = AgentHandle(agent)
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            self._sender = Sender(self._peer_registrar, self._agent)
-            self._receiver = Receiver(self._peer_registrar, self._agent)
-            self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
+            self._sender = Sender(self._peer_registrar, self._handle)
+            self._receiver = Receiver(self._peer_registrar)
+            with self._handle.use() as agent:
+                self._rank_info.transfer_engine_info = bytes(agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
         except Exception:
-            self._finalizer()
+            # shutdown()'s getattr guards handle whichever attrs got set before the failure.
+            try:
+                self.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
 
     def _register_kv_cache(self):
@@ -1996,9 +1996,8 @@ class TransferWorker:
         )
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
-            self._agent.register_memory(reg_memory_desc)
+            self._handle.register_memory(reg_memory_desc)
             logger.debug(f"Registered KV cache memory with transfer agent: {memory_descs}")
-            self._registered_mem.append(reg_memory_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
@@ -2008,9 +2007,8 @@ class TransferWorker:
         for i in range(ptr_num):
             ptr_descs.append((aux_meta.ptrs[i], aux_meta.size[i], 0, f"aux_buffer_ptr_{i}"))
         reg_memory_desc = RegMemoryDescs("DRAM", ptr_descs)
-        self._agent.register_memory(reg_memory_desc)
+        self._handle.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
-        self._registered_mem.append(reg_memory_desc)
 
     @property
     def rank_info_server_endpoint(self) -> Optional[str]:
@@ -2042,19 +2040,14 @@ class TransferWorker:
         receiver = getattr(self, "_receiver", None)
         if receiver is not None:
             receiver.shutdown()
-        # Deregister NIXL memory before shutting down components, so that
-        # pinned GPU memory is released and can be re-allocated (e.g. when
-        # the KV cache manager is recreated after profiling).
-        finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None:
-            finalizer()
-        agent = getattr(self, "_agent", None)
-        if agent is not None:
+        # handle.close() deregisters NIXL memory then calls agent.shutdown().
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
             try:
-                agent.shutdown()
+                handle.close(timeout=30.0)
             except Exception as e:
-                logger.warning(f"TransferWorker.shutdown: agent.shutdown error: {e}")
-            self._agent = None
+                logger.warning(f"TransferWorker.shutdown: handle.close error: {e}")
+            self._handle = None
 
     def __del__(self):
         try:

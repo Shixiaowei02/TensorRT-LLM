@@ -1,3 +1,4 @@
+import contextlib
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -6,6 +7,8 @@ from typing import List, NamedTuple, Optional, Tuple
 import numpy as np
 
 from tensorrt_llm import logger
+
+from ._rwlock import _RWLock  # re-exported for test imports; AgentHandle is the public API
 
 
 # We deliberately use a non-enum data structure here. This choice ensures that
@@ -115,6 +118,12 @@ class BaseTransferAgent(ABC):
     @abstractmethod
     def check_remote_descs(self, name: str, memory_descs: MemoryDescs) -> bool: ...
 
+    @abstractmethod
+    def shutdown(self) -> None:
+        """Quiesce backend resources; idempotent; callers must already have deregistered
+        memory and invalidated remote agents."""
+        ...
+
 
 def _force_py_nixl_kv_transfer() -> bool:
     env_value = os.getenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0")
@@ -176,3 +185,60 @@ else:
 
 def use_pure_python_transfer_agent() -> bool:
     return _use_pure_python_transfer_agent
+
+
+class AgentClosedError(RuntimeError):
+    """Raised when AgentHandle.use() is attempted after close()."""
+
+
+class AgentHandle:
+    """Single-owner, drain-on-close access to a BaseTransferAgent.
+
+    All agent calls must go through use() or the dedicated wrapper methods
+    (register_memory). close() waits for in-flight use() blocks to exit, then
+    deregisters all tracked memory and calls agent.shutdown() — in that order.
+    Subsequent use()/register_memory() raises AgentClosedError.
+    """
+
+    def __init__(self, agent: "BaseTransferAgent") -> None:
+        self._agent: Optional["BaseTransferAgent"] = agent
+        self._lock = _RWLock()
+        self._closed = False
+        self._registered_mem: List["RegMemoryDescs"] = []
+
+    @contextlib.contextmanager
+    def use(self):
+        with self._lock.read():
+            if self._closed:
+                raise AgentClosedError("AgentHandle is closed")
+            yield self._agent
+
+    def register_memory(self, descs: "RegMemoryDescs") -> None:
+        """Forward to agent.register_memory and record descs for auto deregister-on-close."""
+        with self._lock.read():
+            if self._closed:
+                raise AgentClosedError("AgentHandle is closed")
+            self._agent.register_memory(descs)
+            self._registered_mem.append(descs)
+
+    def close(self, timeout: Optional[float] = None) -> None:
+        with self._lock.write(timeout=timeout):
+            if self._closed:
+                return
+            self._closed = True
+            agent = self._agent
+            registered = self._registered_mem
+            self._agent = None
+            self._registered_mem = []
+        if agent is None:
+            return
+        for desc in registered:
+            try:
+                agent.deregister_memory(desc)
+            except Exception as e:
+                logger.warning(f"AgentHandle.close: deregister_memory failed: {e}")
+        agent.shutdown()
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
