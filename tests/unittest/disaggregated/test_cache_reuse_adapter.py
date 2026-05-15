@@ -160,9 +160,12 @@ class TestAdapterPerLayerGroup:
     TPB = 8
 
     def test_reuse_disabled(self):
+        # When block reuse is off the scalar prefix collapses to 0, but SWA
+        # groups still clamp up to stale_end*tpb because that eviction is
+        # intrinsic to SWA (transceiver asserts this invariant).
         ad = _StubAdapter(scalar=128, tpb=self.TPB, enabled=False)
         out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
-        assert out == [0, 0]
+        assert out == [0, 192]
 
     def test_zero_scalar_clamps_swa_stale_prefix(self):
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
