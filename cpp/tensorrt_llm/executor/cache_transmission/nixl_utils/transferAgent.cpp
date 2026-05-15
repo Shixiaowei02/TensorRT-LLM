@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -316,30 +316,37 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
     }
 }
 
-NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
-    : mRawAgent{agent}
+NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle)
+    : mWeakAgent{std::move(agent)}
     , mHandle{handle}
 {
-    TLLM_CHECK(mRawAgent);
+    TLLM_CHECK(!mWeakAgent.expired());
     TLLM_CHECK(mHandle);
 }
 
 NixlTransferStatus::~NixlTransferStatus() noexcept
 {
-    if (mRawAgent != nullptr && mHandle != nullptr)
+    if (mHandle == nullptr)
     {
-        try
-        {
-            mRawAgent->releaseXferReq(mHandle);
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: %s", e.what());
-        }
-        catch (...)
-        {
-            TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw unknown exception");
-        }
+        return;
+    }
+    // Skip release if the owning agent was reset; the underlying nixlXferReqH is already gone.
+    auto agent = mWeakAgent.lock();
+    if (!agent)
+    {
+        return;
+    }
+    try
+    {
+        agent->releaseXferReq(mHandle);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw unknown exception");
     }
 }
 
@@ -507,7 +514,13 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
     while (true)
     {
-        auto status = mRawAgent->getXferStatus(mHandle);
+        auto agent = mWeakAgent.lock();
+        if (!agent)
+        {
+            // Agent has been reset; nothing left to wait on.
+            return TransferState::kFAILURE;
+        }
+        auto status = agent->getXferStatus(mHandle);
         mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
         if (status == NIXL_SUCCESS)
         {
@@ -550,7 +563,13 @@ std::string NixlTransferStatus::getLastStatusStr() const
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
-    auto status = mRawAgent->getXferStatus(mHandle);
+    auto agent = mWeakAgent.lock();
+    if (!agent)
+    {
+        // Agent has been reset; report completion so callers stop polling.
+        return true;
+    }
+    auto status = agent->getXferStatus(mHandle);
     mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
     return status == NIXL_SUCCESS;
 }
@@ -574,7 +593,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
         mAddress = getAvailableIP() + ":" + std::to_string(port);
-        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+        mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
     {
@@ -584,7 +603,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         mAddress.clear();
         nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
-        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+        mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
     std::string nixlBackend = common::getEnvNixlBackend();
@@ -769,7 +788,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         NVTX3_SCOPED_RANGE(postXferReq);
         status = mRawAgent->postXferReq(handle, &mExtraParams);
     }
-    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+    return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
@@ -905,7 +924,7 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     nixl_status_t status;
     nixl_b_params_t init;
 
-    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     init["batch_pool_size"] = std::to_string(8);
     init["batch_limit"] = std::to_string(128);
     init["max_request_size"] = std::to_string(16 * 1024 * 1024);
@@ -991,7 +1010,7 @@ std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
     status = mRawAgent->postXferReq(handle);
     TLLM_CHECK(status == NIXL_IN_PROG);
 
-    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+    return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
 }
 
 void NixlLoopbackAgent::executeLoopbackRequest(

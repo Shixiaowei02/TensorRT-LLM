@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 
 from tensorrt_llm._utils import nvtx_range
@@ -15,6 +16,10 @@ from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
 )
 
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+
+# Upstream NIXL can hang in nixlAgent's destructor (graceful ucp_ep_close + progress thread
+# joined before ucp_worker_destroy drains). Detach the call so shutdown is bounded.
+_SHUTDOWN_TIMEOUT_S = float(os.environ.get("TRTLLM_AGENT_SHUTDOWN_TIMEOUT", "10"))
 
 
 class BindingsNixlTransferStatus(TransferStatus):
@@ -98,7 +103,28 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             return
         # Null out first so a re-entrant call after a raise is a no-op; errors propagate.
         self._cpp_agent = None
-        cpp_agent.shutdown()
+        done = threading.Event()
+        captured: list[BaseException] = []
+
+        def _run():
+            try:
+                cpp_agent.shutdown()
+            except BaseException as e:
+                captured.append(e)
+            finally:
+                done.set()
+
+        thread_name = f"nixl-shutdown-{self.name}"
+        threading.Thread(target=_run, daemon=True, name=thread_name).start()
+        if not done.wait(timeout=_SHUTDOWN_TIMEOUT_S):
+            # NIXL destructor stuck (see _SHUTDOWN_TIMEOUT_S comment); detach to avoid blocking.
+            logger.warning(
+                f"BindingsNixlTransferAgent({self.name!r}).shutdown did not complete in "
+                f"{_SHUTDOWN_TIMEOUT_S:.1f}s; detaching (UCX resources will leak until process exit)"
+            )
+            return
+        if captured:
+            raise captured[0]
 
     def __enter__(self):
         return self

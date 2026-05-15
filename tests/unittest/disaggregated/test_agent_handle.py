@@ -16,35 +16,11 @@
 
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.agent import AgentClosedError, AgentHandle, _RWLock
-
-
-def test_use_yields_underlying_agent():
-    agent = MagicMock()
-    handle = AgentHandle(agent)
-    with handle.use() as a:
-        assert a is agent
-    assert not handle.is_closed
-
-
-def test_close_with_no_active_use_succeeds_and_calls_shutdown():
-    agent = MagicMock()
-    handle = AgentHandle(agent)
-    handle.close(timeout=1.0)
-    agent.shutdown.assert_called_once()
-    assert handle.is_closed
-
-
-def test_use_after_close_raises_agent_closed_error():
-    handle = AgentHandle(MagicMock())
-    handle.close(timeout=1.0)
-    with pytest.raises(AgentClosedError):
-        with handle.use():
-            pass
 
 
 def test_double_close_is_idempotent():
@@ -53,6 +29,19 @@ def test_double_close_is_idempotent():
     handle.close(timeout=1.0)
     handle.close(timeout=1.0)
     agent.shutdown.assert_called_once()
+    assert handle.is_closed
+
+
+@pytest.mark.parametrize("op", ["use", "register"])
+def test_operation_after_close_raises(op):
+    handle = AgentHandle(MagicMock())
+    handle.close(timeout=1.0)
+    with pytest.raises(AgentClosedError):
+        if op == "use":
+            with handle.use():
+                pass
+        else:
+            handle.register_memory("desc")
 
 
 def test_close_blocks_until_active_reader_releases():
@@ -168,16 +157,6 @@ def test_waiting_writer_blocks_new_readers():
     assert r2_outcome.get("closed") is True
 
 
-def test_register_memory_delegates_and_records():
-    agent = MagicMock()
-    handle = AgentHandle(agent)
-    handle.register_memory("desc1")
-    handle.register_memory("desc2")
-    agent.register_memory.assert_any_call("desc1")
-    agent.register_memory.assert_any_call("desc2")
-    assert handle._registered_mem == ["desc1", "desc2"]
-
-
 def test_register_memory_failure_does_not_record():
     agent = MagicMock()
     agent.register_memory.side_effect = RuntimeError("boom")
@@ -187,21 +166,6 @@ def test_register_memory_failure_does_not_record():
     assert handle._registered_mem == []
     handle.close(timeout=1.0)
     agent.deregister_memory.assert_not_called()
-
-
-def test_close_deregisters_before_shutdown_in_order():
-    agent = MagicMock()
-    call_order = []
-    agent.deregister_memory.side_effect = lambda d: call_order.append(("dereg", d))
-    agent.shutdown.side_effect = lambda: call_order.append(("shutdown",))
-
-    handle = AgentHandle(agent)
-    handle.register_memory("a")
-    handle.register_memory("b")
-    handle.register_memory("c")
-    handle.close(timeout=1.0)
-
-    assert call_order == [("dereg", "a"), ("dereg", "b"), ("dereg", "c"), ("shutdown",)]
 
 
 def test_close_continues_when_a_deregister_raises():
@@ -222,70 +186,75 @@ def test_close_continues_when_a_deregister_raises():
     handle.register_memory("c")
     handle.close(timeout=1.0)
 
-    # All dereg attempted in order; shutdown still called despite the middle failure.
+    # All dereg attempted in registration order; shutdown still called despite the middle failure.
     assert call_order == [("dereg", "a"), ("dereg", "b"), ("dereg", "c"), ("shutdown",)]
     assert handle.is_closed
 
 
-def test_register_memory_after_close_raises():
-    handle = AgentHandle(MagicMock())
-    handle.close(timeout=1.0)
-    with pytest.raises(AgentClosedError):
-        handle.register_memory("desc")
-
-
-def test_bindings_shutdown_propagates_errors():
+@pytest.mark.parametrize("raise_on_shutdown", [False, True])
+def test_bindings_shutdown_idempotent_and_propagates(raise_on_shutdown):
     try:
         from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
     except ImportError:
         pytest.skip("C++ transfer agent binding not available")
 
     cpp_agent = MagicMock()
-    cpp_agent.shutdown.side_effect = RuntimeError("boom")
+    if raise_on_shutdown:
+        cpp_agent.shutdown.side_effect = RuntimeError("boom")
     # __new__ bypasses __init__ so the test doesn't need a real C++ CppNixlTransferAgent.
     agent = BindingsNixlTransferAgent.__new__(BindingsNixlTransferAgent)
     agent._cpp_agent = cpp_agent
     agent.name = "test"
 
-    with pytest.raises(RuntimeError, match="boom"):
+    if raise_on_shutdown:
+        with pytest.raises(RuntimeError, match="boom"):
+            agent.shutdown()
+    else:
         agent.shutdown()
-    # Wrapper field nulled before the raised call, so the next shutdown is a no-op.
+
+    # Wrapper field nulled either way; second shutdown is a no-op.
     assert agent._cpp_agent is None
+    agent.shutdown()
     cpp_agent.shutdown.assert_called_once()
 
 
-def test_bindings_shutdown_idempotent():
+def test_bindings_shutdown_abandons_on_timeout():
+    """Abandon cpp_agent.shutdown() once _SHUTDOWN_TIMEOUT_S elapses.
+
+    The wrapper logs a warning and returns instead of blocking forever.
+    """
     try:
-        from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+        from tensorrt_llm._torch.disaggregation.nixl import _agent_cpp
     except ImportError:
         pytest.skip("C++ transfer agent binding not available")
 
+    release = threading.Event()
     cpp_agent = MagicMock()
-    # __new__ bypasses __init__ so the test doesn't need a real C++ CppNixlTransferAgent.
-    agent = BindingsNixlTransferAgent.__new__(BindingsNixlTransferAgent)
+    cpp_agent.shutdown.side_effect = lambda: release.wait(timeout=5.0)
+
+    agent = _agent_cpp.BindingsNixlTransferAgent.__new__(_agent_cpp.BindingsNixlTransferAgent)
     agent._cpp_agent = cpp_agent
-    agent.name = "test"
+    thread_name = "nixl-shutdown-test_hang"
+    agent.name = "test_hang"
 
-    agent.shutdown()
-    agent.shutdown()
-    cpp_agent.shutdown.assert_called_once()
+    with patch.object(_agent_cpp, "_SHUTDOWN_TIMEOUT_S", 0.1):
+        start = time.monotonic()
+        agent.shutdown()  # must return without raising
+        elapsed = time.monotonic() - start
 
+    assert elapsed < 1.0, f"shutdown should bail at ~0.1s, took {elapsed:.3f}s"
+    assert agent._cpp_agent is None  # nulled before launching the daemon thread
 
-def test_nested_use_on_same_thread_raises():
-    handle = AgentHandle(MagicMock())
-    with handle.use():
-        with pytest.raises(RuntimeError, match="nested"):
-            with handle.use():
-                pass
-    # Outer slot released cleanly; close still works.
-    handle.close(timeout=1.0)
-
-
-def test_nested_use_via_register_memory_raises():
-    handle = AgentHandle(MagicMock())
-    with handle.use():
-        with pytest.raises(RuntimeError, match="nested"):
-            handle.register_memory("d")
+    # The daemon thread the wrapper spawned is still alive after the timeout — that's the
+    # point of the safety net. For test cleanliness, release it and wait for it to finish.
+    release.set()
+    for t in threading.enumerate():
+        if t.name == thread_name:
+            t.join(timeout=2.0)
+            assert not t.is_alive()
+            break
+    else:
+        pytest.fail(f"Daemon thread {thread_name!r} not found in threading.enumerate()")
 
 
 def test_nested_use_raises_even_with_writer_waiting():

@@ -2,7 +2,7 @@ import contextlib
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Iterator, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -207,10 +207,11 @@ class AgentHandle:
         self._registered_mem: List["RegMemoryDescs"] = []
 
     @contextlib.contextmanager
-    def use(self):
+    def use(self) -> Iterator["BaseTransferAgent"]:
         with self._lock.read():
             if self._closed:
                 raise AgentClosedError("AgentHandle is closed")
+            assert self._agent is not None  # invariant: not-closed implies agent is set
             yield self._agent
 
     def register_memory(self, descs: "RegMemoryDescs") -> None:
@@ -218,6 +219,7 @@ class AgentHandle:
         with self._lock.read():
             if self._closed:
                 raise AgentClosedError("AgentHandle is closed")
+            assert self._agent is not None  # invariant: not-closed implies agent is set
             self._agent.register_memory(descs)
             self._registered_mem.append(descs)
 
