@@ -343,7 +343,6 @@ unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py::test_vision_block_mat
 unittest/auto_deploy/singlegpu/models/test_qwen3_5_moe.py::test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage SKIP (https://nvbugs/6189450)
 unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py::test_build_ad[deepseek-ai/DeepSeek-V3-llm_extra_args10] SKIP (https://nvbugs/5888827)
 unittest/bindings/test_transfer_agent_bindings.py::TestNixlFunctionalTransfer::test_nixl_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6260897)
-unittest/disaggregated/test_agent_multi_backends.py::test_run_with_different_env[1] SKIP (https://nvbugs/5979673)
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
