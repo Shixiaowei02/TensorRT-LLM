@@ -817,11 +817,27 @@ bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {
-        return mCacheSender->cancelRequest(*llmRequest);
+        bool const cancelled = mCacheSender->cancelRequest(*llmRequest);
+        if (cancelled)
+        {
+            // The caller frees the LlmRequest once cancel succeeds, so drop the raw pointer kept in
+            // mSenderFutures to avoid a use-after-free in checkContextTransferStatus.
+            mSenderFutures.erase(std::remove_if(mSenderFutures.begin(), mSenderFutures.end(),
+                                     [llmRequest](auto const& p) { return p.first == llmRequest; }),
+                mSenderFutures.end());
+        }
+        return cancelled;
     }
     else if (llmRequest->isGenerationOnlyRequest())
     {
-        return mCacheReceiver->cancelRequest(*llmRequest);
+        bool const cancelled = mCacheReceiver->cancelRequest(*llmRequest);
+        if (cancelled)
+        {
+            mRequesterFutures.erase(std::remove_if(mRequesterFutures.begin(), mRequesterFutures.end(),
+                                        [llmRequest](auto const& p) { return p.first == llmRequest; }),
+                mRequesterFutures.end());
+        }
+        return cancelled;
     }
     return false;
 }
