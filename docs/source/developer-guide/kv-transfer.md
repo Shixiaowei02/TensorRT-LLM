@@ -2,6 +2,8 @@
 
 This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by dist-serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities.
 
+It describes the C++ transceiver (`cache_transceiver_config.transceiver_runtime='CPP'`). For the Python runtime selected by `transceiver_runtime='PYTHON'`, see [KV Cache Transceiver V2](./kv-transfer-v2.md).
+
 ## Table of Contents
 
 - [Workflow](#workflow)
@@ -67,4 +69,4 @@ This corresponds to the communication info section shown in the figure above. Si
 
 ## Evolution Outlook
 
-Currently, the architecture of KV transfer is being optimized. First, we plan to move the control plane logic up to Python to enable better integration with the Python runtime. In addition, we are reevaluating the current design choice of initiating communication only after the context computation is completed, which was originally made for flexibility. Lastly, since some control logic is still being transmitted through the data plane, we aim to clarify the relationship between the control and data planes, and to simplify and streamline the code logic of the data plane. Due to the modular architecture, these iterative enhancements are only loosely coupled with the `TransferAgent`. We aim to minimize the impact of future upgrades on third-party integrations.
+Currently, the architecture of KV transfer is being optimized. First, we plan to move the control plane logic up to Python to enable better integration with the Python runtime; this has since landed as the [V2 transceiver](./kv-transfer-v2.md). In addition, we are reevaluating the current design choice of initiating communication only after the context computation is completed, which was originally made for flexibility. Lastly, since some control logic is still being transmitted through the data plane, we aim to clarify the relationship between the control and data planes, and to simplify and streamline the code logic of the data plane. Due to the modular architecture, these iterative enhancements are only loosely coupled with the `TransferAgent`. We aim to minimize the impact of future upgrades on third-party integrations.
