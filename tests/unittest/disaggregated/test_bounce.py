@@ -660,6 +660,18 @@ class TestFanInReserve:
         t.orphan_reservation(rid_slice)  # already gone -> no-op, must not raise
         assert t._recv_alloc.quarantined == [0]
 
+    def test_release_send_frees_but_quarantine_send_holds_the_region(self, monkeypatch):
+        # A drained write returns its send region to the pool; a write the sender gave up WAITING
+        # on is still reading that region, so it must be held out of reuse instead (otherwise the
+        # next gather overwrites the bytes in flight).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t.release_send(3)
+        assert t._send_alloc.released == [3]
+        assert t._send_alloc.quarantined == []
+        t.quarantine_send(4)
+        assert t._send_alloc.quarantined == [4]
+        assert t._send_alloc.released == [3]  # unchanged: quarantine is not a release
+
 
 # --------------------------------------------------------------------------- #
 # Hybrid layouts (Kimi K3: KDA mamba + MLA attention) — page-table gate,

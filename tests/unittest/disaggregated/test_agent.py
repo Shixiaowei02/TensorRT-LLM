@@ -13,6 +13,7 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
+    AgentWaitState,
     MemoryDescs,
     MemoryType,
     RegMemoryDescs,
@@ -44,12 +45,12 @@ class TestTransferStatus(TestCase):
         mock_transfer_status.is_completed.return_value = True
         self.assertTrue(mock_transfer_status.is_completed())
         mock_transfer_status.is_completed.assert_called_once()
-        mock_transfer_status.wait.return_value = True
+        mock_transfer_status.wait.return_value = AgentWaitState.SUCCESS
         timeout_values = [None, 1000, 5000]
         for timeout in timeout_values:
             with self.subTest(timeout=timeout):
                 result = mock_transfer_status.wait(timeout_ms=timeout)
-                self.assertTrue(result)
+                self.assertEqual(result, AgentWaitState.SUCCESS)
                 mock_transfer_status.wait.assert_called_with(timeout_ms=timeout)
 
 
@@ -66,6 +67,44 @@ def test_python_agent_accepts_topology_without_forwarding_it_to_nixl():
 
     agent_config.assert_called_once_with(enable_prog_thread=False, backends=["UCX"], num_threads=3)
     nixl_agent.assert_called_once_with("testAgent", agent_config.return_value)
+
+
+@pytest.mark.cpu_only
+def test_python_agent_status_release_drops_the_handle_and_is_idempotent():
+    # The pure-Python wrapper must offer the same explicit cancel as the C++ one, and must not
+    # query a handle it has released (that would hand nixl a dangling handle).
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    agent = Mock()
+    status = agent_py.NixlTransferStatus(agent, handle="h")
+
+    assert status.release() is True
+    agent.release_xfer_handle.assert_called_once_with("h")
+    assert status.handle is None
+    assert status.release() is True  # idempotent: nothing left to release
+    agent.release_xfer_handle.assert_called_once_with("h")
+    assert status.is_completed() is False
+    assert status.wait(timeout_ms=0) == AgentWaitState.FAILURE
+    agent.check_xfer_state.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_python_agent_status_release_reports_a_backend_refusal():
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    agent = Mock()
+    agent.release_xfer_handle.side_effect = RuntimeError("nixl refused")
+    status = agent_py.NixlTransferStatus(agent, handle="h")
+
+    with patch(f"{_AGENT_PY_MODULE}.logger") as mlog:
+        assert status.release() is False
+    mlog.error.assert_called_once()
+    assert status.handle == "h"  # not cleared: the handle is still live
+
+
+@pytest.mark.cpu_only
+def test_transfer_status_release_is_not_abstract():
+    # release() mirrors the C++ base: non-abstract with a false default, so an out-of-tree wrapper
+    # still loads. The sender treats a missing/false release as "the request was NOT torn down".
+    assert "release" not in getattr(TransferStatus, "__abstractmethods__", frozenset())
 
 
 def _convert_to_memory_descs(reg_descs: RegMemoryDescs) -> MemoryDescs:
@@ -193,7 +232,9 @@ def test_transfer_between_agents(
         sync_message=None,
     )
     transfer_status = transfer_agent_src.submit_transfer_requests(transfer_request)
-    assert transfer_status.wait(timeout_ms=5000), "Transfer did not complete within timeout."
+    assert transfer_status.wait(timeout_ms=5000) == AgentWaitState.SUCCESS, (
+        "Transfer did not complete within timeout."
+    )
 
     # Validate transfer completion
     assert transfer_status.is_completed(), "Transfer did not complete successfully."
@@ -219,30 +260,63 @@ class TestBindingsNixlTransferStatus(TestCase):
     GPU or a real NIXL agent.
     """
 
-    def test_wait_success_returns_true(self):
+    def test_wait_success_returns_success_state(self):
         cpp = Mock()
         cpp.wait.return_value = TransferState.SUCCESS
         status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
-        self.assertTrue(status.wait(timeout_ms=5000))
+        self.assertEqual(status.wait(timeout_ms=5000), AgentWaitState.SUCCESS)
         cpp.wait.assert_called_once_with(5000)
 
     def test_wait_none_timeout_maps_to_minus_one(self):
         cpp = Mock()
         cpp.wait.return_value = TransferState.SUCCESS
         status = BindingsNixlTransferStatus(cpp, agent_name="a")
-        self.assertTrue(status.wait())
+        self.assertEqual(status.wait(), AgentWaitState.SUCCESS)
         cpp.wait.assert_called_once_with(-1)
 
-    def test_wait_failure_returns_false_and_logs(self):
+    def test_wait_failure_returns_failure_state_and_logs(self):
         cpp = Mock()
         cpp.wait.return_value = TransferState.FAILURE
         status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
         with patch(f"{_AGENT_CPP_MODULE}.logger") as mlog:
-            self.assertFalse(status.wait())
+            self.assertEqual(status.wait(), AgentWaitState.FAILURE)
         mlog.error.assert_called_once()
         msg = mlog.error.call_args.args[0]
-        self.assertIn("non-SUCCESS", msg)
+        self.assertIn("FAILURE", msg)
         self.assertIn("testAgent", msg)
+
+    def test_wait_in_progress_returns_in_progress_and_does_not_log(self):
+        # A timeout is the normal case under bounded polling: it must not be reported as a
+        # failure, and must not log, or conc512 would drown in per-slice error lines.
+        cpp = Mock()
+        cpp.wait.return_value = TransferState.IN_PROGRESS
+        status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
+        with patch(f"{_AGENT_CPP_MODULE}.logger") as mlog:
+            self.assertEqual(status.wait(timeout_ms=100), AgentWaitState.IN_PROGRESS)
+        mlog.error.assert_not_called()
+
+    def test_release_delegates_to_the_binding(self):
+        # The give-up path cancels in flight by calling release() deliberately; it must reach the
+        # C++ NixlTransferStatus::release rather than depend on the destructor running it later.
+        cpp = Mock()
+        cpp.release.return_value = True
+        self.assertTrue(BindingsNixlTransferStatus(cpp, agent_name="a").release())
+        cpp.release.assert_called_once_with()
+
+    def test_release_reports_a_backend_refusal(self):
+        cpp = Mock()
+        cpp.release.return_value = False
+        self.assertFalse(BindingsNixlTransferStatus(cpp, agent_name="a").release())
+
+    def test_release_without_binding_reports_false_and_warns(self):
+        # An extension built before release() was bound cannot cancel: say so instead of letting
+        # the caller read the give-up as a successful in-flight cancel.
+        cpp = Mock(spec=[])
+        status = BindingsNixlTransferStatus(cpp, agent_name="testAgent")
+        with patch(f"{_AGENT_CPP_MODULE}.logger") as mlog:
+            self.assertFalse(status.release())
+        mlog.warning_once.assert_called_once()
+        self.assertIn("testAgent", mlog.warning_once.call_args.args[0])
 
     def test_is_completed_passthrough(self):
         cpp = Mock()

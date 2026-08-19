@@ -37,6 +37,7 @@ except ImportError:
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
+    AgentWaitState,
     BaseTransferAgent,
     MemoryDescs,
     MemoryType,
@@ -90,6 +91,12 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Floor for the sender's agent wait so a transfer dispatched at or past the session deadline still
+# gets a real attempt instead of being abandoned before the agent is ever polled.
+_MIN_AGENT_WAIT_S = 1.0
+# One bounded agent poll slice, matching the C++ v1 in-flight-cancel loop. Between slices the
+# sender re-checks session cancellation and the overall deadline.
+_AGENT_POLL_SLICE_MS = 100
 
 
 @dataclass
@@ -226,6 +233,47 @@ def _make_kv_result_msg(
     if tail:
         msg += tail
     return msg
+
+
+def _agent_wait_deadline_s(session: Optional["TxSession"]) -> float:
+    """Absolute monotonic instant at which the sender stops WAITING on the agent.
+
+    It is the session's transfer deadline (``kv_transfer_timeout_ms``), floored so a transfer
+    dispatched at or past that deadline still gets a real attempt. Reaching it does not end the
+    transfer by itself; the caller decides, and ``_release_abandoned_transfer`` is that decision.
+    """
+    deadline_s = session._deadline_monotonic_s if session is not None else None
+    if deadline_s is None:
+        # send() anchors the deadline before dispatching, but aux and standalone sessions can
+        # reach the worker unanchored; keep those finite too.
+        return time.monotonic() + _FALLBACK_TX_OVERALL_TIMEOUT_S
+    return max(deadline_s, time.monotonic() + _MIN_AGENT_WAIT_S)
+
+
+def _release_abandoned_transfer(status, what: str) -> bool:
+    """Tear down the request the sender is giving up on, deliberately instead of leaving it to the
+    status destructor. Same primitive as the C++ in-flight cancel (agent_utils/connection.cpp:213);
+    a true return does NOT prove the NIC quiesced (executor/transferAgent.h:368)."""
+    release = getattr(status, "release", None)
+    if release is None:
+        # Out-of-tree status without release(): nothing here can cancel, so say so once.
+        logger.warning_once(
+            f"{type(status).__name__} exposes no release(); an abandoned transfer request cannot "
+            f"be torn down explicitly.",
+            key="agent-status-no-release",
+        )
+        return False
+    try:
+        released = bool(release())
+    except Exception as e:
+        logger.error(f"{what}: releasing the abandoned transfer request raised: {e}")
+        return False
+    if not released:
+        logger.error(
+            f"{what}: the backend refused to release the abandoned transfer request; one backend "
+            f"transfer handle stays active for the life of the agent"
+        )
+    return released
 
 
 class SendTaskBase:
@@ -493,6 +541,24 @@ class Sender(SenderBase):
                         )
                 dealers.clear()
 
+    def _wait_for_agent(self, status, session: "TxSession", deadline_s: float) -> AgentWaitState:
+        """Poll one transfer in bounded slices until terminal, or until the session is cancelled
+        or its deadline passes. IN_PROGRESS means the write neither drained nor errored, so the
+        caller must release the request rather than treat it as a completed writer.
+        """
+        while True:
+            # Never pass a negative timeout: to the C++ agent that means "spin forever", which
+            # would reinstate the unbounded wait this loop exists to remove.
+            remaining_ms = round((deadline_s - time.monotonic()) * 1000)
+            slice_ms = min(_AGENT_POLL_SLICE_MS, remaining_ms) if remaining_ms > 0 else 0
+            state = status.wait(timeout_ms=slice_ms)
+            if state != AgentWaitState.IN_PROGRESS:
+                return state
+            if slice_ms == 0:  # budget spent, and the last look found it still in flight
+                return AgentWaitState.IN_PROGRESS
+            if session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                return AgentWaitState.IN_PROGRESS
+
     @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
@@ -615,14 +681,29 @@ class Sender(SenderBase):
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
+            # Poll in bounded slices instead of one unbounded wait, so cancellation and the session
+            # deadline are observable and this worker thread is not pinned forever by one transfer.
+            deadline_s = _agent_wait_deadline_s(session)
+            abandoned = False
+            released = False
+            wait_start_s = time.monotonic()
             try:
                 status = self._agent.submit_transfer_requests(request)
-                if not status.wait():
+                state = self._wait_for_agent(status, session, deadline_s)
+                if state == AgentWaitState.IN_PROGRESS:
+                    abandoned = True
+                    # Release here, before the send region is quarantined below, so the grace
+                    # period starts only after the backend has been told to tear the request down.
+                    released = _release_abandoned_transfer(
+                        status, f"KV rid={write_meta.unique_rid} slice={write_meta.slice_id}"
+                    )
+                elif state == AgentWaitState.FAILURE:
                     agent_result = AgentResult.FAILED
                     last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
-                        f"KV transfer agent failed: "
+                        f"KV transfer agent failed (agent reported error after "
+                        f"{time.monotonic() - wait_start_s:.3f}s): "
                         f"unique_rid={write_meta.unique_rid} "
                         f"slice={write_meta.slice_id} "
                         f"peer_rank={write_meta.peer_rank} "
@@ -637,8 +718,47 @@ class Sender(SenderBase):
                     task.fail(RuntimeError(detail))
             finally:
                 if send_slot_id is not None:
-                    self._bounce.release_send(send_slot_id)
-        if timer:
+                    # Releasing the request does not prove the NIC stopped reading this region, so
+                    # hold it out of reuse instead of handing it to the next gather. SUCCESS and
+                    # FAILURE have drained and can go straight back to the pool.
+                    if abandoned:
+                        self._bounce.quarantine_send(send_slot_id)
+                    else:
+                        self._bounce.release_send(send_slot_id)
+            if timer:
+                timer.record_transfer_end(write_meta.peer_rank)
+            if abandoned:
+                # The request was released above; what is NOT protected is the source region. A
+                # bounced write reads the quarantined slot; an unbounced one reads this request's
+                # KV pages, which this module does not hold -- the log below says which.
+                source = (
+                    f"src=bounce_slot:{send_slot_id} (quarantined for the grace period)"
+                    if send_slot_id is not None
+                    else "src=kv_pages (bounce off: this module does not hold them; the executor "
+                    "frees them once the session is reaped as CANCELLED)"
+                )
+                logger.error(
+                    f"KV transfer still in flight at its deadline; released the backend request "
+                    f"and freed the sender worker: unique_rid={write_meta.unique_rid} "
+                    f"slice={write_meta.slice_id} peer_rank={write_meta.peer_rank} "
+                    f"peer_endpoint={write_meta.peer_endpoint} "
+                    f"waited={time.monotonic() - wait_start_s:.3f}s "
+                    f"session_status={session.status.value} "
+                    f"src_size={int(write_meta.src_ptrs.size)} "
+                    f"release_accepted={released} {source} "
+                    f"(kv_transfer_timeout_ms budget exhausted; no result is sent, since "
+                    f"AgentResult.FAILED would tell the receiver this writer had drained)"
+                )
+                if send_slot_id is None:
+                    logger.warning_once(
+                        "[kv-bounce] a KV write was abandoned in place: with "
+                        "kv_cache_bounce_size_mb=0 the NIC reads the request's KV pages directly, "
+                        "so no send region exists to quarantine. Enabling bounce moves the "
+                        "abandoned read onto a slot that can be held out of reuse.",
+                        key="kv-abandon-unbounced",
+                    )
+                return
+        elif timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
@@ -707,11 +827,35 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
-                agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
+            # Same bounded poll as the KV path, so one slow aux write cannot pin the worker thread.
+            deadline_s = _agent_wait_deadline_s(session)
+            wait_start_s = time.monotonic()
+            status = self._agent.submit_transfer_requests(request)
+            state = self._wait_for_agent(status, session, deadline_s)
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
+            if state == AgentWaitState.IN_PROGRESS:
+                # Release the request, then stay silent: set_exception() would resolve every task
+                # and close the session at once, freeing the aux slot, and release does not prove
+                # the NIC stopped reading it. The CANCELLED reap still frees it a few iters later.
+                released = _release_abandoned_transfer(status, f"aux rid={write_meta.unique_rid}")
+                logger.error(
+                    f"aux transfer still in flight at its deadline; released the backend request "
+                    f"and freed the sender worker: unique_rid={write_meta.unique_rid} "
+                    f"peer_rank={write_meta.peer_rank} peer_endpoint={write_meta.peer_endpoint} "
+                    f"waited={time.monotonic() - wait_start_s:.3f}s "
+                    f"release_accepted={released} (no AUX_AGENT_RESULT is sent, since that would "
+                    f"tell the receiver this writer had drained)"
+                )
+                return
+            if state == AgentWaitState.FAILURE:
+                agent_result = AgentResult.FAILED
+                logger.error(
+                    f"aux transfer agent failed (agent reported error after "
+                    f"{time.monotonic() - wait_start_s:.3f}s): unique_rid={write_meta.unique_rid} "
+                    f"peer_rank={write_meta.peer_rank} peer_endpoint={write_meta.peer_endpoint}"
+                )
+                session.set_exception("aux transfer agent request failed")
 
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [

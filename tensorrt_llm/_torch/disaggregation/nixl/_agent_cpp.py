@@ -29,7 +29,13 @@ from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
     NixlTransferAgent as CppNixlTransferAgent,
 )
 
-from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+from ..base.agent import (
+    AgentWaitState,
+    BaseTransferAgent,
+    RegMemoryDescs,
+    TransferRequest,
+    TransferStatus,
+)
 
 
 class BindingsNixlTransferStatus(TransferStatus):
@@ -44,18 +50,39 @@ class BindingsNixlTransferStatus(TransferStatus):
         return self._cpp_status.is_completed()
 
     @nvtx_range("BindingsNixlTransferStatus.wait")
-    def wait(self, timeout_ms=None) -> bool:
-        """Wait for transfer to complete (releases GIL)."""
+    def wait(self, timeout_ms=None) -> AgentWaitState:
+        """Bounded wait preserving the C++ tri-state (executor/transferAgent.h). A timeout yields
+        IN_PROGRESS, which must never be treated as failure: the write has neither drained nor
+        errored. A caller that gives up on such a wait should release() the request explicitly."""
         start_time = time.time()
-        if timeout_ms is None:
-            timeout_ms = -1
-        result = self._cpp_status.wait(timeout_ms)
-        if result != TransferState.SUCCESS:
+        result = self._cpp_status.wait(-1 if timeout_ms is None else int(timeout_ms))
+        if result == TransferState.SUCCESS:
+            return AgentWaitState.SUCCESS
+        if result == TransferState.FAILURE:
+            # Only FAILURE is logged: under bounded polling a timeout is the normal case, and
+            # logging it would be a per-slice log storm. The caller logs when it gives up.
             logger.error(
-                f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
+                f"NIXL (cpp binding) wait returned FAILURE "
                 f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
             )
-        return result == TransferState.SUCCESS
+            return AgentWaitState.FAILURE
+        return AgentWaitState.IN_PROGRESS
+
+    def release(self) -> bool:
+        """Release the backend transfer request (NixlTransferStatus::release). True only means the
+        backend accepted it, not that the NIC quiesced. Idempotent: ~NixlTransferStatus calls
+        release() again and finds the handle already gone."""
+        release = getattr(self._cpp_status, "release", None)
+        if release is None:
+            # Extension built before the binding existed: ~NixlTransferStatus still releases, only
+            # later and unlogged. Say so, so the caller does not read this as "nothing happened".
+            logger.warning_once(
+                f"NIXL (cpp binding) status exposes no release(); an abandoned transfer is torn "
+                f"down by the status destructor instead (agent={self._agent_name}).",
+                key="nixl-cpp-status-no-release",
+            )
+            return False
+        return bool(release())
 
     def last_status_str(self) -> str:
         get = getattr(self._cpp_status, "get_last_status_str", None)

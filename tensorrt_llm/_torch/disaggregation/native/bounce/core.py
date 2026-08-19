@@ -192,6 +192,12 @@ class BounceTransport(ABC):
         """Release a send region after its write completes."""
 
     @abstractmethod
+    def quarantine_send(self, slot_id, grace_s: Optional[float] = None) -> None:
+        """Give up on a send region whose write is still in flight (the sender's wait hit its
+        deadline). The sender releases the request, but that does not prove the NIC stopped reading
+        this region, so hold it out of reuse rather than handing it to the next gather."""
+
+    @abstractmethod
     def reserve(
         self,
         recv_req,
