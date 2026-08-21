@@ -88,6 +88,10 @@ class ZMQMessenger(MessengerInterface):
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
         self._endpoint: Optional[str] = None
         self._lock = Lock()
+        # Separate from _lock: stop() holds _lock across a listener join, so a
+        # send taking _lock would stall (or deadlock) against a listener that
+        # replies on this same socket.
+        self._send_lock = Lock()
         self._closed = False
         self._stop_event = Event()
         self._listener_thread: Optional[Thread] = None
@@ -118,10 +122,14 @@ class ZMQMessenger(MessengerInterface):
         pass
 
     def send(self, messages: list[bytes], recipient: Optional[bytes] = None) -> None:
-        if recipient:
-            self._socket.send_multipart([recipient] + messages)
-        else:
-            self._socket.send_multipart(messages)
+        # pyzmq sockets are not thread-safe: two concurrent send_multipart calls
+        # interleave frames of different messages on the wire. Serialize per
+        # socket so a shared messenger cannot corrupt message boundaries.
+        with self._send_lock:
+            if recipient:
+                self._socket.send_multipart([recipient] + messages)
+            else:
+                self._socket.send_multipart(messages)
 
     def receive(self) -> list[bytes]:
         return self._socket.recv_multipart()

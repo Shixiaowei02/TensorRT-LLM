@@ -905,6 +905,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         wait_num: int,
         poll_interval_ms: Optional[int],
     ) -> None:
+        # A rank can only reap completions from the sessions it owns, so a
+        # target above that count is unreachable and would spin out the whole
+        # poll interval without making any progress.
+        wait_num = min(wait_num, len(sessions))
+        if wait_num <= 0:
+            return
         poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:

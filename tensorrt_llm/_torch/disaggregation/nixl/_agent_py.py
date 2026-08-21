@@ -21,7 +21,13 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 # Import base classes for type compatibility
-from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+from ..base.agent import (
+    AgentWaitState,
+    BaseTransferAgent,
+    RegMemoryDescs,
+    TransferRequest,
+    TransferStatus,
+)
 
 # The PyPI ``nixl`` meta-package provides a top-level ``nixl`` shim that
 # redirects to ``nixl_cu13`` or ``nixl_cu12``. When only ``nixl-cu13`` (or
@@ -57,28 +63,50 @@ class NixlTransferStatus(TransferStatus):
         self.handle = handle
 
     def is_completed(self):
+        if self.handle is None:
+            return False  # already released; the handle must not be queried again
         status = TransferState(self.agent.check_xfer_state(self.handle))
         return status == TransferState.DONE
 
-    def wait(self, timeout_ms=None):
-        start_time = time.time()
-        status = TransferState.PENDING
+    def release(self) -> bool:
+        """Release the backend transfer request, in flight or not. True only means nixl accepted
+        the release; it does not prove the NIC stopped reading the source."""
+        if self.handle is None:
+            return True
+        try:
+            self.agent.release_xfer_handle(self.handle)
+        except Exception as e:  # backend refused: the handle stays live for the agent's lifetime
+            logger.error("NIXL release_xfer_handle failed (agent=%s): %s", self.agent.name, e)
+            return False
+        self.handle = None
+        return True
+
+    def wait(self, timeout_ms=None) -> AgentWaitState:
+        """Bounded wait that keeps the backend's tri-state. A timeout returns IN_PROGRESS, which
+        must not be conflated with ERROR: the transfer has neither drained nor errored, so callers
+        that give up should release() it rather than treat it as failed."""
+        start_time = time.monotonic()
         sleep_time = 0.0001  # 0.1ms in seconds
         max_sleep_time = 0.01  # 10ms in seconds
 
         timeout = timeout_ms / 1000 if timeout_ms is not None else None
 
-        while status in (TransferState.PENDING, TransferState.PROCESSING):
+        if self.handle is None:
+            return AgentWaitState.FAILURE  # released: there is nothing left to wait on
+
+        while True:
             status = TransferState(self.agent.check_xfer_state(self.handle))
+            if status == TransferState.DONE:
+                return AgentWaitState.SUCCESS
             if status == TransferState.ERROR:
+                # Only ERROR is logged: under bounded polling a timeout is the normal case, and
+                # logging it would be a per-slice log storm. The caller logs when it gives up.
                 logger.error("NIXL transfer entered ERROR state (agent=%s).", self.agent.name)
-                return False
-            if timeout is not None and (time.time() - start_time > timeout):
-                logger.warning("NIXL transfer wait timed out after %s ms.", timeout_ms)
-                return False
+                return AgentWaitState.FAILURE
+            if timeout is not None and (time.monotonic() - start_time) >= timeout:
+                return AgentWaitState.IN_PROGRESS
             time.sleep(sleep_time)
             sleep_time = min(sleep_time * 2, max_sleep_time)
-        return status == TransferState.DONE
 
 
 class NixlTransferAgent(BaseTransferAgent):

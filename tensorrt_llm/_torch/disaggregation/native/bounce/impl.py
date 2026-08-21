@@ -219,6 +219,14 @@ class VmmBounceTransport(BounceTransport):
         """Release a send region after its write has completed."""
         self._send_alloc.release(slot_id)
 
+    def quarantine_send(self, slot_id, grace_s: Optional[float] = None) -> None:
+        """Hold a send region out of reuse after the sender gave up waiting on its write. Mirrors
+        orphan_reservation on the receive side: releasing the request does not prove the NIC
+        stopped reading, so returning the region now would let the next gather corrupt it."""
+        self._send_alloc.quarantine(
+            slot_id, self._quarantine_grace_s if grace_s is None else grace_s
+        )
+
     @staticmethod
     def _skip_bounce(reason: str, *, warn_key: str) -> bool:
         """Log why a transfer falls back to the per-fragment path and return False, so the guards
@@ -446,8 +454,10 @@ class VmmBounceTransport(BounceTransport):
             try:
                 item = self._scatter_q.get(timeout=_SCATTER_POLL_S)
             except queue.Empty:
-                # idle: reclaim quarantine past its grace period, independent of any reserve call
+                # idle: reclaim quarantine past its grace period, independent of any reserve call.
+                # Both arenas quarantine (recv on cancel/teardown, send on a sender wait deadline).
                 self._recv_alloc.reclaim_expired()
+                self._send_alloc.reclaim_expired()
                 continue
             if item is None:
                 break  # poison pill from close: wake and exit
@@ -495,6 +505,9 @@ class NoBounceTransport(BounceTransport):
         return None
 
     def release_send(self, slot_id) -> None:
+        pass
+
+    def quarantine_send(self, slot_id, grace_s: Optional[float] = None) -> None:
         pass
 
     def reserve(

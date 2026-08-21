@@ -87,6 +87,7 @@ def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: st
         executor.dist = _TorchCollectiveDist()
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
             num_fitting_reqs=0,
@@ -942,6 +943,27 @@ class TestDisaggTransferAdmissionController:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
+    @staticmethod
+    def _make_idle_progress_executor(active_requests, has_context_send=False):
+        """Build a single-rank executor stub for the idle-progress path."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.async_transfer_manager = Mock(
+            has_any_inflight_requests=Mock(return_value=has_context_send)
+        )
+        executor.active_requests = active_requests
+        return executor
+
+    @staticmethod
+    def _make_gen_request(*, waiting_in_init=False, receiving=False):
+        """Build a generation-side request stub in one disagg state."""
+        return Mock(
+            is_disagg_generation_init_state=waiting_in_init,
+            is_disagg_generation_transmission_in_progress=receiving,
+        )
+
     def test_gen_transfer_status_polls_active_transfers(self):
         executor = object.__new__(PyExecutor)
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
@@ -974,6 +996,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
@@ -986,12 +1009,15 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
-    def test_peer_rank_enters_bounded_progress_poll(self):
+    def test_peer_rank_enters_progress_poll_without_blocking(self):
+        # A rank that only entered because of the allreduce must not spend the
+        # poll interval waiting; it still runs the same collectives.
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
@@ -1001,7 +1027,7 @@ class TestDisaggTransferIdleProgress:
             all_gen_first=False,
         )
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
 
@@ -1010,6 +1036,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
@@ -1022,6 +1049,95 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
+    @pytest.mark.parametrize("has_stuck_init_request", [False, True])
+    def test_idle_context_wait_warns_only_when_admission_is_stalled(self, has_stuck_init_request):
+        executor = self._make_idle_progress_executor(
+            [self._make_gen_request(waiting_in_init=has_stuck_init_request)]
+        )
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+            PyExecutor._check_disagg_transfer_progress_when_idle(
+                executor,
+                num_fitting_reqs=0,
+                fitting_disagg_gen_init_requests=[],
+                wait_for_disagg_gen_transfer_progress=False,
+                all_gen_first=False,
+                is_idle=True,
+            )
+
+        # A merely starved rank must stay quiet; a request waiting in
+        # DISAGG_GENERATION_INIT with nothing in flight is the reportable case.
+        assert mock_logger.warning.called is has_stuck_init_request
+        mock_logger.warning_once.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+
+    def test_idle_context_wait_stays_quiet_on_partial_admission_burst(self):
+        # First burst on an idle generation server: the capacity scheduler
+        # fits six requests, the transfer budget admits two and defers four.
+        admitted = [self._make_gen_request() for _ in range(2)]
+        waiting = [self._make_gen_request(waiting_in_init=True) for _ in range(8)]
+        executor = self._make_idle_progress_executor(admitted + waiting)
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+            PyExecutor._check_disagg_transfer_progress_when_idle(
+                executor,
+                num_fitting_reqs=0,
+                fitting_disagg_gen_init_requests=admitted,
+                wait_for_disagg_gen_transfer_progress=False,
+                all_gen_first=False,
+                is_idle=True,
+            )
+
+        # Two requests were admitted, so the eight still waiting are ordinary
+        # back-pressure and must not consume the stall report.
+        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+
+    @pytest.mark.parametrize("blocker", ["gen_receive", "ctx_send"])
+    def test_idle_context_wait_stays_quiet_while_transfer_pending(self, blocker):
+        active_requests = [self._make_gen_request(waiting_in_init=True)]
+        if blocker == "gen_receive":
+            active_requests.append(self._make_gen_request(receiving=True))
+        executor = self._make_idle_progress_executor(
+            active_requests, has_context_send=blocker == "ctx_send"
+        )
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+            PyExecutor._check_disagg_transfer_progress_when_idle(
+                executor,
+                num_fitting_reqs=0,
+                fitting_disagg_gen_init_requests=[],
+                wait_for_disagg_gen_transfer_progress=False,
+                all_gen_first=False,
+                is_idle=True,
+            )
+
+        # A transfer in either direction can still free the blocks or the
+        # admission slot the waiting request needs, so this is back-pressure.
+        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+
+    def test_idle_context_wait_repeats_stall_report_on_a_heartbeat(self):
+        executor = self._make_idle_progress_executor([self._make_gen_request(waiting_in_init=True)])
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+            for _ in range(2):
+                PyExecutor._check_disagg_transfer_progress_when_idle(
+                    executor,
+                    num_fitting_reqs=0,
+                    fitting_disagg_gen_init_requests=[],
+                    wait_for_disagg_gen_transfer_progress=False,
+                    all_gen_first=False,
+                    is_idle=True,
+                )
+
+        # The stall persists across iterations but the report is rate limited,
+        # and it stays repeatable instead of being spent once per process.
+        assert mock_logger.warning.call_count == 1
+        assert executor._check_disagg_ctx_cache_transfer_status.call_count == 2
+
     def test_gen_only_no_context_benchmark_polls_context_when_idle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1032,6 +1148,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
@@ -1055,6 +1172,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,
@@ -1172,6 +1290,7 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor.active_requests = []
 
         PyExecutor._check_disagg_transfer_progress_when_idle(
             executor,

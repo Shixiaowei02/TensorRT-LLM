@@ -172,6 +172,11 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# A disagg generation rank that cannot admit anything usually stays that way
+# for many iterations, so its report repeats on this interval: often enough to
+# show the stall is ongoing, rare enough not to flood the log.
+_DISAGG_GEN_STALL_WARN_INTERVAL_S = 60.0
+
 # How many executor iterations between KV pool rebalance checks.  The V2
 # auto-tuner rate-limits itself to one adjustment per 120s, so a check every
 # iteration is pure overhead -- and under TP each check costs a broadcast (see
@@ -3769,6 +3774,8 @@ class PyExecutor:
             wait_for_disagg_gen_transfer_progress: bool,
             all_gen_first: bool,
             is_idle: bool = False) -> None:
+        # fitting_disagg_gen_init_requests is the post-admission list, so a
+        # nonempty list means this iteration did admit generation requests.
         local_needs_progress = (num_fitting_reqs == 0
                                 and not fitting_disagg_gen_init_requests)
 
@@ -3793,7 +3800,11 @@ class PyExecutor:
                 logger.debug(
                     "Waiting for generation KV cache transfer progress to "
                     "free disagg admission budget")
-            self._check_disagg_gen_cache_transfer_status(1)
+            # Only the rank whose admission is blocked waits out the poll
+            # interval; a peer pulled in by the allreduce would burn it with
+            # nothing to reap. Both values run the same collectives.
+            self._check_disagg_gen_cache_transfer_status(
+                1 if local_need_gen_check else 0)
             return
 
         local_need_ctx_check = is_idle or (uses_async_gen_transfer
@@ -3802,9 +3813,20 @@ class PyExecutor:
             local_need_ctx_check)
         if any_need_check > 0:
             if local_need_ctx_check and not all_gen_first:
-                logger.warning(
-                    "Executor is idle or no disaggregated generation request "
-                    "fits; waiting for context KV cache transfer progress")
+                stuck_init_request_count = sum(
+                    request.is_disagg_generation_init_state
+                    for request in self.active_requests)
+                # A rank merely starved by a slow context server, or one that
+                # just admitted part of a burst, reaches this every iteration.
+                # Only a wait that nothing in flight can end is worth a report.
+                if (local_needs_progress and stuck_init_request_count
+                        and not wait_for_disagg_gen_transfer_progress
+                        and not self._has_disagg_transfer_in_flight()):
+                    self._warn_disagg_gen_admission_stalled(
+                        stuck_init_request_count)
+                else:
+                    logger.debug("Executor is idle; waiting for context KV "
+                                 "cache transfer progress")
                 # Local conditions warrant a blocking wait for at least one
                 # in-flight transfer to complete so KV blocks can be freed.
                 self._check_disagg_ctx_cache_transfer_status(1)
@@ -3816,6 +3838,33 @@ class PyExecutor:
                 # sync) and reaps any already-completed transfers without
                 # blocking on un-finished ones.
                 self._check_disagg_ctx_cache_transfer_status(0)
+
+    def _has_disagg_transfer_in_flight(self) -> bool:
+        """Return whether a KV transfer this rank can wait on is in flight.
+
+        Covers both directions: a generation receive that will release its
+        admission slot, and a context send whose completion frees the blocks
+        it pinned. Either one can admit a waiting request on a later iteration.
+        """
+        return (self.async_transfer_manager.has_any_inflight_requests()
+                or any(request.is_disagg_generation_transmission_in_progress
+                       for request in self.active_requests))
+
+    def _warn_disagg_gen_admission_stalled(self,
+                                           stuck_request_count: int) -> None:
+        # Report only what is known: requests are waiting and nothing this
+        # rank can wait on is running. Whether admission is blocked by KV
+        # capacity or by the transfer budget is not visible from here.
+        now = time.monotonic()
+        last_warn_time = getattr(self, "_disagg_gen_stall_warn_time", None)
+        if (last_warn_time is not None
+                and now - last_warn_time < _DISAGG_GEN_STALL_WARN_INTERVAL_S):
+            return
+        self._disagg_gen_stall_warn_time = now
+        logger.warning(
+            f"{stuck_request_count} disaggregated generation request(s) "
+            "waiting in DISAGG_GENERATION_INIT: none could be admitted this "
+            "iteration and no KV cache transfer is in flight on this rank")
 
     def _sync_gen_only_benchmark_has_insufficient_kv(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],

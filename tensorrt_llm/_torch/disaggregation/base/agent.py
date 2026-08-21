@@ -1,6 +1,7 @@
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, NamedTuple, Optional, Tuple
 
 import numpy as np
@@ -82,12 +83,30 @@ class RegMemoryDescs:
     descs: List[Tuple[int, int, int, str]]
 
 
+class AgentWaitState(Enum):
+    """Outcome of one bounded agent wait.
+
+    IN_PROGRESS means the transfer is still live, not failed: it has neither drained nor errored,
+    so treating it as failure would release memory the NIC may still be reading.
+    """
+
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    IN_PROGRESS = "IN_PROGRESS"
+
+
 class TransferStatus(ABC):
     @abstractmethod
     def is_completed(self) -> bool: ...
 
     @abstractmethod
-    def wait(self, timeout_ms: int | None = None) -> bool: ...
+    def wait(self, timeout_ms: int | None = None) -> AgentWaitState: ...
+
+    def release(self) -> bool:
+        """Tear down the backend transfer request, in flight or not. True means the backend
+        accepted the release; it does NOT prove the NIC stopped reading the source (mirrors the
+        C++ default in executor/transferAgent.h, and is non-abstract for the same reason)."""
+        return False
 
 
 class BaseTransferAgent(ABC):
@@ -165,6 +184,9 @@ if _force_py_nixl_kv_transfer():
     _use_pure_python_transfer_agent = True
 else:
     if _cpp_binding:
+        # These rebind the names defined above, so on this (default) path the ABCs are NOT the base
+        # of the concrete wrappers and their @abstractmethod decorators enforce nothing. Every
+        # wrapper must define each method itself rather than relying on the ABC.
         MemoryType = _cpp_binding.MemoryType
         TransferOp = _cpp_binding.TransferOp
         MemoryDesc = _cpp_binding.MemoryDesc

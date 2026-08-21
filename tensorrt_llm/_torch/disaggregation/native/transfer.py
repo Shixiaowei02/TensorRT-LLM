@@ -21,6 +21,7 @@ import struct
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
@@ -37,6 +38,7 @@ except ImportError:
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
+    AgentWaitState,
     BaseTransferAgent,
     MemoryDescs,
     MemoryType,
@@ -90,6 +92,12 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Floor for the sender's agent wait so a transfer dispatched at or past the session deadline still
+# gets a real attempt instead of being abandoned before the agent is ever polled.
+_MIN_AGENT_WAIT_S = 1.0
+# One bounded agent poll slice, matching the C++ v1 in-flight-cancel loop. Between slices the
+# sender re-checks session cancellation and the overall deadline.
+_AGENT_POLL_SLICE_MS = 100
 
 
 @dataclass
@@ -228,6 +236,47 @@ def _make_kv_result_msg(
     return msg
 
 
+def _agent_wait_deadline_s(session: Optional["TxSession"]) -> float:
+    """Absolute monotonic instant at which the sender stops WAITING on the agent.
+
+    It is the session's transfer deadline (``kv_transfer_timeout_ms``), floored so a transfer
+    dispatched at or past that deadline still gets a real attempt. Reaching it does not end the
+    transfer by itself; the caller decides, and ``_release_abandoned_transfer`` is that decision.
+    """
+    deadline_s = session._deadline_monotonic_s if session is not None else None
+    if deadline_s is None:
+        # send() anchors the deadline before dispatching, but aux and standalone sessions can
+        # reach the worker unanchored; keep those finite too.
+        return time.monotonic() + _FALLBACK_TX_OVERALL_TIMEOUT_S
+    return max(deadline_s, time.monotonic() + _MIN_AGENT_WAIT_S)
+
+
+def _release_abandoned_transfer(status, what: str) -> bool:
+    """Tear down the request the sender is giving up on, deliberately instead of leaving it to the
+    status destructor. Same primitive as the C++ in-flight cancel (agent_utils/connection.cpp:213);
+    a true return does NOT prove the NIC quiesced (executor/transferAgent.h:368)."""
+    release = getattr(status, "release", None)
+    if release is None:
+        # Out-of-tree status without release(): nothing here can cancel, so say so once.
+        logger.warning_once(
+            f"{type(status).__name__} exposes no release(); an abandoned transfer request cannot "
+            f"be torn down explicitly.",
+            key="agent-status-no-release",
+        )
+        return False
+    try:
+        released = bool(release())
+    except Exception as e:
+        logger.error(f"{what}: releasing the abandoned transfer request raised: {e}")
+        return False
+    if not released:
+        logger.error(
+            f"{what}: the backend refused to release the abandoned transfer request; one backend "
+            f"transfer handle stays active for the life of the agent"
+        )
+    return released
+
+
 class SendTaskBase:
     def __init__(self, params: DisaggregatedParams):
         self.status = TaskStatus.INIT
@@ -292,12 +341,33 @@ class KVSendTask(SendTaskBase):
         self._beam_width = beam_width
 
 
+@dataclass
+class RetiredSession:
+    """Tombstone left by clear_session so a late REQUEST_DATA can be answered.
+
+    ``completed`` distinguishes retirement by success from retirement by
+    timeout/cancel/error; ``served_ranks`` are the peer instance ranks whose
+    RecvReqInfo had already been accepted, i.e. the only peers this sender could
+    ever have built a WriteMeta (and therefore issued an RDMA write) for.
+    """
+
+    completed: bool
+    served_ranks: frozenset
+    retired_at: float
+
+
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # Bound on retired-session tombstones. Capacity caps the worst case (a burst
+    # of retirements between sweeps); the TTL reclaims a quiet server's tail.
+    _MAX_RETIRED_SESSIONS = 4096
+    # A REQUEST_DATA cannot usefully arrive later than the receiver's own
+    # transfer timeout, so match the RecvReqInfo TTL rather than exceed it.
+    _RETIRED_SESSION_TTL_S = 120.0
 
     def __init__(
         self,
@@ -313,11 +383,21 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
+        # Shared DEALER cache for the non-worker paths. Reached from the listener
+        # thread (_send_failed_result_to_receiver, CANCEL_SESSION) AND the
+        # executor thread (cancel_request -> TxSession.cancel), so it needs a lock.
+        self._dealers = {}
+        self._dealers_lock = threading.Lock()
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
-        self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
+        # Protects _sessions, _pre_cancelled_rids and _retired_sessions. Keeping the
+        # tombstone under the same lock makes "session gone" and "tombstone present"
+        # a single atomic observation for _respond_with_kv.
+        self._sessions_lock = threading.Lock()
         self._pre_cancelled_rids: set[int] = set()
+        # unique_rid -> RetiredSession, insertion-ordered (== retired_at order) so the
+        # TTL sweep can stop at the first entry that is still fresh.
+        self._retired_sessions: "OrderedDict[int, RetiredSession]" = OrderedDict()
         self._shutdown = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
         # Guards concurrent add() from the listener thread.
@@ -369,10 +449,15 @@ class Sender(SenderBase):
                 return None
             return next(iter(reqs.values()))
 
-    def _remove_req_info(self, unique_rid: int):
+    def _remove_req_info(self, unique_rid: int) -> frozenset:
+        """Drop this rid's RecvReqInfo and return the peer instance ranks it held.
+
+        Those ranks are exactly the peers a WriteMeta could have been built for.
+        """
         with self._peer_requests_lock:
-            self._peer_requests.pop(unique_rid, None)
+            served_ranks = frozenset(self._peer_requests.pop(unique_rid, {}))
             self._peer_requests_timestamps.pop(unique_rid, None)
+            return served_ranks
 
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
@@ -380,7 +465,9 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+        Retired-session tombstones are swept here too so they cannot leak either.
         """
+        self._sweep_retired_sessions()
         now = time.monotonic()
         with self._peer_requests_lock:
             stale_rids = [
@@ -397,11 +484,44 @@ class Sender(SenderBase):
                     self._peer_requests_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
 
+    def _sweep_retired_sessions(self):
+        """Drop tombstones older than the TTL.
+
+        _retired_sessions is insertion-ordered by retired_at, so stopping at the
+        first fresh head keeps this O(evicted) rather than O(live).
+        """
+        now = time.monotonic()
+        swept = 0
+        with self._sessions_lock:
+            while self._retired_sessions:
+                rid, entry = next(iter(self._retired_sessions.items()))
+                if now - entry.retired_at <= self._RETIRED_SESSION_TTL_S:
+                    break
+                self._retired_sessions.pop(rid, None)
+                swept += 1
+        if swept:
+            logger.debug(f"Swept {swept} retired-session tombstone(s)")
+
+    def _add_tombstone(self, unique_rid: int, completed: bool, served_ranks: frozenset):
+        """Record a retirement. Caller must hold _sessions_lock.
+
+        Re-inserting moves the entry to the tail so insertion order stays sorted by
+        retired_at, and the capacity bound evicts the oldest first.
+        """
+        self._retired_sessions.pop(unique_rid, None)
+        self._retired_sessions[unique_rid] = RetiredSession(
+            completed=completed, served_ranks=served_ranks, retired_at=time.monotonic()
+        )
+        while len(self._retired_sessions) > self._MAX_RETIRED_SESSIONS:
+            self._retired_sessions.popitem(last=False)
+
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
         pre_cancel = False
         with self._sessions_lock:
             self._sessions[unique_rid] = weakref.ref(tx_session)
+            # A live session supersedes any tombstone for the same rid.
+            self._retired_sessions.pop(unique_rid, None)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 self._pre_cancelled_rids.discard(unique_rid)
@@ -493,6 +613,24 @@ class Sender(SenderBase):
                         )
                 dealers.clear()
 
+    def _wait_for_agent(self, status, session: "TxSession", deadline_s: float) -> AgentWaitState:
+        """Poll one transfer in bounded slices until terminal, or until the session is cancelled
+        or its deadline passes. IN_PROGRESS means the write neither drained nor errored, so the
+        caller must release the request rather than treat it as a completed writer.
+        """
+        while True:
+            # Never pass a negative timeout: to the C++ agent that means "spin forever", which
+            # would reinstate the unbounded wait this loop exists to remove.
+            remaining_ms = round((deadline_s - time.monotonic()) * 1000)
+            slice_ms = min(_AGENT_POLL_SLICE_MS, remaining_ms) if remaining_ms > 0 else 0
+            state = status.wait(timeout_ms=slice_ms)
+            if state != AgentWaitState.IN_PROGRESS:
+                return state
+            if slice_ms == 0:  # budget spent, and the last look found it still in flight
+                return AgentWaitState.IN_PROGRESS
+            if session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                return AgentWaitState.IN_PROGRESS
+
     @staticmethod
     @nvtx_range("_make_agent_request")
     def _make_agent_request(write_meta: WriteMeta, device_id: int) -> "TransferRequest":
@@ -573,7 +711,9 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            # Worker thread: must use this thread's own DEALER, never the shared
+            # one, which the listener/executor threads send on concurrently.
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -603,7 +743,9 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                # Worker thread: same thread-local DEALER as the success path
+                # below; the shared dict belongs to the listener/executor threads.
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -615,14 +757,29 @@ class Sender(SenderBase):
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
+            # Poll in bounded slices instead of one unbounded wait, so cancellation and the session
+            # deadline are observable and this worker thread is not pinned forever by one transfer.
+            deadline_s = _agent_wait_deadline_s(session)
+            abandoned = False
+            released = False
+            wait_start_s = time.monotonic()
             try:
                 status = self._agent.submit_transfer_requests(request)
-                if not status.wait():
+                state = self._wait_for_agent(status, session, deadline_s)
+                if state == AgentWaitState.IN_PROGRESS:
+                    abandoned = True
+                    # Release here, before the send region is quarantined below, so the grace
+                    # period starts only after the backend has been told to tear the request down.
+                    released = _release_abandoned_transfer(
+                        status, f"KV rid={write_meta.unique_rid} slice={write_meta.slice_id}"
+                    )
+                elif state == AgentWaitState.FAILURE:
                     agent_result = AgentResult.FAILED
                     last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
-                        f"KV transfer agent failed: "
+                        f"KV transfer agent failed (agent reported error after "
+                        f"{time.monotonic() - wait_start_s:.3f}s): "
                         f"unique_rid={write_meta.unique_rid} "
                         f"slice={write_meta.slice_id} "
                         f"peer_rank={write_meta.peer_rank} "
@@ -637,8 +794,47 @@ class Sender(SenderBase):
                     task.fail(RuntimeError(detail))
             finally:
                 if send_slot_id is not None:
-                    self._bounce.release_send(send_slot_id)
-        if timer:
+                    # Releasing the request does not prove the NIC stopped reading this region, so
+                    # hold it out of reuse instead of handing it to the next gather. SUCCESS and
+                    # FAILURE have drained and can go straight back to the pool.
+                    if abandoned:
+                        self._bounce.quarantine_send(send_slot_id)
+                    else:
+                        self._bounce.release_send(send_slot_id)
+            if timer:
+                timer.record_transfer_end(write_meta.peer_rank)
+            if abandoned:
+                # The request was released above; what is NOT protected is the source region. A
+                # bounced write reads the quarantined slot; an unbounced one reads this request's
+                # KV pages, which this module does not hold -- the log below says which.
+                source = (
+                    f"src=bounce_slot:{send_slot_id} (quarantined for the grace period)"
+                    if send_slot_id is not None
+                    else "src=kv_pages (bounce off: this module does not hold them; the executor "
+                    "frees them once the session is reaped as CANCELLED)"
+                )
+                logger.error(
+                    f"KV transfer still in flight at its deadline; released the backend request "
+                    f"and freed the sender worker: unique_rid={write_meta.unique_rid} "
+                    f"slice={write_meta.slice_id} peer_rank={write_meta.peer_rank} "
+                    f"peer_endpoint={write_meta.peer_endpoint} "
+                    f"waited={time.monotonic() - wait_start_s:.3f}s "
+                    f"session_status={session.status.value} "
+                    f"src_size={int(write_meta.src_ptrs.size)} "
+                    f"release_accepted={released} {source} "
+                    f"(kv_transfer_timeout_ms budget exhausted; no result is sent, since "
+                    f"AgentResult.FAILED would tell the receiver this writer had drained)"
+                )
+                if send_slot_id is None:
+                    logger.warning_once(
+                        "[kv-bounce] a KV write was abandoned in place: with "
+                        "kv_cache_bounce_size_mb=0 the NIC reads the request's KV pages directly, "
+                        "so no send region exists to quarantine. Enabling bounce moves the "
+                        "abandoned read onto a slot that can be held out of reuse.",
+                        key="kv-abandon-unbounced",
+                    )
+                return
+        elif timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
@@ -707,11 +903,35 @@ class Sender(SenderBase):
             request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            if not self._agent.submit_transfer_requests(request).wait():
-                agent_result = AgentResult.FAILED
-                session.set_exception("aux transfer agent request failed")
+            # Same bounded poll as the KV path, so one slow aux write cannot pin the worker thread.
+            deadline_s = _agent_wait_deadline_s(session)
+            wait_start_s = time.monotonic()
+            status = self._agent.submit_transfer_requests(request)
+            state = self._wait_for_agent(status, session, deadline_s)
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
+            if state == AgentWaitState.IN_PROGRESS:
+                # Release the request, then stay silent: set_exception() would resolve every task
+                # and close the session at once, freeing the aux slot, and release does not prove
+                # the NIC stopped reading it. The CANCELLED reap still frees it a few iters later.
+                released = _release_abandoned_transfer(status, f"aux rid={write_meta.unique_rid}")
+                logger.error(
+                    f"aux transfer still in flight at its deadline; released the backend request "
+                    f"and freed the sender worker: unique_rid={write_meta.unique_rid} "
+                    f"peer_rank={write_meta.peer_rank} peer_endpoint={write_meta.peer_endpoint} "
+                    f"waited={time.monotonic() - wait_start_s:.3f}s "
+                    f"release_accepted={released} (no AUX_AGENT_RESULT is sent, since that would "
+                    f"tell the receiver this writer had drained)"
+                )
+                return
+            if state == AgentWaitState.FAILURE:
+                agent_result = AgentResult.FAILED
+                logger.error(
+                    f"aux transfer agent failed (agent reported error after "
+                    f"{time.monotonic() - wait_start_s:.3f}s): unique_rid={write_meta.unique_rid} "
+                    f"peer_rank={write_meta.peer_rank} peer_endpoint={write_meta.peer_endpoint}"
+                )
+                session.set_exception("aux transfer agent request failed")
 
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
@@ -1102,11 +1322,20 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        retired: Optional[RetiredSession] = None
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
-                self._save_peer_req_info(info)
-                return
+                # clear_session publishes the tombstone under this same lock, so the
+                # session and its tombstone are never both invisible.
+                retired = self._retired_sessions.get(info.unique_rid)
+                if retired is None:
+                    self._save_peer_req_info(info)
+                    return
+        if retired is not None:
+            # Send outside the lock to avoid holding it during I/O.
+            self._answer_retired_session(info, retired)
+            return
         with session.lock:
             self._save_peer_req_info(info)
             tasks = list(session.kv_tasks)
@@ -1123,6 +1352,41 @@ class Sender(SenderBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_push_start(trans_meta.peer_rank)
             self._enqueue(trans_meta)
+
+    def _answer_retired_session(self, info: RecvReqInfo, retired: RetiredSession):
+        """Answer a REQUEST_DATA that arrived after its TxSession was retired.
+
+        Staying silent here is what strands the receiver's KVRecvTask in
+        TRANSFERRING forever, pinning a generation transfer-block slot (nvbugs/6480621).
+        """
+        rid = info.unique_rid
+        if info.instance_rank in retired.served_ranks:
+            # A WriteMeta already went out for this peer, so a one-sided write may still
+            # be landing. FAILED asserts "this writer has drained" and would let the
+            # receiver release the region unquarantined; the dispatched write answers.
+            logger.warning(
+                f"_respond_with_kv: duplicate REQUEST_DATA for retired rid={rid} from an "
+                f"already-served rank={info.instance_rank}; not answering (a write may be in "
+                "flight, so FAILED would falsely claim it drained)"
+            )
+            return
+        if retired.completed:
+            # Retired by success: this peer either already holds its SUCCESS result, or the
+            # session completed without owing it anything. FAILED would flip a transfer that
+            # landed back to ERROR, and a SUCCESS with no data tail would complete it with no KV.
+            logger.warning(
+                f"_respond_with_kv: REQUEST_DATA for rid={rid} from rank={info.instance_rank} "
+                "arrived after the session completed successfully; not answering"
+            )
+            return
+        # Retired by timeout/cancel/error and never served: no WriteMeta was ever built
+        # for this peer, so nothing of ours can be in flight to it and FAILED is both
+        # drained-accurate and the only thing that frees its receive task.
+        logger.warning(
+            f"_respond_with_kv: rid={rid} was retired without completing; failing "
+            f"rank={info.instance_rank} instead of leaving it to hang"
+        )
+        self._send_failed_result_to_receiver(info)
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
         try:
@@ -1143,11 +1407,15 @@ class Sender(SenderBase):
             )
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
+        """Shared DEALER for the listener/executor cancel+abort paths. The lock
+        covers only the lookup/connect, never the send; ZMQMessenger.send holds
+        its own per-socket lock so this one is not held across the wire."""
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        with self._dealers_lock:
+            if endpoint not in self._dealers:
+                self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+            return self._dealers[endpoint]
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -1170,11 +1438,16 @@ class Sender(SenderBase):
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
         return self._is_req_ready(req_info.unique_rid, expected_transfers)
 
-    def clear_session(self, unique_rid: int):
+    def clear_session(self, unique_rid: int, completed: bool = False):
+        """Retire a session, leaving a tombstone for late REQUEST_DATA messages.
+
+        ``completed`` must be the session's own success verdict: only a
+        not-completed retirement may answer a late peer with AgentResult.FAILED.
+        """
+        # Lock order matches sweep_stale_req_infos: _sessions_lock then _peer_requests_lock.
         with self._sessions_lock:
-            if unique_rid in self._sessions:
-                del self._sessions[unique_rid]
-        self._remove_req_info(unique_rid)
+            self._sessions.pop(unique_rid, None)
+            self._add_tombstone(unique_rid, completed, self._remove_req_info(unique_rid))
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
         """Notify all receivers involved in this session to cancel."""
@@ -1219,12 +1492,15 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
+        # Detach under the lock so a late executor-thread cancel cannot mutate
+        # the dict while we iterate it.
+        with self._dealers_lock:
+            dealers, self._dealers = self._dealers, {}
+        for dealer in dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
 
     def __del__(self):
         try:
@@ -1516,8 +1792,10 @@ class TxSession(TxSessionBase):
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
         # Unregister from Sender; keep fields alive for in-flight worker threads.
+        # is_completed() is the positive success test, so every other retirement
+        # (cancelled, errored, timed out, abandoned to GC) tombstones as a failure.
         if self._sender is not None:
-            self._sender.clear_session(self.disagg_request_id)
+            self._sender.clear_session(self.disagg_request_id, completed=self.is_completed())
 
     def __enter__(self):
         return self
@@ -1594,7 +1872,10 @@ class Receiver(ReceiverBase):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
+        # Reached from the executor thread (dispatch_task) AND the listener
+        # thread (CANCEL_SESSION -> RxSession.cancel -> send_cancel_to_senders).
         self._dealers = {}
+        self._dealers_lock = threading.Lock()
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
         # compatibility check. Requests targeting such a peer fail fast
@@ -1619,12 +1900,15 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
-        for dealer in self._dealers.values():
+        # Detach under the lock so a concurrent listener-thread cancel cannot
+        # mutate the dict while we iterate it.
+        with self._dealers_lock:
+            dealers, self._dealers = self._dealers, {}
+        for dealer in dealers.values():
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
-        self._dealers.clear()
         self._messenger.stop()
 
     def clear_session(self, unique_rid: int):
@@ -1843,11 +2127,14 @@ class Receiver(ReceiverBase):
         return endpoint not in self._sender_ep_instance_map
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
+        """Shared DEALER cache. The lock covers only the lookup/connect, never
+        the send; ZMQMessenger.send holds its own per-socket lock."""
         if endpoint is None:
             raise ValueError("Receiver: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        with self._dealers_lock:
+            if endpoint not in self._dealers:
+                self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+            return self._dealers[endpoint]
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)

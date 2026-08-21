@@ -187,9 +187,12 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // All concrete subclasses (Nixl, Mooncake) perform blocking waits, so releasing
     // the GIL here is safe and necessary for correct behavior when the concrete
     // subclass type is not directly registered (e.g., agents created via factory).
+    // release() is exposed so a Python caller that gives up on a bounded wait can tear the request
+    // down deliberately instead of relying on the status destructor doing it as a side effect.
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -258,6 +261,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("is_completed", &kvc::NixlTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
         .def("wait", &kvc::NixlTransferStatus::wait, nb::arg("timeout_ms") = -1,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::NixlTransferStatus::release, nb::call_guard<nb::gil_scoped_release>())
         .def("get_last_status", &kvc::NixlTransferStatus::getLastStatus)
         .def("get_last_status_str", &kvc::NixlTransferStatus::getLastStatusStr);
 
