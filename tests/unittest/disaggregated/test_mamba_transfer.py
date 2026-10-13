@@ -213,7 +213,6 @@ def _create_managers(
     use_v2=False,
     conv_state_layout="x_b_c",
     with_ple=False,
-    max_util_for_resume=0.95,
 ):
     """Create Mamba hybrid cache managers for all TP ranks (PP=1).
 
@@ -260,7 +259,6 @@ def _create_managers(
                 max_tokens=256 * max_batch_size,
                 enable_block_reuse=False,
                 event_buffer_max_size=0,
-                max_util_for_resume=max_util_for_resume,
             ),
             kv_cache_type=CacheTypeCpp.SELF,
             num_layers=1,
@@ -691,172 +689,6 @@ def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
         assert mgr._impl.mamba_cache_index[100] != mgr._impl._attention_dp_dummy_slot
     finally:
         mgr.shutdown()
-
-
-def _transfer_regions(transceiver, request):
-    """View the actual KV, convolution and SSM bytes described to NIXL."""
-    from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
-
-    chunk = transceiver._create_chunk(request)
-    extractor = transceiver._transfer_worker._peer_registrar.self_extractor
-    regions = []
-    for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
-        for pool, view in enumerate(extractor.page_table.layer_groups[group].pool_views):
-            memory = extractor.extract(blocks, group, pool).memory
-            for pointer in memory.ptrs:
-                for entry in view.buffer_entries:
-                    address = int(pointer) + int(entry["offset"])
-                    size = int(entry["size"])
-                    regions.append(
-                        convert_to_torch_tensor(TensorWrapper(address, torch.uint8, [size]))
-                    )
-    assert regions
-    return regions
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("bounce_mb", [0, 8])
-@pytest.mark.parametrize("mode", ["async", "sync"])
-def test_v2_recycled_slots_wait_before_receive(bounce_mb, mode):
-    """An independent NIXL WRITE must follow the recycled KV/SSM slots' last GPU writer."""
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL
-
-    stream = torch.cuda.Stream()
-    managers = _create_managers(1, max_batch_size=2, use_v2=True, max_util_for_resume=1.0)
-    with torch.cuda.stream(stream):
-        managers += _create_managers(1, max_batch_size=2, use_v2=True, max_util_for_resume=1.0)
-    ctx_manager, gen_manager = managers
-    assert gen_manager._stream == stream
-    config = CacheTransceiverConfig(
-        backend="NIXL",
-        transceiver_runtime="PYTHON",
-        kv_cache_bounce_size_mb=bounce_mb,
-        agent_bounce_buffer_enable=bounce_mb > 0,
-        agent_bounce_params=(
-            {"min_descriptor_count": "1", "max_average_descriptor_size": "4MB"}
-            if bounce_mb
-            else None
-        ),
-        kv_transfer_timeout_ms=30000,
-    )
-    transceivers = []
-    fillers = []
-    try:
-        transceivers += _create_transceivers(1, [ctx_manager], config)
-        transceivers += _create_transceivers(1, [gen_manager], config)
-        ctx, gen = transceivers
-        unique_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-
-        def request(request_id, generation):
-            req = LlmRequest(
-                request_id=request_id,
-                max_new_tokens=1,
-                input_tokens=list(range(16)),
-                sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                    SamplingParams()._get_sampling_config()
-                ),
-                is_streaming=False,
-                llm_request_type=(
-                    LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
-                    if generation
-                    else LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
-                ),
-            )
-            req.py_disaggregated_params = DisaggregatedParams(
-                disagg_request_id=unique_id,
-                ctx_request_id=1 if generation else None,
-                ctx_dp_rank=0 if generation else None,
-                ctx_info_endpoint=ctx._context_info_endpoint if generation else None,
-            )
-            return req
-
-        source, old, incoming = request(1, False), request(2, True), request(3, True)
-        assert ctx_manager.prepare_context(source)
-        assert ctx_manager.resize_context(source, source.prompt_len)
-        ctx_batch = ScheduledRequests()
-        ctx_batch.context_requests_last_chunk = [source]
-        ctx_manager.prepare_resources(ctx_batch)
-        source.context_current_position = source.prompt_len
-        source.add_new_token(source.prompt_len, 0)
-        ctx_manager.update_resources(ctx_batch)
-        assert gen_manager.prepare_disagg_gen_init(old)
-        old_batch = ScheduledRequests()
-        old_batch.context_requests_last_chunk = [old]
-        with torch.cuda.stream(stream):
-            gen_manager.prepare_resources(old_batch)
-        source_regions = _transfer_regions(ctx, source)
-        old_regions = _transfer_regions(gen, old)
-        for region in source_regions:
-            region.fill_(29)
-        torch.cuda.synchronize()
-
-        state_pool = next(
-            int(pool.pool_group_index)
-            for pool in gen_manager.impl.pool_group_descs
-            if any(
-                int(variant.layer_group_id) == int(gen_manager.ssm_layer_group_id)
-                for variant in pool.slot_desc.variants
-            )
-        )
-        stats = gen_manager.impl.get_storage_statistics(GPU_LEVEL)
-        assert len(stats) == 2
-        attention_pool = 1 - state_pool
-        # Zero-capacity native caches occupy SSM slots without using the wrapper's request rows.
-        while stats[state_pool].free:
-            filler = gen_manager.impl.create_kv_cache()
-            fillers.append(filler)
-            filler.stop_committing()
-            assert filler.resume(stream.cuda_stream), (
-                f"SSM pool has {stats[state_pool].free} free slots but refused another filler"
-            )
-            assert filler.resize(0)
-            stats = gen_manager.impl.get_storage_statistics(GPU_LEVEL)
-        stats = gen_manager.impl.get_storage_statistics(GPU_LEVEL)
-        assert fillers and stats[state_pool].free == 0
-        assert fillers[0].resize(stats[attention_pool].free * gen_manager.tokens_per_block)
-        assert all(
-            pool.free == pool.available == 0
-            for pool in gen_manager.impl.get_storage_statistics(GPU_LEVEL)
-        )
-        torch.cuda.synchronize()
-
-        old_done = torch.cuda.Event()
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(2_000_000_000)
-            for region in old_regions:
-                region.fill_(17)
-            old_done.record()
-            gen_manager.free_resources(old)
-            assert gen_manager.prepare_disagg_gen_init(incoming)
-            # Direct transceiver users still need the host state-index map. This deliberately
-            # bypasses executor resource preparation so the receive entry owns its own fence.
-            gen_manager._setup_state_indices([incoming], num_contexts=1)
-        assert not old_done.query(), "the old GPU writer must still be pending at slot reuse"
-        incoming_regions = _transfer_regions(gen, incoming)
-        assert sorted((r.data_ptr(), r.numel()) for r in incoming_regions) == sorted(
-            (r.data_ptr(), r.numel()) for r in old_regions
-        ), "both attention pages and SSM slots must actually be recycled"
-        # Make CTX ready before the synchronous GEN call, which otherwise waits for the sender.
-        ctx.respond_and_send_async(source)
-        if mode == "async":
-            gen.request_and_receive_async(incoming)
-            gen.check_gen_transfer_status(None)
-        else:
-            gen.request_and_receive_sync(incoming)
-        ctx.check_context_transfer_status(None, mark_complete=True)
-        if bounce_mb:
-            assert ctx._transfer_worker._agent.bounce_submit_count > 0
-        torch.cuda.synchronize()
-        for region in incoming_regions:
-            assert torch.all(region == 29), "the old GPU writer overwrote received KV/SSM bytes"
-    finally:
-        torch.cuda.synchronize()
-        for transceiver in transceivers:
-            transceiver.shutdown()
-        for filler in fillers:
-            filler.close()
-        for manager in managers:
-            manager.shutdown()
 
 
 def run_mamba_transfer_test(

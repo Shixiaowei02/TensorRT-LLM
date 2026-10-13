@@ -9,71 +9,12 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
-from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import PyExecutorEffects
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-
-
-def _direct_receiver(manager: KVCacheManagerV2, publish: Mock) -> KvCacheTransceiverV2:
-    receiver = object.__new__(KvCacheTransceiverV2)
-    receiver._kv_cache_manager = manager
-    receiver._recv_sessions = {}
-    receiver._recv_reqs = {}
-    receiver._kv_size_rank_factor = 1
-    receiver._validate_bridge_req = Mock(return_value=True)
-    receiver._create_cache_extent = Mock(return_value=SimpleNamespace(local=object()))
-    receiver._chunk_num_bytes = Mock(return_value=1)
-    receiver._need_aux_transfer = Mock(return_value=False)
-    receiver._assert_disagg_history_declared = Mock()
-    session = Mock()
-    session.wait_complete.return_value = WaitResult.COMPLETED
-    session.close.return_value = True
-    fetch = SimpleNamespace(session=session, fetch=publish)
-    receiver._open_peer_source = Mock(return_value=fetch)
-    return receiver
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("mode", ["async", "sync"])
-def test_direct_receive_waits_before_publishing_recycled_slots(mode: str) -> None:
-    """Calling the V2 receiver directly must respect the allocation's CUDA fence."""
-    manager = object.__new__(KVCacheManagerV2)
-    ready = Mock()
-    manager._disagg_receive_ready = {1: ready}
-    request = Mock(request_id=1, py_request_id=1, py_disaggregated_params=None)
-
-    def publish(*args: object, **kwargs: object) -> None:
-        ready.synchronize.assert_called_once_with()
-
-    receiver = _direct_receiver(manager, Mock(side_effect=publish))
-    getattr(receiver, f"request_and_receive_{mode}")(request)
-
-    assert manager._disagg_receive_ready == {}
-    receiver._open_peer_source.assert_called_once_with(request)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("mode", ["async", "sync"])
-def test_direct_receive_failed_fence_does_not_publish(mode: str) -> None:
-    manager = object.__new__(KVCacheManagerV2)
-    ready = Mock()
-    ready.synchronize.side_effect = RuntimeError("cache event failed")
-    manager._disagg_receive_ready = {1: ready}
-    request = Mock(request_id=1, py_request_id=1, py_disaggregated_params=None)
-    receiver = _direct_receiver(manager, Mock())
-
-    with pytest.raises(RuntimeError, match="cache event failed"):
-        getattr(receiver, f"request_and_receive_{mode}")(request)
-
-    receiver._open_peer_source.assert_not_called()
-    receiver._create_cache_extent.assert_not_called()
-    assert receiver._recv_sessions == receiver._recv_reqs == {}
-    assert manager._disagg_receive_ready == {1: ready}
 
 
 @pytest.fixture(params=["async", "sync"])
@@ -120,7 +61,6 @@ def _manager() -> Mock:
     manager.kv_cache_map = {}
     manager.prepare_context_cache.return_value = 0
     manager.prepare_disagg_gen_init = MethodType(KVCacheManagerV2.prepare_disagg_gen_init, manager)
-    manager.wait_for_disagg_receive = MethodType(KVCacheManagerV2.wait_for_disagg_receive, manager)
     manager.prepare_resources = MethodType(KVCacheManagerV2.prepare_resources, manager)
     return manager
 

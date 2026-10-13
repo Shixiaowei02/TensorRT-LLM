@@ -304,7 +304,6 @@ def _transceiver_over(worker):
     """
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._transfer_worker = worker
-    transceiver._kv_cache_manager = None
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._kv_size_rank_factor = 1
