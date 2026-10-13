@@ -1121,6 +1121,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session = None
         fetches = None
         try:
+            self._wait_for_receive_ready(req)
             extent = self._create_cache_extent(req)
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
@@ -1163,6 +1164,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     "resources remain active"
                 )
 
+    def _wait_for_receive_ready(self, req: LlmRequest) -> None:
+        """Fence recycled V2 KV and SSM slots before NIXL writes outside the CUDA stream."""
+        if isinstance(self._kv_cache_manager, KVCacheManagerV2):
+            self._kv_cache_manager.wait_for_disagg_receive(req)
+
     def _open_peer_source(self, req: LlmRequest) -> PeerFetch:
         """The paired backend: pull this request's cache from the worker that ran its context."""
         return PeerFetch(self._transfer_worker, req)
@@ -1199,6 +1205,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
             )
             return
+        try:
+            self._wait_for_receive_ready(req)
+        except Exception:
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            raise
         extent = self._create_cache_extent(req)
         chunk_bytes = self._chunk_num_bytes(extent.local)
         req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor

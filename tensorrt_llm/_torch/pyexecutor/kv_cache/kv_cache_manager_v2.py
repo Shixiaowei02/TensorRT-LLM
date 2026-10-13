@@ -3993,6 +3993,17 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
 
+    def wait_for_disagg_receive(self, req: LlmRequest) -> None:
+        """Wait for this request's allocated GPU slots before an external writer uses them.
+
+        Args:
+            req: The generation request whose receive destination was allocated.
+        """
+        ready = self._disagg_receive_ready.get(req.py_request_id)
+        if ready is not None:
+            ready.synchronize()
+            del self._disagg_receive_ready[req.py_request_id]
+
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
 
@@ -4234,10 +4245,7 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         for request in scheduled_batch.context_requests:
-            ready = self._disagg_receive_ready.get(request.py_request_id)
-            if ready is not None:
-                ready.synchronize()
-                del self._disagg_receive_ready[request.py_request_id]
+            self.wait_for_disagg_receive(request)
 
         if self.is_draft:
             # Mirror the main manager. Under one-model spec decoding the
